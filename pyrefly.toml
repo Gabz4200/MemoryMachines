@@ -1,0 +1,140 @@
+# pyrefly config for PyTorch research projects
+
+[tool.pyrefly]
+project_root = "."
+python_version = "3.11"
+
+strict = true
+warn_unused_ignores = true
+warn_unused_type_params = true
+check_generics = true
+check_protocol_members = true
+check_class_overrides = true
+
+allow_dynamic_attributes = true
+allow_untyped_decorators = true
+
+[[tool.pyrefly.stub_paths]]
+path = ".pyrefly/stubs"
+
+exclude = [
+    "**/build/**",
+    "**/dist/**",
+    "**/*.egg-info/**",
+    "**/__pycache__/**",
+    "**/*_pb2*.py",
+    "**/*_pb2.pyi",
+    "**/.mypy_cache/**",
+    "**/.pyrefly/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/env/**",
+    "**/data/**",
+    "**/checkpoints/**",
+    "**/*.pt",
+    "**/*.pth",
+    "**/*.safetensors",
+    "**/*.bin",
+    "**/*.ipynb",
+]
+
+ignore = [
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/tests/**",
+    "**/conftest.py",
+    "**/scripts/**",
+    "**/tools/**",
+    "**/experiments/**",
+    "**/notebooks/**",
+    "**/config.py",
+    "**/configs/**/*.py",
+    "**/*_generated.py",
+]
+
+[[tool.pyrefly.overrides]]
+pattern = "**/models/**/*.py"
+settings = { allow_dynamic_attributes = true }
+
+[[tool.pyrefly.overrides]]
+pattern = "**/data/**/*.py"
+settings = { allow_untyped_calls = true }
+
+[[tool.pyrefly.overrides]]
+pattern = "**/train*.py"
+settings = { allow_untyped_decorators = true }
+
+[[tool.pyrefly.overrides]]
+pattern = "**/eval*.py"
+settings = { allow_untyped_decorators = true }
+
+[[tool.pyrefly.overrides]]
+pattern = "**/inference*.py"
+settings = { allow_untyped_decorators = true }
+
+infer_types = true
+infer_return_types = true
+infer_property_types = true
+
+allow_implicit_reexport = true
+implicit_reexport_modules = [
+    "torch",
+    "torch.nn",
+    "torch.nn.functional",
+    "torch.optim",
+    "torch.utils.data",
+    "einops",
+    "einops.layers.torch",
+]
+
+typed_modules = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "accelerate",
+    "lightning",
+    "pytorch_lightning",
+    "wandb",
+    "tensorboard",
+    "einops",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "omegaconf",
+    "hydra",
+    "yaml",
+    "json",
+    "pathlib",
+    "dataclasses",
+    "typing",
+    "collections",
+    "itertools",
+    "functools",
+    "contextlib",
+    "abc",
+    "enum",
+    "attrs",
+    "pydantic",
+]
+
+untyped_modules = [
+    "wandb.sdk",
+    "tensorboard.summary",
+    "omegaconf.dictconfig",
+    "omegaconf.listconfig",
+]
+
+output_format = "json"
+error_on_warnings = false
+
+jobs = 0
+cache_dir = ".pyrefly/cache"
+incremental = true
+
+[tool.pyrefly.lsp]
+enabled = true
+hover = true
+completion = true
+diagnostics = true
+code_actions = true

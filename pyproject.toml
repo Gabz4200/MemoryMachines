@@ -69,12 +69,9 @@ torchaudio = [
 packages = ["src/memory_machines"]
 
 [tool.ruff]
-line-length = 100
+line-length = 200
 target-version = "py311"
 src = ["src"]
-
-[tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
 
 [tool.mypy]
 python_version = "3.11"
