@@ -11,7 +11,7 @@ class ModelConfig:
 
 
 @dataclass
-class MemoryMachineConfig:  # todo: Use actual necessary values (this is copying LFM2 for now)
+class MemoryMachineConfig:
     """Configuration class for MemoryMachine model.
 
     Attributes:
@@ -26,7 +26,11 @@ class MemoryMachineConfig:  # todo: Use actual necessary values (this is copying
         max_position_embeddings: Maximum sequence length
         rms_norm_eps: RMS normalization epsilon
         tie_word_embeddings: Whether to tie input/output embeddings
-        rope_theta: RoPE base frequency
+        cvpe_mlp_hidden: Hidden width of the CVPE QK functional-bias MLP
+        cvpe_use_log_transform: Log-warp the normalized offset before the MLP
+        cvpe_enabled: Whether to add the CVPE dynamic QK bias
+        frvm_enabled: Whether to apply F-RVM antisymmetric value gating
+        frvm_chunk_size: Query chunk size for the F-RVM gated reduction
         attention_dropout: Dropout rate for attention
         hidden_dropout: Dropout rate for hidden layers
         initializer_range: Standard deviation for weight initialization
@@ -50,7 +54,11 @@ class MemoryMachineConfig:  # todo: Use actual necessary values (this is copying
     max_position_embeddings: int = 32768
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = True
-    rope_theta: float = 10000.0
+    cvpe_mlp_hidden: int = 32
+    cvpe_use_log_transform: bool = True
+    cvpe_enabled: bool = True
+    frvm_enabled: bool = True
+    frvm_chunk_size: int = 128
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
     initializer_range: float = 0.02
@@ -62,16 +70,31 @@ class MemoryMachineConfig:  # todo: Use actual necessary values (this is copying
     output_attentions: bool = False
     output_hidden_states: bool = False
 
+    def __post_init__(self):
+        """Validate invariant bounds across configuration fields."""
+        if self.hidden_size <= 0:
+            raise ValueError(f"hidden_size ({self.hidden_size}) must be positive")
+        if self.num_attention_heads <= 0:
+            raise ValueError(f"num_attention_heads ({self.num_attention_heads}) must be positive")
+        if self.num_key_value_heads <= 0:
+            raise ValueError(f"num_key_value_heads ({self.num_key_value_heads}) must be positive")
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})")
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})")
+        if self.cvpe_mlp_hidden <= 0:
+            raise ValueError(f"cvpe_mlp_hidden ({self.cvpe_mlp_hidden}) must be positive")
+        if self.frvm_chunk_size <= 0:
+            raise ValueError(f"frvm_chunk_size ({self.frvm_chunk_size}) must be positive")
+        if self.conv_kernel_size <= 0:
+            raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be positive")
+        if self.conv_kernel_size % 2 == 0:
+            raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be odd to preserve length with padding kernel//2")
+        if self.max_position_embeddings <= 0:
+            raise ValueError(f"max_position_embeddings ({self.max_position_embeddings}) must be positive")
+
     @classmethod
     def from_pretrained_size(cls, size: str) -> "MemoryMachineConfig":
-        """Create configuration for standard MemoryMachine model sizes.
-
-        Args:
-            size: Model size ('350M', '700M', or '1.2B')
-
-        Returns:
-            MemoryMachineConfig instance for the specified size
-        """
         configs = {
             "350M": cls(
                 hidden_size=768,
