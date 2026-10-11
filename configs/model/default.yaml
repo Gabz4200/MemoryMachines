@@ -1,0 +1,4 @@
+_target_: project.models.backbone.ExampleBackbone
+embed_dim: 256
+num_layers: 2
+backend: "naive"

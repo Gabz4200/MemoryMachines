@@ -1,0 +1,5 @@
+formats = "notebooks///py:percent,notebooks///ipynb"
+notebook_format = "ipynb"
+script_format = "py:percent"
+cell_metadata_filter = "all"
+notebook_metadata_filter = "-all"

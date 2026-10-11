@@ -1,0 +1,43 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+uv.lock.tmp
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checkers / IDE
+.mypy_cache/
+.pyrefly/
+.ruff_cache/
+.vscode/
+.idea/
+
+# Data & artifacts
+data/
+runs/
+wandb/
+*.ckpt
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks checkpoints (keep committed *.ipynb)
+.ipynb_checkpoints/

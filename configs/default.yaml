@@ -1,0 +1,15 @@
+defaults:
+  - model: default
+  - data: default
+  - trainer: default
+  - callbacks: default
+  - _self_
+
+system:
+  _target_: project.modules.lightning_module.LitResearchSystem
+  learning_rate: 1e-4
+  weight_decay: 1e-2
+
+# Consumed by scripts/eval.py, not by the system. Override it from the CLI:
+#   uv run python scripts/eval.py checkpoint=path/to/ckpt.ckpt
+checkpoint: null
