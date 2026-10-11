@@ -1,30 +1,33 @@
-"""Top-level research backbone: pure tensor math, nothing else.
-
-This is a deliberately minimal EXAMPLE (a 2-block residual stack) that
-exercises every scaffold invariant. Replace it with your model — keep
-the invariants, swap the math:
-
-  - No training loops, no loss, no optimizer, no .to(device), no file I/O.
-  - Accepts typed kwargs (embed_dim: int), never a DictConfig.
-  - State is passed in explicitly and returned explicitly (no self.state).
-  - Primitive ops go through the dispatcher, never a raw kernel import.
-"""
+"""Minimal example backbone exercising scaffold invariants (typed kwargs, explicit state, dispatcher ops)."""
 
 from typing import cast
 
 import torch
 from torch import nn
 
-from memory_machines.models.blocks import AttentionBlock, FeedForwardBlock
+from memory_machines.models.blocks import GroupedQueryAttention, SwiGLU
 from memory_machines.models.io import ModelInput, ModelOutput
 from memory_machines.models.registry import register_model
 from memory_machines.ops.dispatch import dispatch_dw_scale
+from memory_machines.utils.config_schema import MemoryMachineConfig
+
+
+class _GQAWrapper(nn.Module):
+    """GroupedQueryAttention returning hidden states only (drops weights/cache)."""
+
+    def __init__(self, attn: GroupedQueryAttention):
+        super().__init__()
+        self.attn = attn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _, _ = self.attn(x)
+        return out
 
 
 @register_model("default")
 @register_model("example")
 class ExampleBackbone(nn.Module):
-    """Minimal flat composition: attn + ffn blocks, a norm, a head."""
+    """Minimal flat composition: GQA + SwiGLU blocks, a norm, a head."""
 
     def __init__(
         self,
@@ -39,12 +42,19 @@ class ExampleBackbone(nn.Module):
         self.num_layers = num_layers
         self.vocab_size = vocab_size
         self.backend = backend
+        cfg = MemoryMachineConfig(
+            hidden_size=embed_dim,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            # Unused by this backbone, but validated at boot: keep 1 head/group.
+            csa_num_output_groups=num_heads,
+        )
         self.blocks = nn.ModuleList(
             [
                 nn.ModuleDict(
                     {
-                        "attn": AttentionBlock(embed_dim, num_heads),
-                        "ff": FeedForwardBlock(embed_dim),
+                        "attn": _GQAWrapper(GroupedQueryAttention(cfg)),
+                        "ff": SwiGLU(cfg),
                     }
                 )
                 for _ in range(num_layers)
@@ -62,11 +72,10 @@ class ExampleBackbone(nn.Module):
             x = torch.nn.functional.one_hot(inputs.input_ids, self.vocab_size).to(torch.float32)
             x = self.input_proj(x)
         for block in self.blocks:
-            # ModuleList is typed as Module, so indexing a ModuleDict element
-            # needs the cast to keep a type checker honest.
+            # Cast keeps the type checker honest on ModuleDict indexing.
             pair = cast(nn.ModuleDict, block)
             x = pair["ff"](pair["attn"](x))
         x = self.norm(x)
-        if x.dtype == torch.float32:  # primitive op via the dispatcher, never a raw kernel
+        if x.dtype == torch.float32:
             x = dispatch_dw_scale(x, x, backend=self.backend)
         return ModelOutput(logits=self.head(x), new_state=None)
