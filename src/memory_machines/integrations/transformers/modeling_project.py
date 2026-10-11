@@ -10,9 +10,9 @@ import torch.nn as nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from project.integrations.transformers.configuration_project import CustomResearchConfig
-from project.models.backbone import ExampleBackbone
-from project.models.io import ModelInput, ModelOutput
+from memory_machines.integrations.transformers.configuration_project import CustomResearchConfig
+from memory_machines.models.backbone import ExampleBackbone
+from memory_machines.models.io import ModelInput, ModelOutput
 
 
 class CustomModelForCausalLM(PreTrainedModel):

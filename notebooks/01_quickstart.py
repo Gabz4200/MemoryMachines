@@ -18,9 +18,9 @@
 # %%
 import torch
 
-from project.models.io import ModelInput
-from project.models.registry import get_model
-from project.ops.dispatch import dispatch_dw_scale
+from memory_machines.models.io import ModelInput
+from memory_machines.models.registry import get_model
+from memory_machines.ops.dispatch import dispatch_dw_scale
 
 # %%
 model = get_model("example", embed_dim=256, num_layers=2, vocab_size=1000)

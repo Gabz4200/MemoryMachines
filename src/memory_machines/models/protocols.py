@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
-from project.models.io import ModelInput, ModelOutput
+from memory_machines.models.io import ModelInput, ModelOutput
 
 
 @runtime_checkable

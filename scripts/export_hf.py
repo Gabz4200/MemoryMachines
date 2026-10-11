@@ -3,9 +3,9 @@
 import argparse
 from typing import Any, cast
 
-from project.integrations.transformers.configuration_project import CustomResearchConfig
-from project.integrations.transformers.modeling_project import CustomModelForCausalLM
-from project.modules.lightning_module import LitResearchSystem
+from memory_machines.integrations.transformers.configuration_project import CustomResearchConfig
+from memory_machines.integrations.transformers.modeling_project import CustomModelForCausalLM
+from memory_machines.modules.lightning_module import LitResearchSystem
 
 
 def export(checkpoint_path: str, output_dir: str):

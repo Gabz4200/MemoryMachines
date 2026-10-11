@@ -66,7 +66,7 @@ torchaudio = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/project"]
+packages = ["src/memory_machines"]
 
 [tool.ruff]
 line-length = 100

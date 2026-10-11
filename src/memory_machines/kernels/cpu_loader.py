@@ -12,8 +12,11 @@ def get_cpu_extension():
     global _ext
     if _ext is None:
         _ext = load(
-            name="project_cpu_kernels",
-            sources=["native/cpu/dw_scale.cpp", "native/cpu/dw_scale_backward.cpp"],
+            name="memory_machines_cpu_kernels",
+            sources=[
+                "src/memory_machines/kernels/native/cpu/dw_scale.cpp",
+                "src/memory_machines/kernels/native/cpu/dw_scale_backward.cpp",
+            ],
             verbose=False,
         )
     return _ext

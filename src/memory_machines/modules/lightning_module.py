@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 
-from project.models.io import ModelInput, ModelOutput
+from memory_machines.models.io import ModelInput, ModelOutput
 
 
 class LitResearchSystem(pl.LightningModule):

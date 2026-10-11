@@ -4,7 +4,7 @@ import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from project.modules.lightning_module import LitResearchSystem
+from memory_machines.modules.lightning_module import LitResearchSystem
 
 
 @hydra.main(config_path="../configs", config_name="default", version_base="1.3")

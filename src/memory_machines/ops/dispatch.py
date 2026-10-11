@@ -15,8 +15,8 @@ that cannot run is an actionable error, not a silent downgrade.
 
 import torch
 
-from project.ops.dw_scale import dw_scale as _compiled_op
-from project.ops.references.dw_scale_reference import reference_dw_scale
+from memory_machines.ops.dw_scale import dw_scale as _compiled_op
+from memory_machines.ops.references.dw_scale_reference import reference_dw_scale
 
 
 def dispatch_dw_scale(

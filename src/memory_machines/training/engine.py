@@ -2,7 +2,7 @@
 
 import pytorch_lightning as pl
 
-from project.callbacks.logging import MetricLoggerCallback
+from memory_machines.callbacks.logging import MetricLoggerCallback
 
 
 def create_trainer(cfg) -> pl.Trainer:

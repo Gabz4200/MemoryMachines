@@ -2,8 +2,8 @@
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from project.integrations.transformers.configuration_project import CustomResearchConfig
-from project.integrations.transformers.modeling_project import CustomModelForCausalLM
+from memory_machines.integrations.transformers.configuration_project import CustomResearchConfig
+from memory_machines.integrations.transformers.modeling_project import CustomModelForCausalLM
 
 
 def register_auto_classes():

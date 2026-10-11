@@ -15,10 +15,10 @@ from typing import cast
 import torch
 from torch import nn
 
-from project.models.blocks import AttentionBlock, FeedForwardBlock
-from project.models.io import ModelInput, ModelOutput
-from project.models.registry import register_model
-from project.ops.dispatch import dispatch_dw_scale
+from memory_machines.models.blocks import AttentionBlock, FeedForwardBlock
+from memory_machines.models.io import ModelInput, ModelOutput
+from memory_machines.models.registry import register_model
+from memory_machines.ops.dispatch import dispatch_dw_scale
 
 
 @register_model("default")
