@@ -22,14 +22,11 @@ repos:
       - id: jupytext
         args: [--sync, --pre-commit]
         pass_filenames: false
-  # Only when the type baseline is zero; a failing baseline blocks every
-  # commit, so omit this hook until `pyrefly check` passes clean.
   - repo: https://github.com/facebook/pyrefly-pre-commit
     rev: v1.3.2
     hooks:
       - id: pyrefly-check
         language: system
-        # Locked version, not system pyrefly: checks run against uv.lock.
         entry: uv run --no-sync pyrefly check
         pass_filenames: false
         always_run: true
@@ -38,7 +35,6 @@ repos:
     hooks:
       - id: pytest
         name: pytest suite
-        # Project env (plugins + package installed) via uv.
         entry: uv run --no-sync pytest -q
         language: system
         pass_filenames: false
@@ -47,4 +43,3 @@ repos:
     rev: v0.18.1
     hooks:
       - id: aislop
-
