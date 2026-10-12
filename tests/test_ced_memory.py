@@ -1,14 +1,14 @@
 """CED + auxiliary memory coverage tests (prefill/decode, engram, mHC, dspark)."""
 
-from dataclasses import replace
-
 import math
+from dataclasses import replace
 
 import torch
 
 from memory_machines.models.blocks import (
     CausalEncoderDecoderStack,
     CEDGlobalKVProjection,
+    CompressedSparseAttention2,
     DSparkDrafter,
     EngramMemory,
     SinglePassMHC,
@@ -56,6 +56,12 @@ def test_ced_decode_is_globally_conditioned():
     torch.manual_seed(0)
     cfg = _ced_cfg()
     model = CausalEncoderDecoderStack(cfg).eval()
+    # Sparse layers use a zero-start residual output; restore signal so the
+    # global-conditioning comparison is meaningful.
+    with torch.no_grad():
+        for layer in list(model.encoder_layers) + list(model.decoder_layers):
+            assert isinstance(layer, CompressedSparseAttention2)
+            torch.nn.init.xavier_uniform_(layer.grouped_out.out_proj.weight)
     torch.manual_seed(1)
     H = torch.randn(1, 6, 32)
     E_A = torch.randn(1, 7, 32)
@@ -69,7 +75,8 @@ def test_ced_decode_is_globally_conditioned():
     torch.manual_seed(3)
     H7 = torch.randn(1, L, 32)
     _, shared = model.encode(H7)
-    assert shared.total_len == L
+    # The stack seeds total_len once; layers do not advance it.
+    assert shared.total_len == 0
     assert shared.compressed_kv is not None
     assert shared.compressed_kv.shape[1] == math.ceil(L / 2)
 
@@ -107,6 +114,10 @@ def test_engram_residual_and_last_token_sensitivity():
 
     torch.manual_seed(0)
     mem2 = EngramMemory(cfg).eval()
+    # Zero-start out_proj would hide the memory path entirely; restore
+    # signal so last-token sensitivity is observable.
+    with torch.no_grad():
+        torch.nn.init.xavier_uniform_(mem2.out_proj.weight)
     torch.manual_seed(7)
     base_ids = torch.randint(0, 50, (1, 6))
     alt_ids = base_ids.clone()
@@ -132,7 +143,7 @@ def test_mhc_routing():
     torch.manual_seed(0)
     streams = torch.randn(2, 5, 2, 32)
 
-    a, b, c = mhc.coefficients(streams)
+    a, b, _ = mhc.coefficients(streams)
     assert tuple(a.shape) == (2, 5, 1, 2)
     assert tuple(b.shape) == (2, 5, 2, 2)
     torch.testing.assert_close(b.sum(dim=-1), torch.ones_like(b.sum(dim=-1)), atol=1e-4, rtol=1e-4)

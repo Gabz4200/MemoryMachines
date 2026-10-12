@@ -53,6 +53,10 @@ def test_swiglu_matches_manual_and_grads():
     torch.manual_seed(2)
     m = SwiGLU(tiny_cfg())
     m.eval()
+    # SwiGLU uses a zero-start init (down_proj = 0), under which both the
+    # SiLU and no-SiLU paths are exactly zero; restore nonzero weights so
+    # the manual-math comparison below is meaningful.
+    torch.nn.init.xavier_uniform_(m.down_proj.weight)
     x = torch.randn(2, 6, 32)
     with torch.no_grad():
         out = m(x)
@@ -98,6 +102,10 @@ def test_position_ids_explicit_and_overflow():
     # Explicit ids must match the full-run slice; default positions differ.
     torch.manual_seed(4)
     m = GroupedQueryAttention(tiny_cfg()).eval()
+    # Zero-start o_proj outputs all zeros alike; restore signal so the
+    # explicit-vs-default position comparison is meaningful.
+    with torch.no_grad():
+        torch.nn.init.xavier_uniform_(m.o_proj.weight)
     x_full = torch.randn(1, 14, 32)
     explicit = torch.arange(10, 14)
     with torch.no_grad():

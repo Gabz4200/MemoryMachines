@@ -39,8 +39,12 @@ def test_gqa_disable_paths_change_output():
     model = GroupedQueryAttention(tiny_cfg()).eval()
     # Zero-init CVPE would make the disable test vacuous.
     with torch.no_grad():
-        for p in model.cvpe_bias.parameters():
+        cvpe = model.cvpe_bias
+        assert cvpe is not None
+        for p in cvpe.parameters():
             torch.nn.init.normal_(p)
+        # Zero-start o_proj would zero all outputs alike; restore signal.
+        torch.nn.init.xavier_uniform_(model.o_proj.weight)
     x = torch.randn(1, 8, 32)
     with torch.no_grad():
         out_on = model(x)[0]

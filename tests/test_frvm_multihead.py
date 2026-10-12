@@ -50,4 +50,7 @@ def test_gqa_frvm_end_to_end():
     assert tuple(out.shape) == (2, 8, 32)
     out.sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
-    assert torch.isfinite(m.frvm_gate.phi_weight.grad).all()
+    gate = m.frvm_gate
+    assert gate is not None
+    assert gate.phi_weight.grad is not None
+    assert torch.isfinite(gate.phi_weight.grad).all()

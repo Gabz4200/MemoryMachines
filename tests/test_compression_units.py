@@ -92,6 +92,9 @@ def test_grouped_out_proj_group_isolation():
     nheads, hd, groups, gdim, hidden = 4, 8, 2, 16, 32
     proj = GroupedOutputProjection(nheads, hd, groups, gdim, hidden).eval()
     with torch.no_grad():
+        # Zero-start out_proj would zero every output alike; restore signal
+        # before masking the second group so isolation is observable.
+        torch.nn.init.xavier_uniform_(proj.out_proj.weight)
         proj.out_proj.weight[:, gdim:] = 0.0
     x0 = torch.randn(1, 4, 3, 8)
     with torch.no_grad():
