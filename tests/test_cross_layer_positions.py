@@ -127,10 +127,10 @@ def test_ced_stack_positions_stay_correct_across_layers():
 
 
 def test_engram_hash_is_dtype_invariant():
-    """The FNV hash must not depend on the input integer dtype.
+    """The multiplicative-XOR hash must not depend on the input dtype.
 
-    int32 input_ids silently wrapped the accumulator, producing different
-    table ids than int64 for the same tokens.
+    int32 input_ids must produce the same table ids (and forward
+    output) as int64 for the same tokens.
     """
     torch.manual_seed(0)
     cfg = replace(
@@ -141,8 +141,8 @@ def test_engram_hash_is_dtype_invariant():
     )
     mem = EngramMemory(cfg).eval()
     ids = torch.tensor([[1, 2, 3, 4, 5]])
-    h64 = mem._ngram_id(ids.to(torch.int64), 0)
-    h32 = mem._ngram_id(ids.to(torch.int32), 0)
+    h64 = mem._ngram_hashes(ids.to(torch.int64), layer_id=0)
+    h32 = mem._ngram_hashes(ids.to(torch.int32), layer_id=0)
     torch.testing.assert_close(h64, h32)
     # Forward path agrees for both dtypes.
     hidden = torch.randn(1, 5, cfg.hidden_size)

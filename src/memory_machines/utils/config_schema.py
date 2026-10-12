@@ -64,7 +64,20 @@ class MemoryMachineConfig:
         engram_orders: N-gram orders (V4.1: 2,3,4)
         engram_hash_heads: Hash heads (V4.1: 8)
         engram_dim_per_order: Dim per order (V4.1: 2048; default scaled down)
-        engram_num_entries: Hash table entries, id 0 reserved for padding (V4.1: ~16M/head; default tiny)
+        engram_num_entries: Minimum hash-table size per head; actual sizes are
+            distinct primes >= engram_num_entries (V4.1: ~16M/head; default tiny)
+        engram_use_conv: Short depthwise causal conv refinement (original paper:
+            True; V4.1 omits the conv, so the flag is configurable)
+        engram_layer_positions: Zero-indexed layers that host Engram blocks
+            (V4.1: 1 and 14; empty = every layer)
+        engram_offload: Storage mode for the hashed tables: "ram" (default,
+            an in-memory nn.Embedding), "ssd" (always a numpy-memmap file
+            on SSD, gathered on demand), or "auto" (ssd when the table
+            would exceed engram_offload_ram_threshold bytes of RAM, else ram)
+        engram_offload_dir: Directory for SSD-backed table files (engram_offload
+            in {"ssd", "auto"}); created if missing. Default: "engram_tables"
+        engram_offload_ram_threshold: Table bytes above which "auto" picks
+            SSD offloading. Default: 1 GiB.
         dspark_num_drafts: Parallel draft positions (V4.1: 5)
         dspark_window: Drafter window (V4.1: 128)
     """
@@ -119,6 +132,12 @@ class MemoryMachineConfig:
     engram_hash_heads: int = 4
     engram_dim_per_order: int = 128
     engram_num_entries: int = 16384
+    engram_use_conv: bool = True
+    engram_layer_positions: tuple[int, ...] = ()
+    engram_offload: str = "ram"
+    engram_offload_dir: str = "engram_tables"
+    engram_offload_ram_threshold: int = 1 << 30
+    seed: int = 0
     dspark_num_drafts: int = 5
     dspark_window: int = 128
 
@@ -204,21 +223,25 @@ class MemoryMachineConfig:
             raise ValueError(f"mhc_sinkhorn_iters ({self.mhc_sinkhorn_iters}) must be positive")
         if len(self.engram_orders) == 0:
             raise ValueError("engram_orders must be non-empty")
-        if any(o <= 0 for o in self.engram_orders):
-            raise ValueError(f"engram_orders ({self.engram_orders}) must all be positive")
+        if any(o < 2 for o in self.engram_orders):
+            raise ValueError(f"engram_orders ({self.engram_orders}) must all be >= 2")
         if self.engram_hash_heads <= 0:
             raise ValueError(f"engram_hash_heads ({self.engram_hash_heads}) must be positive")
         if self.engram_dim_per_order <= 0:
             raise ValueError(f"engram_dim_per_order ({self.engram_dim_per_order}) must be positive")
         if self.engram_num_entries < 2:
-            raise ValueError(f"engram_num_entries ({self.engram_num_entries}) must be >= 2 (id 0 is reserved for padding)")
+            raise ValueError(f"engram_num_entries ({self.engram_num_entries}) must be >= 2")
+        if any(p < 0 for p in self.engram_layer_positions):
+            raise ValueError(f"engram_layer_positions ({self.engram_layer_positions}) must be non-negative")
+        if self.engram_offload not in ("ram", "ssd", "auto"):
+            raise ValueError(f'engram_offload ({self.engram_offload!r}) must be "ram", "ssd", or "auto"')
+        if not self.engram_offload_dir:
+            raise ValueError("engram_offload_dir must be non-empty")
+        if self.engram_offload_ram_threshold <= 0:
+            raise ValueError(f"engram_offload_ram_threshold ({self.engram_offload_ram_threshold}) must be positive")
         engram_elements = len(self.engram_orders) * self.engram_hash_heads * self.engram_num_entries * self.engram_dim_per_order
         if engram_elements > 268_435_456:
-            raise ValueError(
-                f"Engram tables total {engram_elements:,} elements (> 256M, ~1GB fp32); "
-                "paper-scale tables need sharded/FP8 storage outside nn.Embedding — "
-                "reduce engram_num_entries/engram_dim_per_order or shard explicitly"
-            )
+            raise ValueError(f"Engram tables total {engram_elements:,} elements (> 256M, ~1GB fp32); reduce engram_num_entries/engram_dim_per_order or shard explicitly")
         if self.dspark_num_drafts <= 0:
             raise ValueError(f"dspark_num_drafts ({self.dspark_num_drafts}) must be positive")
         if self.dspark_window <= 0:

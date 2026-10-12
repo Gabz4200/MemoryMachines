@@ -103,9 +103,11 @@ def test_engram_residual_and_last_token_sensitivity():
     torch.manual_seed(0)
     cfg = _engram_cfg()
 
-    # Zero out_proj recovers the residual exactly.
+    # Zero value_proj (and conv weights) recovers the residual exactly.
     mem = EngramMemory(cfg).eval()
-    torch.nn.init.zeros_(mem.out_proj.weight)
+    torch.nn.init.zeros_(mem.value_proj.weight)
+    if mem.conv is not None:
+        torch.nn.init.zeros_(mem.conv.conv.weight)
     torch.manual_seed(1)
     input_ids = torch.randint(0, 50, (1, 6))
     hidden = torch.randn(1, 6, 32)
@@ -114,10 +116,10 @@ def test_engram_residual_and_last_token_sensitivity():
 
     torch.manual_seed(0)
     mem2 = EngramMemory(cfg).eval()
-    # Zero-start out_proj would hide the memory path entirely; restore
-    # signal so last-token sensitivity is observable.
+    # Zero-start value_proj would hide the memory path entirely;
+    # restore signal so last-token sensitivity is observable.
     with torch.no_grad():
-        torch.nn.init.xavier_uniform_(mem2.out_proj.weight)
+        torch.nn.init.xavier_uniform_(mem2.value_proj.weight)
     torch.manual_seed(7)
     base_ids = torch.randint(0, 50, (1, 6))
     alt_ids = base_ids.clone()
@@ -130,10 +132,11 @@ def test_engram_residual_and_last_token_sensitivity():
     o1_repeat = mem2(base_ids, h)
     torch.testing.assert_close(o1, o1_repeat, atol=1e-5, rtol=1e-5)
 
-    window = torch.tensor([[5, 7, 9], [1, 2, 3]])
-    id0 = mem2._ngram_id(window, head=0)
-    id1 = mem2._ngram_id(window, head=1)
-    assert not torch.equal(id0, id1)
+    # Distinct hash heads map the same n-grams to different table ids.
+    ids = torch.tensor([[5, 7, 9, 1, 2, 3]])
+    hashes = mem2._ngram_hashes(ids, layer_id=0)
+    # First two heads (order 2) must differ.
+    assert not torch.equal(hashes[..., 0], hashes[..., 1])
 
 
 def test_mhc_routing():
