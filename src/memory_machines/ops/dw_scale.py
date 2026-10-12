@@ -17,9 +17,7 @@ def dw_scale(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @torch.library.custom_op("memory_machines::dw_scale_backward", mutates_args=())
-def dw_scale_backward(
-    grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def dw_scale_backward(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     from memory_machines.kernels.taichi import ensure_taichi
     from memory_machines.kernels.taichi.dw_scale import dw_scale_backward_kernel
 
@@ -39,9 +37,7 @@ def _dw_scale_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @torch.library.register_fake("memory_machines::dw_scale_backward")
-def _dw_scale_backward_fake(
-    grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _dw_scale_backward_fake(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty_like(weight)
 
 
@@ -55,6 +51,4 @@ def _backward(ctx, grad_output):
     return torch.ops.memory_machines.dw_scale_backward(grad_output, x, weight)
 
 
-torch.library.register_autograd(
-    "memory_machines::dw_scale", _backward, setup_context=_setup_context
-)
+torch.library.register_autograd("memory_machines::dw_scale", _backward, setup_context=_setup_context)

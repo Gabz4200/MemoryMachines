@@ -1,7 +1,7 @@
 """Objective losses. Kept out of models/ — a backbone computes no loss."""
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class LabelSmoothingCrossEntropy(nn.Module):

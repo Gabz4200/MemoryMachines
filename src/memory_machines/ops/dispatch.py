@@ -19,9 +19,7 @@ from memory_machines.ops.dw_scale import dw_scale as _compiled_op
 from memory_machines.ops.references.dw_scale_reference import reference_dw_scale
 
 
-def dispatch_dw_scale(
-    x: torch.Tensor, weight: torch.Tensor, backend: str = "naive"
-) -> torch.Tensor:
+def dispatch_dw_scale(x: torch.Tensor, weight: torch.Tensor, backend: str = "naive") -> torch.Tensor:
     if backend == "naive":
         return reference_dw_scale(x, weight)
     if backend in ("cpu", "gpu", "taichi", "compiled"):

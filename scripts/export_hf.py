@@ -11,12 +11,12 @@ from memory_machines.modules.lightning_module import LitResearchSystem
 def export(checkpoint_path: str, output_dir: str):
     # Load trained weights from the Lightning checkpoint.
     system = LitResearchSystem.load_from_checkpoint(checkpoint_path)
-    # nn.Module.__getattr__ is typed Module | Tensor, so the casts go through
-    # Any: int() on Module | Tensor is itself a type error.
+    # nn.Module.__getattr__ is typed Module | Tensor; cast to Any
+    # so attribute access feeds the config constructor directly.
     backbone = cast(Any, system.model)
     config = CustomResearchConfig(
-        embed_dim=int(cast(Any, backbone.embed_dim)),
-        num_layers=int(cast(Any, backbone.num_layers)),
+        embed_dim=backbone.embed_dim,
+        num_layers=backbone.num_layers,
     )
     hf_model = CustomModelForCausalLM(config)
     hf_model.backbone.load_state_dict(system.model.state_dict())

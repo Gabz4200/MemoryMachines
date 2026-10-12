@@ -115,7 +115,7 @@ class MemoryMachineConfig:
     ced_num_decoder_layers: int = 20
     mhc_num_streams: int = 4
     mhc_sinkhorn_iters: int = 20
-    engram_orders: tuple = (2, 3, 4)
+    engram_orders: tuple[int, ...] = (2, 3, 4)
     engram_hash_heads: int = 4
     engram_dim_per_order: int = 128
     engram_num_entries: int = 16384

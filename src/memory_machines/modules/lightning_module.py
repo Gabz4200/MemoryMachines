@@ -6,7 +6,7 @@ owns loss, step metrics, and optimizer configuration only.
 
 import pytorch_lightning as pl
 import torch
-import torch.nn as nn
+from torch import nn
 
 from memory_machines.models.io import ModelInput, ModelOutput
 
@@ -24,9 +24,7 @@ class LitResearchSystem(pl.LightningModule):
         return self.model(inputs)
 
     def training_step(self, batch, batch_idx):
-        inputs = ModelInput(
-            input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask")
-        )
+        inputs = ModelInput(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
         output: ModelOutput = self.model(inputs)
         loss = self.criterion(
             output.logits.view(-1, output.logits.size(-1)),
@@ -38,9 +36,7 @@ class LitResearchSystem(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        inputs = ModelInput(
-            input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask")
-        )
+        inputs = ModelInput(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
         output: ModelOutput = self.model(inputs)
         loss = self.criterion(
             output.logits.view(-1, output.logits.size(-1)),

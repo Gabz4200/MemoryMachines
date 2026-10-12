@@ -6,7 +6,7 @@ The core backbone stays a pure nn.Module; all HF coupling lives here.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -53,9 +53,7 @@ class CustomModelForCausalLM(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # 1. Translate HF input -> typed ModelInput.
-        clean_input = ModelInput(
-            input_ids=input_ids, attention_mask=attention_mask, state=past_key_values
-        )
+        clean_input = ModelInput(input_ids=input_ids, attention_mask=attention_mask, state=past_key_values)
 
         # 2. Execute pure PyTorch math.
         clean_output: ModelOutput = self.backbone(clean_input)
