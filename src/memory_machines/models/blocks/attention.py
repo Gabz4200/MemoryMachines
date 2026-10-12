@@ -126,7 +126,7 @@ def _sanitize_attention_weights(weights: torch.Tensor) -> torch.Tensor:
                  [0.0000, 0.0000]]])
     """
     row_ok = torch.isfinite(weights).any(dim=-1, keepdim=True)
-    return torch.where(row_ok, weights, torch.zeros_like(weights))
+    return torch.where(row_ok, weights, 0.0)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -153,11 +153,14 @@ class GroupedQueryAttention(nn.Module):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2))
+        ...     num_attention_heads=4, num_key_value_heads=2, csa_num_output_groups=4))
         >>> out, w, kv = attn(torch.randn(1, 6, 32), is_causal=True)
         >>> out.shape
         torch.Size([1, 6, 32])
     """
+
+    cvpe_bias: CVPEContextBias | None
+    frvm_gate: FRVMValueGate | None
 
     def __init__(self, config: MemoryMachineConfig):
         super().__init__()
@@ -212,6 +215,22 @@ class GroupedQueryAttention(nn.Module):
         self.frvm_gate = FRVMValueGate(self.head_dim, self.num_heads) if self.frvm_enabled else None
 
         self.attention_dropout = nn.Dropout(config.attention_dropout)
+        GroupedQueryAttention.reset_parameters(self)
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Xavier-uniform init for the Q/K/V input projections (variance
+        preserving across widths; Glorot & Bengio, 2010); the output
+        projection is zero-initialized so the attention branch starts as an
+        identity residual (Fixup, Zhang et al., 2019; ReZero, Bachlechner
+        et al., 2020). Submodules (CVPE/FRVM) keep their own neutral-start
+        inits and are left untouched.
+        """
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.zeros_(self.o_proj.weight)
 
     def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""_project_qkv(hidden_states) -> (Tensor, Tensor, Tensor)
@@ -229,7 +248,7 @@ class GroupedQueryAttention(nn.Module):
 
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> [t.shape for t in attn._project_qkv(__import__("torch").randn(1, 4, 16))]
             [torch.Size([1, 2, 4, 8]), torch.Size([1, 1, 4, 8]), torch.Size([1, 1, 4, 8])]
         """
@@ -264,7 +283,7 @@ class GroupedQueryAttention(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> [t.shape for t in attn._expand_kv(torch.randn(1, 1, 5, 8),
             ...     torch.randn(1, 1, 5, 8), torch.randn(1, 1, 3, 8))]
             [torch.Size([1, 2, 5, 8]), torch.Size([1, 2, 5, 8]), torch.Size([1, 2, 3, 8])]
@@ -300,7 +319,7 @@ class GroupedQueryAttention(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> attn._score_qk(torch.randn(1, 2, 3, 8), torch.randn(1, 2, 5, 8),
             ...     torch.tensor([[5, 6, 7]]), torch.tensor([[0, 1, 2, 3, 4]])).shape
             torch.Size([1, 2, 3, 5])
@@ -334,7 +353,7 @@ class GroupedQueryAttention(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, frvm_enabled=False))
+            ...     num_attention_heads=2, num_key_value_heads=1, frvm_enabled=False, csa_num_output_groups=2))
             >>> attn._weights_to_heads(torch.softmax(torch.randn(1, 2, 3, 5), -1),
             ...     torch.randn(1, 2, 5, 8), torch.randn(1, 2, 3, 8)).shape
             torch.Size([1, 2, 3, 8])
@@ -362,7 +381,7 @@ class GroupedQueryAttention(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> attn._project_heads(torch.randn(1, 2, 3, 8), 1, 3).shape
             torch.Size([1, 3, 16])
         """
@@ -387,7 +406,7 @@ class GroupedQueryAttention(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> attn.project_heads(torch.randn(1, 2, 3, 8), 1, 3).shape
             torch.Size([1, 3, 16])
         """
@@ -439,11 +458,11 @@ class GroupedQueryAttention(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> out, w, _ = attn(torch.randn(1, 4, 16), is_causal=True,
             ...     output_attentions=True)
             >>> out.shape, w.shape
-            (torch.Size([1, 4, 16]), torch.Size([1, 2, 4, 6]))
+            (torch.Size([1, 4, 16]), torch.Size([1, 2, 4, 4]))
         """
         bsz, q_len, _ = hidden_states.size()
 
@@ -513,12 +532,28 @@ class SwiGLU(nn.Module):
 
     def __init__(self, config: MemoryMachineConfig):
         super().__init__()
+        if config.intermediate_size % 2 != 0:
+            raise ValueError(f"SwiGLU needs even intermediate_size, got {config.intermediate_size}")
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        SwiGLU.reset_parameters(self)
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Xavier-uniform for the gate/up projections; the down projection is
+        zero-initialized so the FFN branch starts as an identity residual
+        (Fixup; ReZero). The SiLU-gated product has roughly half the
+        variance of a plain linear path, so a variance-preserving input
+        init plus a zero-start output keeps early-step activations bounded.
+        """
+        nn.init.xavier_uniform_(self.gate_proj.weight)
+        nn.init.xavier_uniform_(self.up_proj.weight)
+        nn.init.zeros_(self.down_proj.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""forward(x) -> Tensor
@@ -565,7 +600,7 @@ class SlidingWindowAttention(GroupedQueryAttention):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2, swa_window_size=8))
+        ...     num_attention_heads=4, num_key_value_heads=2, swa_window_size=8, csa_num_output_groups=4))
         >>> out, _, present = swa(torch.randn(1, 6, 32), use_cache=True)
         >>> out.shape, present[0].shape
         (torch.Size([1, 6, 32]), torch.Size([1, 2, 6, 8]))
@@ -612,7 +647,7 @@ class SlidingWindowAttention(GroupedQueryAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4))
+            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4, csa_num_output_groups=2))
             >>> out, w = swa.attend(torch.randn(1, 2, 3, 8), torch.randn(1, 1, 5, 8),
             ...     torch.randn(1, 1, 5, 8), torch.randn(1, 1, 3, 8),
             ...     torch.tensor([[3, 4, 5]]), torch.tensor([[1, 2, 3, 4, 5]]))
@@ -682,7 +717,7 @@ class SlidingWindowAttention(GroupedQueryAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4))
+            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4, csa_num_output_groups=2))
             >>> out, _, present = swa(torch.randn(1, 6, 16), use_cache=True)
             >>> out.shape, present[0].shape
             (torch.Size([1, 6, 16]), torch.Size([1, 1, 4, 8]))
@@ -714,13 +749,12 @@ class SlidingWindowAttention(GroupedQueryAttention):
         else:
             value_full = value_current
         out_h, attn_w = self.attend(query_states, key_states, value_full, value_current, q_pos, k_pos_full, attention_mask, is_causal=is_causal)
-        full_k, full_v = key_states, value_full
         out = self._project_heads(out_h, bsz, q_len)
         present = None
         if use_cache:
             present = (
-                full_k[:, :, -self.window_size :, :],
-                full_v[:, :, -self.window_size :, :],
+                key_states[:, :, -self.window_size :, :],
+                value_full[:, :, -self.window_size :, :],
             )
         return out, (attn_w if output_attentions else None), present
 
@@ -747,7 +781,7 @@ class SlidingWindowAttention(GroupedQueryAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4))
+            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4, csa_num_output_groups=2))
             >>> k, v, p = swa.truncate_for_replay(torch.randn(1, 1, 6, 8),
             ...     torch.randn(1, 1, 6, 8), torch.arange(6))
             >>> k.shape, p.shape

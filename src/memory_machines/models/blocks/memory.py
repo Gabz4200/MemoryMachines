@@ -55,6 +55,31 @@ class SinglePassMHC(nn.Module):
         self.alpha_pre = nn.Parameter(torch.tensor(1e-3))
         self.alpha_res = nn.Parameter(torch.tensor(1e-3))
         self.alpha_post = nn.Parameter(torch.tensor(1e-3))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        RMSNorm to unit gain; dynamic mixers Xavier-uniform but
+        temperature-gated by ``alpha = 1e-3``, so coefficients start at
+        the statics: uniform input/residual mixing and unit output scale
+        (near-identity stream mixing). Static biases stay zero, i.e.
+        ``sigmoid(0) = 0.5`` input weights, uniform Sinkhorn rows, and
+        ``2 * sigmoid(0) = 1`` output scales.
+        """
+        self.pre_norm.reset_parameters()
+        nn.init.xavier_uniform_(self.a_dyn.weight)
+        nn.init.zeros_(self.a_dyn.bias)
+        nn.init.xavier_uniform_(self.b_dyn.weight)
+        nn.init.zeros_(self.b_dyn.bias)
+        nn.init.xavier_uniform_(self.c_dyn.weight)
+        nn.init.zeros_(self.c_dyn.bias)
+        nn.init.zeros_(self.a_static)
+        nn.init.zeros_(self.b_static)
+        nn.init.zeros_(self.c_static)
+        nn.init.constant_(self.alpha_pre, 1e-3)
+        nn.init.constant_(self.alpha_res, 1e-3)
+        nn.init.constant_(self.alpha_post, 1e-3)
 
     def coefficients(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""coefficients(x) -> (Tensor, Tensor, Tensor)
@@ -115,6 +140,29 @@ class SinglePassMHC(nn.Module):
             raise ValueError(f"mixing coefficients shape {tuple(a.shape)} incompatible with streams {tuple(streams.shape)} (expect [B, L, 1, n])")
         return torch.matmul(a, streams)
 
+    @staticmethod
+    def _combine(
+        streams: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        branch_out: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""_combine(streams, b, c, branch_out) -> Tensor
+
+        Residual recombination shared by :meth:`forward` and
+        :meth:`step`.
+
+        Args:
+            streams (Tensor): streams of shape ``(B, L, n, d)``.
+            b (Tensor): residual mixing weights of shape ``(B, L, n, n)``.
+            c (Tensor): output scaling of shape ``(B, L, n, 1)``.
+            branch_out (Tensor): branch output of shape ``(B, L, d)``.
+
+        Returns:
+            Tensor: updated streams of shape ``(B, L, n, d)``.
+        """
+        return torch.matmul(b, streams) + c * branch_out.unsqueeze(2)
+
     def forward(
         self,
         streams: torch.Tensor,
@@ -146,7 +194,7 @@ class SinglePassMHC(nn.Module):
         a, b, c = self.coefficients(streams)
         if prev_a is not None and (prev_a.shape != a.shape):
             raise ValueError(f"prev_a shape {tuple(prev_a.shape)} does not match current coefficients {tuple(a.shape)}")
-        out = torch.matmul(b, streams) + c * branch_out.unsqueeze(2)
+        out = self._combine(streams, b, c, branch_out)
         return out, a
 
     def step(
@@ -188,7 +236,7 @@ class SinglePassMHC(nn.Module):
         branch_out = branch_fn(mixed)
         if branch_out.shape != mixed.shape:
             raise ValueError(f"branch output shape {tuple(branch_out.shape)} does not match mixed input {tuple(mixed.shape)}")
-        out = torch.matmul(b, streams) + c * branch_out.unsqueeze(2)
+        out = self._combine(streams, b, c, branch_out)
         return out, a
 
 
@@ -217,6 +265,7 @@ class EngramMemory(nn.Module):
     """
 
     _PAD_ID = 0
+    tables: nn.ModuleList
 
     def __init__(self, config: MemoryMachineConfig):
         super().__init__()
@@ -227,9 +276,32 @@ class EngramMemory(nn.Module):
         self.hidden_size = config.hidden_size
         if self.entries < 2:
             raise ValueError(f"engram_num_entries ({self.entries}) must be >= 2")
-        self.tables = nn.ModuleList([nn.Embedding(self.entries, self.dim, padding_idx=self._PAD_ID) for _ in self.orders for _ in range(self.hash_heads)])
+        tables = [nn.Embedding(self.entries, self.dim, padding_idx=self._PAD_ID) for _ in self.orders for _ in range(self.hash_heads)]
+        self.tables = nn.ModuleList(tables)
         self.gate_proj = nn.Linear(config.hidden_size, len(self.orders) * self.hash_heads)
         self.out_proj = nn.Linear(len(self.orders) * self.hash_heads * self.dim, config.hidden_size, bias=False)
+        self.init_std = config.initializer_range
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Hash tables from a small normal (``std = initializer_range``,
+        GPT-2 embedding style) with the reserved padding row re-zeroed;
+        the gate projection zeroed (balanced ``0.5`` gates); the output
+        projection zeroed so the memory path contributes nothing at
+        step 0 and the model starts as its memory-less base, learning to
+        use n-gram memory gradually (cf. LoRA's zero-start ``B``,
+        Hu et al., 2021; ControlNet zero-convolutions).
+        """
+        for table in self.tables:
+            assert isinstance(table, nn.Embedding)
+            nn.init.normal_(table.weight, std=self.init_std)
+            with torch.no_grad():
+                table.weight[self._PAD_ID].zero_()
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.zeros_(self.gate_proj.bias)
+        nn.init.zeros_(self.out_proj.weight)
 
     def _ngram_id(self, window: torch.Tensor, head: int) -> torch.Tensor:
         r"""_ngram_id(window, head) -> Tensor
@@ -253,7 +325,8 @@ class EngramMemory(nn.Module):
             >>> mem._ngram_id(torch.tensor([[1, 2], [3, 4]]), 0).shape
             torch.Size([2])
         """
-        # FNV-style mix; mod each step keeps h in int64 range.
+        # Cast up so the hash is invariant to the input integer dtype.
+        window = window.to(torch.int64)
         h = torch.zeros_like(window[:, 0])
         for t in window.unbind(dim=1):
             h = (h * 9113823 + t + 1 + head * 2654435761) % (self.entries - 1) + 1
@@ -288,16 +361,20 @@ class EngramMemory(nn.Module):
         feats: list[torch.Tensor] = []
         ti = 0
         for order in self.orders:
-            for head in range(self.hash_heads):
-                if lq >= order:
-                    windows = input_ids.unfold(1, order, 1)
-                    ids = self._ngram_id(windows.reshape(-1, order), head).view(bsz, -1)
+            if lq >= order:
+                flat_windows = input_ids.unfold(1, order, 1).reshape(-1, order)
+                n_grams = lq - order + 1
+                for head in range(self.hash_heads):
+                    ids = self._ngram_id(flat_windows, head).view(bsz, n_grams)
                     pad = torch.full((bsz, lq - ids.shape[1]), self._PAD_ID, dtype=torch.long, device=ids.device)
                     ids = torch.cat([pad, ids], dim=1)
-                else:
-                    ids = torch.full((bsz, lq), self._PAD_ID, dtype=torch.long, device=input_ids.device)
-                feats.append(self.tables[ti](ids))
-                ti += 1
+                    feats.append(self.tables[ti](ids))
+                    ti += 1
+            else:
+                ids = torch.full((bsz, lq), self._PAD_ID, dtype=torch.long, device=input_ids.device)
+                for head in range(self.hash_heads):
+                    feats.append(self.tables[ti](ids))
+                    ti += 1
         mem = torch.cat(feats, dim=-1)
         gate = torch.sigmoid(self.gate_proj(hidden_states)).unsqueeze(-1)
         mem = mem.view(bsz, lq, -1, self.dim) * gate
@@ -335,6 +412,21 @@ class DSparkDrafter(nn.Module):
         self.draft_proj = nn.Linear(d, self.num_drafts * d, bias=False)
         self.markov_head = nn.Linear(d, d, bias=False)
         self.confidence_head = nn.Linear(d, self.num_drafts)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Xavier-uniform draft proposals; the Markov refinement head
+        zeroed so drafts start unrefined (``tanh(0) = 0`` residual) and
+        the confidence head zeroed for maximal initial uncertainty
+        (``sigmoid(0) = 0.5``). The drafter thus proposes from context
+        statistics first and earns confidence through training.
+        """
+        nn.init.xavier_uniform_(self.draft_proj.weight)
+        nn.init.zeros_(self.markov_head.weight)
+        nn.init.zeros_(self.confidence_head.weight)
+        nn.init.zeros_(self.confidence_head.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         r"""forward(hidden_states) -> (Tensor, Tensor)

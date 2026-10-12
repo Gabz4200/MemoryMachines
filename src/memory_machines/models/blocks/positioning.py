@@ -42,8 +42,8 @@ class CVPEContextBias(nn.Module):
         >>> import torch
         >>> mod = CVPEContextBias(head_dim=8)
         >>> q = torch.randn(2, 4, 5, 8)
-        >>> q_pos = torch.tensor([[4, 5, 6, 7, 8]])
-        >>> k_pos = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8]])
+        >>> q_pos = torch.tensor([[4, 5, 6, 7, 8], [4, 5, 6, 7, 8]])
+        >>> k_pos = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 2, 3, 4, 5, 6, 7, 8]])
         >>> mod(q, q_pos, k_pos).shape
         torch.Size([2, 4, 5, 9])
     """
@@ -65,6 +65,21 @@ class CVPEContextBias(nn.Module):
         self.mlp_act = nn.ReLU()
         self.offset_out = nn.Linear(mlp_hidden, 1)
 
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        All-zero init so the bias starts at exactly zero and attention
+        begins as the vanilla scaled dot-product; the content/position
+        modulation is learned from a disabled start (cf. zero-initialized
+        conditioning branches: ControlNet, Zhang et al., 2023; ReZero).
+        The offset MLP input layer uses an explicit Kaiming-uniform init
+        (ReLU gain) so re-init is idempotent; its output is multiplied
+        by the zeroed ``offset_out``/``gamma`` at step 0 regardless.
+        """
+        nn.init.kaiming_uniform_(self.mlp_in.weight, a=0, nonlinearity="relu")
+        nn.init.zeros_(self.mlp_in.bias)
         nn.init.zeros_(self.gamma_proj.weight)
         nn.init.zeros_(self.gamma_proj.bias)
         nn.init.zeros_(self.beta_proj.weight)
@@ -171,8 +186,20 @@ class FRVMValueGate(nn.Module):
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.phi_weight = nn.Parameter(torch.empty(num_heads, head_dim, head_dim))
-        for h in range(num_heads):
-            nn.init.kaiming_uniform_(self.phi_weight[h], a=math.sqrt(5))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Zero-initialized per-head maps, so gating starts as pure
+        self-gating ``v * SiLU(v)`` with no pairwise term; the
+        query-relative modulation ``phi(v_q - v_k)`` grows from a disabled
+        start instead of injecting large random pairwise terms at step 0
+        (cf. ReZero/gated-attention identity-start practice). This
+        replaces the previous Kaiming init, which gave the pairwise term
+        full random magnitude before any value geometry was learned.
+        """
+        nn.init.zeros_(self.phi_weight)
 
     def _phi(self, x: torch.Tensor) -> torch.Tensor:
         r"""_phi(x) -> Tensor

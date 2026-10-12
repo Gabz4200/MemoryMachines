@@ -35,7 +35,7 @@ class CEDGlobalKVProjection(nn.Module):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> proj = CEDGlobalKVProjection(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2))
+        ...     num_attention_heads=4, num_key_value_heads=2, csa_num_output_groups=4))
         >>> kv, ends = proj(torch.randn(1, 8, 32))
         >>> kv.shape
         torch.Size([1, 8, 2, 8])
@@ -50,6 +50,16 @@ class CEDGlobalKVProjection(nn.Module):
             head_dim,
             compression_ratio if compression_ratio is not None else config.csa_decoder_compression_ratio,
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Re-applies the wrapped :class:`BlockCompressor` init
+        (Xavier-uniform KV projection, zero-start scores/bias for uniform
+        pooling at step 0). This module holds no other parameters.
+        """
+        self.compressor.reset_parameters()
 
     def forward(self, encoder_final_hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         r"""forward(encoder_final_hidden) -> (Tensor, Tensor)
@@ -68,7 +78,7 @@ class CEDGlobalKVProjection(nn.Module):
 
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> proj = CEDGlobalKVProjection(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
             >>> proj(torch.randn(1, 6, 16))[0].shape
             torch.Size([1, 6, 1, 8])
         """
@@ -101,7 +111,7 @@ class CausalEncoderDecoderStack(nn.Module):
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> stack = CausalEncoderDecoderStack(MemoryMachineConfig(hidden_size=32,
         ...     num_attention_heads=4, num_key_value_heads=2, ced_num_encoder_layers=1,
-        ...     ced_num_decoder_layers=1, csa_top_k=4))
+        ...     ced_num_decoder_layers=1, csa_top_k=4, csa_num_output_groups=4))
         >>> enc = torch.randn(1, 8, 32)
         >>> x, shared = stack.encode(enc)
         >>> stack.decode_full_context(torch.randn(1, 4, 32), x).shape
@@ -128,6 +138,19 @@ class CausalEncoderDecoderStack(nn.Module):
         )
         self.global_projs = nn.ModuleList([CEDGlobalKVProjection(config) for _ in range(dec_n)])
         self.window_size = config.swa_window_size
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Re-applies every encoder/decoder layer and global-projection init
+        so a freshly built (or re-initialized) stack starts from balanced
+        branch fusion, uniform pooling, and zero-start residual outputs.
+        """
+        for layer in (*self.encoder_layers, *self.decoder_layers, *self.global_projs):
+            reset = getattr(layer, "reset_parameters", None)
+            if callable(reset):
+                reset()
 
     def encode(self, hidden_states: torch.Tensor, position_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, CSA2SharedState]:
         r"""encode(hidden_states, position_ids=None) -> (Tensor, CSA2SharedState)
@@ -148,7 +171,7 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> stack = CausalEncoderDecoderStack(MemoryMachineConfig(hidden_size=16,
             ...     num_attention_heads=2, num_key_value_heads=1, ced_num_encoder_layers=1,
-            ...     ced_num_decoder_layers=1, csa_top_k=4))
+            ...     ced_num_decoder_layers=1, csa_top_k=4, csa_num_output_groups=2))
             >>> stack.encode(torch.randn(1, 6, 16))[0].shape
             torch.Size([1, 6, 16])
         """
@@ -157,6 +180,8 @@ class CausalEncoderDecoderStack(nn.Module):
         for layer in self.encoder_layers:
             if not isinstance(layer, CompressedSparseAttention2):
                 raise TypeError(f"encoder_layers must hold CompressedSparseAttention2, got {type(layer).__name__}")
+            if shared is None:
+                shared = CSA2SharedState(total_len=0)
             x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
         if shared is None:
             raise ValueError("encode produced no shared state (encoder_layers is empty)")
@@ -185,7 +210,7 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> stack = CausalEncoderDecoderStack(MemoryMachineConfig(hidden_size=16,
             ...     num_attention_heads=2, num_key_value_heads=1, ced_num_encoder_layers=1,
-            ...     ced_num_decoder_layers=1, csa_top_k=4))
+            ...     ced_num_decoder_layers=1, csa_top_k=4, csa_num_output_groups=2))
             >>> enc = torch.randn(1, 6, 16)
             >>> stack.decode_full_context(torch.randn(1, 4, 16), enc).shape
             torch.Size([1, 4, 16])
@@ -196,7 +221,7 @@ class CausalEncoderDecoderStack(nn.Module):
             if not isinstance(layer, CompressedSparseAttention2):
                 raise TypeError(f"decoder_layers must hold CompressedSparseAttention2, got {type(layer).__name__}")
             comp, ends = proj(encoder_final)
-            if shared is None or layer.mode == "full":
+            if shared is None:
                 shared = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=encoder_final.shape[1])
                 if layer.indexer is not None:
                     shared.indexer_k = layer.indexer.k_index_proj(comp.mean(dim=2))
@@ -231,15 +256,13 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> stack = CausalEncoderDecoderStack(MemoryMachineConfig(hidden_size=16,
             ...     num_attention_heads=2, num_key_value_heads=1, ced_num_encoder_layers=1,
-            ...     ced_num_decoder_layers=1, csa_top_k=4))
+            ...     ced_num_decoder_layers=1, csa_top_k=4, csa_num_output_groups=2))
             >>> stack.prefill(torch.randn(1, 4, 16), torch.randn(1, 6, 16)).shape
             torch.Size([1, 4, 16])
         """
         if not self.config.swa_bounded_replay:
             return self.decode_full_context(hidden_states, encoder_final, position_ids)
         tail = hidden_states[:, -self.window_size :, :]
-        if position_ids is None:
-            return self.decode_full_context(tail, encoder_final, None)
-        if position_ids.dim() == 2:
-            return self.decode_full_context(tail, encoder_final, position_ids[:, -self.window_size :])
-        return self.decode_full_context(tail, encoder_final, position_ids[-self.window_size :])
+        if position_ids is not None:
+            position_ids = position_ids[:, -self.window_size :] if position_ids.dim() == 2 else position_ids[-self.window_size :]
+        return self.decode_full_context(tail, encoder_final, position_ids)

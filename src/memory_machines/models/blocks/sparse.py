@@ -64,11 +64,16 @@ class CompressedSparseAttention(GroupedQueryAttention):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2, csa_top_k=4))
+        ...     num_attention_heads=4, num_key_value_heads=2, csa_top_k=4, csa_num_output_groups=4))
         >>> out, _, cache = layer(torch.randn(1, 8, 32), use_cache=True)
         >>> out.shape
         torch.Size([1, 8, 32])
     """
+
+    q_norm: HeadRMSNorm | None
+    kv_norm: HeadRMSNorm | None
+    sink: AttentionSink | None
+    grouped_out: GroupedOutputProjection
 
     def __init__(
         self,
@@ -80,80 +85,50 @@ class CompressedSparseAttention(GroupedQueryAttention):
         window_size: int | None = None,
     ):
         super().__init__(config)
-        del self.q_proj
-        del self.k_proj
-        del self.o_proj
         self.compression_ratio = compression_ratio if compression_ratio is not None else config.csa_compression_ratio
         self.use_indexer = use_indexer
         self.use_dense_branch = use_dense_branch
         self.top_k = top_k if top_k is not None else config.csa_top_k
         self.window_size = window_size if window_size is not None else config.swa_window_size
-        q_latent = config.csa_q_latent_dim if config.csa_q_latent_dim > 0 else config.hidden_size
-        self.q_latent_dim = q_latent
-        self.q_down = nn.Linear(config.hidden_size, q_latent, bias=False)
-        self.q_up_main = nn.Linear(q_latent, self.num_heads * self.head_dim, bias=False)
+        self.q_latent_dim = config.csa_q_latent_dim if config.csa_q_latent_dim > 0 else config.hidden_size
+        self.q_down = nn.Linear(config.hidden_size, self.q_latent_dim, bias=False)
+        self.q_up_main = nn.Linear(self.q_latent_dim, self.num_heads * self.head_dim, bias=False)
         self.compressor = BlockCompressor(config.hidden_size, self.num_key_value_heads, self.head_dim, self.compression_ratio)
-        self.indexer = SparseIndexer(q_latent, self.head_dim, config.csa_indexer_heads, config.csa_indexer_dim) if use_indexer else None
-        n_br = (1 if use_dense_branch or not use_indexer else 0) + (1 if use_indexer else 0) + 1
+        self.indexer = SparseIndexer(self.q_latent_dim, self.head_dim, config.csa_indexer_heads, config.csa_indexer_dim) if use_indexer else None
+        n_br = 2 + (1 if use_dense_branch and use_indexer else 0)
         self.branch_gate = BranchGate(config.hidden_size, n_br)
         self.q_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if config.csa_use_qkv_norm else None
         self.kv_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if config.csa_use_qkv_norm else None
         self.sink = AttentionSink(self.num_heads) if config.csa_use_sink else None
         self.grouped_out = GroupedOutputProjection(self.num_heads, self.head_dim, config.csa_num_output_groups, config.csa_output_group_dim, config.hidden_size)
         self.swa = SlidingWindowAttention(config, self.window_size)
+        self.reset_parameters()
 
-    def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""_project_qkv(hidden_states) -> (Tensor, Tensor, Tensor)
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
 
-        Disabled parent projection (no Q/K/O projections here).
-
-        Args:
-            hidden_states (Tensor): input of shape ``(B, L, hidden)``.
-
-        Returns:
-            Tensor: never returns; always raises ``NotImplementedError``. Use
-            :meth:`_make_main_queries` instead.
-
-        Examples::
-
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2))
-            >>> try:
-            ...     layer._project_qkv(__import__("torch").randn(1, 2, 16))
-            ... except NotImplementedError:
-            ...     print("raised")
-            raised
+        Xavier-uniform for the low-rank query path (``q_down``/``q_up_main``)
+        and the retained ``v_proj`` reference values; all composed
+        submodules (compressor, indexer, branch gate, norms, sink, grouped
+        output, SWA branch) are re-reset to their own neutral-start inits
+        so a freshly built sparse layer fuses balanced branches from
+        uniform pooling and zero-start residual outputs.
         """
-        raise NotImplementedError("CompressedSparseAttention has no parent Q/K/O projections; use _make_main_queries().")
-
-    def _project_heads(self, heads: torch.Tensor, bsz: int, q_len: int) -> torch.Tensor:
-        r"""_project_heads(heads, bsz, q_len) -> Tensor
-
-        Disabled parent head projection (uses grouped fusion instead).
-
-        Args:
-            heads (Tensor): per-head outputs.
-            bsz (int): batch size.
-            q_len (int): query length.
-
-        Returns:
-            Tensor: never returns; always raises ``NotImplementedError``. Use
-            :meth:`_fuse_branches` plus ``grouped_out`` instead.
-
-        Examples::
-
-            >>> import torch
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2))
-            >>> try:
-            ...     layer._project_heads(torch.randn(1, 2, 2, 8), 1, 2)
-            ... except NotImplementedError:
-            ...     print("raised")
-            raised
-        """
-        raise NotImplementedError("CompressedSparseAttention has no o_proj; use _fuse_branches() + grouped_out.")
+        nn.init.xavier_uniform_(self.q_down.weight)
+        nn.init.xavier_uniform_(self.q_up_main.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        self.compressor.reset_parameters()
+        if self.indexer is not None:
+            self.indexer.reset_parameters()
+        self.branch_gate.reset_parameters()
+        if self.q_norm is not None:
+            self.q_norm.reset_parameters()
+        if self.kv_norm is not None:
+            self.kv_norm.reset_parameters()
+        if self.sink is not None:
+            self.sink.reset_parameters()
+        self.grouped_out.reset_parameters()
+        self.swa.reset_parameters()
 
     def _core_attend(
         self,
@@ -191,15 +166,17 @@ class CompressedSparseAttention(GroupedQueryAttention):
             >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
             ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2,
             ...     csa_use_qkv_norm=False, csa_use_sink=False, frvm_enabled=False,
-            ...     cvpe_enabled=False))
+            ...     cvpe_enabled=False, csa_num_output_groups=2))
             >>> layer._core_attend(torch.randn(1, 2, 3, 8), torch.randn(1, 1, 5, 8),
             ...     torch.randn(1, 2, 3, 8), torch.tensor([[4, 5, 6]]),
             ...     torch.tensor([[0, 1, 2, 3, 4]])).shape
             torch.Size([1, 2, 3, 8])
         """
-        if self.q_norm is not None:
-            q_heads = self.q_norm(q_heads)
-            kv = self.kv_norm(kv)
+        q_norm = self.q_norm
+        kv_norm = self.kv_norm
+        if q_norm is not None and kv_norm is not None:
+            q_heads = q_norm(q_heads)
+            kv = kv_norm(kv)
         kv_exp = kv.repeat_interleave(self.num_key_value_groups, dim=1)
         logits = torch.matmul(q_heads, kv_exp.transpose(2, 3)) / math.sqrt(self.head_dim)
         if self.cvpe_bias is not None:
@@ -286,7 +263,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2))
             >>> cq, q, v = layer._make_main_queries(torch.randn(1, 4, 16))
             >>> cq.shape, q.shape, v.shape
             (torch.Size([1, 4, 16]), torch.Size([1, 2, 4, 8]), torch.Size([1, 2, 4, 8]))
@@ -315,7 +292,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2))
             >>> layer._fuse_branches([torch.randn(1, 2, 3, 8), torch.randn(1, 2, 3, 8)],
             ...     torch.randn(1, 3, 16)).shape
             torch.Size([1, 2, 3, 8])
@@ -337,7 +314,10 @@ class CompressedSparseAttention(GroupedQueryAttention):
     ) -> torch.Tensor:
         r"""_selected_branch(q_main, sel, sel_pos, v_q, q_pos) -> Tensor
 
-        Attend each query to its own top-``k`` selection (per-query loop).
+        Attend each query to its own top-``k`` selection in one batched
+        gather-matmul (queries flattened to ``B * Lq`` with a singleton
+        key dim, so the per-query path matches :meth:`_core_attend`
+        exactly without a Python loop over ``Lq``).
 
         Args:
             q_main (Tensor): queries of shape ``(B, H, Lq, Dh)``.
@@ -356,27 +336,21 @@ class CompressedSparseAttention(GroupedQueryAttention):
             >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
             ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2,
             ...     frvm_enabled=False, cvpe_enabled=False, csa_use_sink=False,
-            ...     csa_use_qkv_norm=False))
+            ...     csa_use_qkv_norm=False, csa_num_output_groups=2))
             >>> layer._selected_branch(torch.randn(1, 2, 2, 8), torch.randn(1, 2, 2, 1, 8),
             ...     torch.tensor([[[0, 1], [0, 1]]]), torch.randn(1, 2, 2, 8),
             ...     torch.tensor([[3, 4]])).shape
             torch.Size([1, 2, 2, 8])
         """
-        # Per-query loop; fuse into one batched gather-matmul for long context.
-        outs = []
-        for t in range(q_main.shape[2]):
-            k_t = sel[:, t, :, :, :].transpose(1, 2)
-            outs.append(
-                self._core_attend(
-                    q_main[:, :, t : t + 1, :],
-                    k_t,
-                    v_q[:, :, t : t + 1, :],
-                    q_pos[:, t : t + 1],
-                    sel_pos[:, t, :],
-                    causal=True,
-                )
-            )
-        return torch.cat(outs, dim=2)
+        bsz, _, lq, _ = q_main.shape
+        flat = bsz * lq
+        qf = q_main.transpose(1, 2).reshape(flat, self.num_heads, 1, self.head_dim)
+        kf = sel.reshape(flat, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        vqf = v_q.transpose(1, 2).reshape(flat, self.num_heads, 1, self.head_dim)
+        qpos = q_pos.reshape(flat, 1)
+        kpos = sel_pos.reshape(flat, -1)
+        out = self._core_attend(qf, kf, vqf, qpos, kpos, causal=True)
+        return out.reshape(bsz, lq, self.num_heads, self.head_dim).transpose(1, 2)
 
     def forward(  # type: ignore[override]
         self,
@@ -420,7 +394,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2))
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2))
             >>> out, w, cache = layer(torch.randn(1, 6, 16), use_cache=True)
             >>> out.shape, w, cache.total_len
             (torch.Size([1, 6, 16]), None, 6)
@@ -477,7 +451,7 @@ class NativeSparseAttention(CompressedSparseAttention):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> layer = NativeSparseAttention(MemoryMachineConfig(hidden_size=16,
-        ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2))
+        ...     num_attention_heads=2, num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2))
         >>> layer(torch.randn(1, 6, 16))[0].shape
         torch.Size([1, 6, 16])
     """
@@ -501,7 +475,7 @@ class HeavilyCompressedAttention(CompressedSparseAttention):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> layer = HeavilyCompressedAttention(MemoryMachineConfig(hidden_size=16,
-        ...     num_attention_heads=2, num_key_value_heads=1))
+        ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
         >>> layer(torch.randn(1, 8, 16))[0].shape
         torch.Size([1, 8, 16])
     """
@@ -543,7 +517,7 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> from memory_machines.models.blocks.shared import CSA2SharedState
         >>> cfg = MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
-        ...     num_key_value_heads=1, csa_top_k=2)
+        ...     num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2)
         >>> full = CompressedSparseAttention2(cfg, mode="full")
         >>> out, shared = full.forward_shared(torch.randn(1, 6, 16))
         >>> out.shape, shared.topk_indices.shape
@@ -578,7 +552,7 @@ class CompressedSparseAttention2(CompressedSparseAttention):
 
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> CompressedSparseAttention2(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1))._hier_pool_blocks() > 0
+            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))._hier_pool_blocks() > 0
             True
         """
         cfg = self.config
@@ -598,8 +572,11 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         Run one CSA2 layer with cross-layer shared state.
 
         Selected sparse outputs and SWA-window outputs are fused with the
-        two-branch gate into model-dimension outputs; the SWA slice of
-        ``shared`` advances when ``use_cache`` is set.
+        two-branch gate into model-dimension outputs. Global KV, indexer
+        keys, and Top-K indices are published to ``shared``; SWA KV is
+        *not* shared (each layer keeps its own window cache), and
+        ``shared.total_len`` is read as the sequence past set by the
+        calling stack, never advanced here.
 
         Args:
             hidden_states (Tensor): input of shape ``(B, Lq, hidden)``.
@@ -610,8 +587,9 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             compress_start_pos (int, optional): start position used with
                 ``compress_from``. Default: ``0``.
             position_ids (Tensor, optional): absolute positions. Default: ``None``.
-            use_cache (bool, optional): whether to advance SWA/total-len bookkeeping.
-                Default: ``False``.
+            use_cache (bool, optional): accepted for API parity; the SWA
+                branch runs without a persistent cache because SWA KV is
+                layer-local. Default: ``False``.
 
         Returns:
             Tensor: fused outputs ``(B, Lq, hidden)`` and the updated shared
@@ -622,8 +600,8 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> cfg = MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
-            ...     num_key_value_heads=1, csa_top_k=2)
-            >>> full, re = CompressedSparseAttention2(cfg, "full"), CompressedSparseAttention2(cfg, "reindex")
+            ...     num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2)
+            >>> full, re = CompressedSparseAttention2(cfg, mode="full"), CompressedSparseAttention2(cfg, mode="reindex")
             >>> out, shared = full.forward_shared(torch.randn(1, 6, 16), use_cache=True)
             >>> full2, _ = re.forward_shared(torch.randn(1, 6, 16), shared)
             >>> full2.shape
@@ -632,7 +610,7 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         bsz, q_len, _ = hidden_states.shape
         if shared is None:
             shared = CSA2SharedState()
-        past_len_raw = _past_total_len(shared) or 0
+        past_len_raw = shared.total_len or 0
         q_pos, _ = _resolve_positions(hidden_states, q_len, past_len_raw, position_ids)
         if self.indexer is None:
             raise ValueError("forward_shared in full/reindex mode requires an indexer (use_indexer=False)")
@@ -665,8 +643,17 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             if shared.pool_indices is not None and shared.pool_indices.shape[1] == q_len:
                 pool_scores = self.indexer.rescore_pool(cq, shared.indexer_k, shared.pool_indices, q_pos, full_ends)
                 k = min(self.top_k, pool_scores.shape[-1])
+                # topk on all -inf rows returns arbitrary entries;
+                # select only causally visible entries instead.
+                finite = pool_scores.isfinite()
                 local = pool_scores.topk(k, dim=-1).indices
-                topk = shared.pool_indices.gather(-1, local)
+                vis_count = finite.sum(-1)
+                has_vis = vis_count > 0
+                last_idx = (finite.shape[-1] - 1) - finite.flip(-1).int().argmax(-1)
+                last_idx = last_idx.masked_fill(~has_vis, 0)
+                tail = torch.arange(k, device=finite.device).unsqueeze(0).unsqueeze(0)
+                local = torch.where(tail < vis_count.unsqueeze(-1), local, last_idx.unsqueeze(-1))
+                topk = torch.where(has_vis.unsqueeze(-1), shared.pool_indices.gather(-1, local), shared.pool_indices[:, :, :1])
             else:
                 scores = self.indexer.score(cq, full_comp, q_pos, full_ends)
                 topk = self.indexer.topk(scores, self.top_k)
@@ -683,11 +670,6 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                 topk = topk[:, -1:, :].expand(bsz, q_len, -1)
         sel = self._gather_selected(full_comp, topk)
         sparse_out = self._selected_branch(q_main, sel, self._selected_positions(full_ends, topk), v_q, q_pos)
-        swa_past = None if shared.swa_k is None else (shared.swa_k, shared.swa_v)
-        win_out, _, swa_present = self.swa(hidden_states, None, position_ids, swa_past, False, use_cache=True, past_len_override=past_len_raw, past_positions=shared.swa_pos)
+        win_out, _, _ = self.swa(hidden_states, None, position_ids, None, False, use_cache=False)
         out = self.grouped_out(self._fuse_branches([sparse_out, win_out], hidden_states))
-        if use_cache and swa_present is not None:
-            shared.swa_k, shared.swa_v = swa_present
-            shared.swa_pos = _update_swa_pos(shared.swa_pos, q_pos, swa_present[0].shape[2])
-            shared.total_len = past_len_raw + q_len
         return out, shared

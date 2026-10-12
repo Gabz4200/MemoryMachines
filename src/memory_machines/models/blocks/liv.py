@@ -32,7 +32,7 @@ class LivDoubleGatedBase(nn.Module):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> from memory_machines.models.blocks.liv import LivConvBlock
-        >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=32, num_attention_heads=4))
+        >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=32, num_attention_heads=4, csa_num_output_groups=4))
         >>> blk(torch.randn(1, 8, 32)).shape
         torch.Size([1, 8, 32])
     """
@@ -55,6 +55,19 @@ class LivDoubleGatedBase(nn.Module):
         self.output_projection = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
         self.dropout = nn.Dropout(config.hidden_dropout)
+        LivDoubleGatedBase.reset_parameters(self)
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Xavier-uniform for the 3-way input projection; the output
+        projection is zero-initialized so the whole double-gated branch
+        starts as an identity residual despite its two multiplicative
+        gatings (Fixup; ReZero). Subclass mixers define their own start
+        (Dirac identity for conv, small-normal latents for perceiver).
+        """
+        nn.init.xavier_uniform_(self.input_projection.weight)
+        nn.init.zeros_(self.output_projection.weight)
 
     def split_gates_heads(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""split_gates_heads(x) -> (Tensor, Tensor, Tensor, Tensor)
@@ -74,7 +87,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> [t.shape for t in blk.split_gates_heads(torch.randn(1, 4, 16))]
             [torch.Size([1, 4, 2, 8]), torch.Size([1, 4, 2, 8]), torch.Size([1, 4, 2, 8]), torch.Size([1, 4, 2, 8])]
         """
@@ -100,7 +113,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> [t.shape for t in blk.split_gates(torch.randn(1, 4, 16))]
             [torch.Size([1, 4, 16]), torch.Size([1, 4, 16]), torch.Size([1, 4, 16]), torch.Size([1, 4, 16])]
         """
@@ -131,7 +144,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> blk.mix_heads(torch.randn(1, 4, 2, 8)).shape
             torch.Size([1, 4, 2, 8])
         """
@@ -153,7 +166,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> blk.token_mix(torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
@@ -177,7 +190,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))(torch.randn(1, 4, 16)).shape
+            >>> LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))(torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
         _, post_gate, _, x_gated = self.split_gates_heads(x)
@@ -200,7 +213,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> blk.finish_heads(torch.randn(1, 4, 2, 8), torch.randn(1, 4, 2, 8)).shape
             torch.Size([1, 4, 16])
         """
@@ -225,7 +238,7 @@ class LivDoubleGatedBase(nn.Module):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> from memory_machines.models.blocks.liv import LivConvBlock
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> blk.finish(torch.randn(1, 4, 16), torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
@@ -249,7 +262,7 @@ class LivConvBlock(LivDoubleGatedBase):
     Examples::
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-        >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=32, num_attention_heads=4))
+        >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=32, num_attention_heads=4, csa_num_output_groups=4))
         >>> blk(torch.randn(2, 8, 32)).shape
         torch.Size([2, 8, 32])
     """
@@ -265,6 +278,26 @@ class LivConvBlock(LivDoubleGatedBase):
             groups=self.num_heads,
             bias=False,
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Grouped-Dirac (identity) init: output channel ``c`` reads its own
+        group's channel ``c % head_dim`` at the center tap, so the mixer
+        preserves the token stream exactly at step 0 and learns local
+        context from an identity start (DiracNets, Zagoruyko & Komodakis,
+        2016; cf. Fixup identity-start). ``nn.init.dirac_`` cannot be
+        used here: it maps output channel ``c`` to input channel ``c``,
+        which leaves all but the first group dead for grouped convolutions
+        with ``out_channels > in_channels // groups``.
+        """
+        LivDoubleGatedBase.reset_parameters(self)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            center = self.conv.kernel_size[0] // 2
+            for c in range(self.conv.out_channels):
+                self.conv.weight[c, c % self.head_dim, center] = 1.0
 
     def mix_heads(self, x_gated: torch.Tensor) -> torch.Tensor:
         r"""mix_heads(x_gated) -> Tensor
@@ -281,7 +314,7 @@ class LivConvBlock(LivDoubleGatedBase):
 
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2))
+            >>> blk = LivConvBlock(MemoryMachineConfig(hidden_size=16, num_attention_heads=2, csa_num_output_groups=2, num_key_value_heads=1))
             >>> blk.mix_heads(torch.randn(1, 6, 2, 8)).shape
             torch.Size([1, 6, 2, 8])
         """
@@ -314,7 +347,7 @@ class LivPerceiver(LivDoubleGatedBase):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> blk = LivPerceiver(MemoryMachineConfig(hidden_size=32, num_attention_heads=4,
-        ...     num_key_value_heads=2, num_perceiver_query=4))
+        ...     num_key_value_heads=2, num_perceiver_query=4, csa_num_output_groups=4))
         >>> blk(torch.randn(1, 8, 32)).shape
         torch.Size([1, 8, 32])
     """
@@ -328,8 +361,22 @@ class LivPerceiver(LivDoubleGatedBase):
         heads, kv_heads, dh = self.swa.num_heads, self.swa.num_key_value_heads, self.swa.head_dim
         self.latent_queries = nn.Parameter(torch.empty(heads, self.num_latents, dh))
         self.latent_values = nn.Parameter(torch.empty(kv_heads, self.num_latents, dh))
-        nn.init.normal_(self.latent_queries, std=config.initializer_range)
-        nn.init.normal_(self.latent_values, std=config.initializer_range)
+        self.latent_std = config.initializer_range
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Small-normal init (``std = config.initializer_range``, GPT-2
+        style) for the learned latent queries/values, matching Perceiver
+        practice (Jaegle et al., 2021) where latents start as weak,
+        near-orthogonal seeds and differentiate through cross-attention.
+        The internal SWA core keeps its own attention init.
+        """
+        LivDoubleGatedBase.reset_parameters(self)
+        self.swa.reset_parameters()
+        nn.init.normal_(self.latent_queries, std=self.latent_std)
+        nn.init.normal_(self.latent_values, std=self.latent_std)
 
     def _latent_anchors(self, seqlen: int, device: torch.device) -> torch.Tensor:
         r"""_latent_anchors(seqlen, device) -> Tensor
@@ -348,7 +395,7 @@ class LivPerceiver(LivDoubleGatedBase):
 
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> blk = LivPerceiver(MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
-            ...     num_key_value_heads=1, num_perceiver_query=3))
+            ...     num_key_value_heads=1, num_perceiver_query=3, csa_num_output_groups=2))
             >>> blk._latent_anchors(6, torch.device("cpu"))
             tensor([[0, 2, 5]])
         """
@@ -372,7 +419,7 @@ class LivPerceiver(LivDoubleGatedBase):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> blk = LivPerceiver(MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
-            ...     num_key_value_heads=1, num_perceiver_query=3))
+            ...     num_key_value_heads=1, num_perceiver_query=3, csa_num_output_groups=2))
             >>> k, v = blk._project_latent_kv(torch.randn(1, 3, 16))
             >>> k.shape, v.shape
             (torch.Size([1, 1, 3, 8]), torch.Size([1, 1, 3, 8]))
@@ -400,7 +447,7 @@ class LivPerceiver(LivDoubleGatedBase):
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> blk = LivPerceiver(MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
-            ...     num_key_value_heads=1, num_perceiver_query=3))
+            ...     num_key_value_heads=1, num_perceiver_query=3, csa_num_output_groups=2))
             >>> blk.mix_heads(torch.randn(1, 6, 2, 8)).shape
             torch.Size([1, 6, 2, 8])
         """
@@ -413,8 +460,7 @@ class LivPerceiver(LivDoubleGatedBase):
         anchors = self._latent_anchors(seqlen, device).expand(bsz, -1)
         k_pos = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, -1)
 
-        kv_in = swa.k_proj(x_merged).view(bsz, seqlen, swa.num_key_value_heads, swa.head_dim).transpose(1, 2)
-        vv_in = swa.v_proj(x_merged).view(bsz, seqlen, swa.num_key_value_heads, swa.head_dim).transpose(1, 2)
+        kv_in, vv_in = self._project_latent_kv(x_merged)
         q_lat = self.latent_queries.unsqueeze(0).expand(bsz, -1, -1, -1)
         v_ref = self.latent_values.unsqueeze(0).expand(bsz, -1, -1, -1)
         heads_lat, _ = swa.attend(q_lat, kv_in, vv_in, v_ref, anchors, k_pos, windowed=False)

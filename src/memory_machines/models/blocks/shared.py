@@ -54,14 +54,15 @@ class CompressedCache:
 
 @dataclass
 class CSA2SharedState:
-    r"""CSA2SharedState(compressed_kv=None, comp_end_pos=None, indexer_k=None, topk_indices=None, pool_indices=None, swa_k=None, swa_v=None, swa_pos=None, total_len=None)
+    r"""CSA2SharedState(compressed_kv=None, comp_end_pos=None, indexer_k=None, topk_indices=None, pool_indices=None, total_len=None)
 
     Cross-layer shared state for
     :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`.
 
     A ``full`` layer populates the compressed store, indexer keys, and
     candidate pools; ``reindex``/``reuse`` layers consume them without
-    recompressing.
+    recompressing. SWA KV is deliberately absent: every CSA2 layer
+    keeps its own sliding-window cache (CSA2, Fig. 4).
 
     Attributes:
         compressed_kv (torch.Tensor, optional): shared compressed KV store of
@@ -74,11 +75,8 @@ class CSA2SharedState:
             shape ``(B, Lq, K)``. Default: ``None``.
         pool_indices (torch.Tensor, optional): hierarchical candidate pool per
             query, shape ``(B, Lq, P)``. Default: ``None``.
-        swa_k (torch.Tensor, optional): shared SWA key window. Default: ``None``.
-        swa_v (torch.Tensor, optional): shared SWA value window. Default: ``None``.
-        swa_pos (torch.Tensor, optional): positions of the SWA window, shape
-            ``(B, Ws)``. Default: ``None``.
-        total_len (int, optional): total consumed sequence length. Default: ``None``.
+        total_len (int, optional): total consumed sequence length, set by
+            the calling stack (not advanced per layer). Default: ``None``.
 
     Examples::
 
@@ -92,9 +90,6 @@ class CSA2SharedState:
     indexer_k: torch.Tensor | None = None
     topk_indices: torch.Tensor | None = None
     pool_indices: torch.Tensor | None = None
-    swa_k: torch.Tensor | None = None
-    swa_v: torch.Tensor | None = None
-    swa_pos: torch.Tensor | None = None
     total_len: int | None = None
 
 
@@ -127,8 +122,9 @@ def _past_total_len(
         return 0
     if past.total_len is not None:
         return past.total_len
-    if past.swa_pos is not None:
-        return int(past.swa_pos.max().item()) + 1
+    swa_pos = getattr(past, "swa_pos", None)
+    if swa_pos is not None:
+        return int(swa_pos.max().item()) + 1
     return None
 
 
@@ -197,8 +193,8 @@ def _window_mask(
         >>> q = torch.tensor([[2, 3]])
         >>> k = torch.tensor([[0, 1, 2, 3]])
         >>> _window_mask(q, k, 2)
-        tensor([[[ True,  True, False, False],
-                 [False,  True,  True, False]]])
+        tensor([[[False,  True,  True, False],
+                 [False, False,  True,  True]]])
     """
     rel = q_pos.unsqueeze(-1) - k_pos.unsqueeze(1)
     return (rel >= 0) & (rel < window)
@@ -272,16 +268,13 @@ def _resolve_positions(
     """
     bsz = hidden_states.shape[0]
     device = hidden_states.device
-    if position_ids is not None and position_ids.dim() == 2:
-        if position_ids.shape[0] != bsz:
-            raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
-        q_pos = position_ids[:, -q_len:].to(device)
-        past_pos = torch.arange(past_len, device=device, dtype=q_pos.dtype).unsqueeze(0).expand(bsz, -1)
-        k_pos = torch.cat([past_pos, q_pos], dim=1) if past_len else q_pos
-        return q_pos, k_pos
-    if position_ids is not None and position_ids.dim() == 1:
-        q_pos_1d = position_ids[-q_len:].to(device)
-        q_pos = q_pos_1d.unsqueeze(0).expand(bsz, -1)
+    if position_ids is not None:
+        if position_ids.dim() == 2:
+            if position_ids.shape[0] != bsz:
+                raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
+            q_pos = position_ids[:, -q_len:].to(device)
+        else:
+            q_pos = position_ids[-q_len:].to(device).unsqueeze(0).expand(bsz, -1)
         past_pos = torch.arange(past_len, device=device, dtype=q_pos.dtype).unsqueeze(0).expand(bsz, -1)
         k_pos = torch.cat([past_pos, q_pos], dim=1) if past_len else q_pos
         return q_pos, k_pos

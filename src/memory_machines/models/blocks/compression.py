@@ -58,6 +58,21 @@ class BlockCompressor(nn.Module):
         self.kv_proj = nn.Linear(hidden_size, kv_dim, bias=False)
         self.score_proj = nn.Linear(hidden_size, num_kv_heads, bias=False)
         self.block_bias = nn.Parameter(torch.zeros(compression_ratio, num_kv_heads))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Xavier-uniform for ``kv_proj``; ``score_proj`` and ``block_bias``
+        are zero-initialized so every block starts as a uniform average
+        pool and the compressor learns selectivity from a neutral,
+        position-independent start (cf. Set Transformer PMA, Lee et al.,
+        2019). A random score init would give sharp arbitrary softmaxes
+        at step 0.
+        """
+        nn.init.xavier_uniform_(self.kv_proj.weight)
+        nn.init.zeros_(self.score_proj.weight)
+        nn.init.zeros_(self.block_bias)
 
     def forward(
         self,
@@ -142,12 +157,25 @@ class SparseIndexer(nn.Module):
         index_dim: int = 128,
     ):
         super().__init__()
-        self.q_latent_dim = q_latent_dim
         self.num_index_heads = num_index_heads
         self.index_dim = index_dim
         self.q_up_index = nn.Linear(q_latent_dim, num_index_heads * index_dim, bias=False)
         self.k_index_proj = nn.Linear(kv_head_dim, index_dim, bias=False)
         self.weight_proj = nn.Linear(q_latent_dim, num_index_heads, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Kaiming-uniform (ReLU gain) for the index query/key projections,
+        whose dot products pass through a ReLU (He et al., 2015);
+        ``weight_proj`` is zero-initialized so retrieval scores start at
+        zero (neutral ranking) instead of collapsing onto random entries
+        before the index geometry is learned.
+        """
+        nn.init.kaiming_uniform_(self.q_up_index.weight, a=0, nonlinearity="relu")
+        nn.init.kaiming_uniform_(self.k_index_proj.weight, a=0, nonlinearity="relu")
+        nn.init.zeros_(self.weight_proj.weight)
 
     def _index_heads(self, query_latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         r"""_index_heads(query_latent) -> (Tensor, Tensor)
@@ -347,6 +375,18 @@ class BranchGate(nn.Module):
     def __init__(self, hidden_size: int, num_branches: int = 2):
         super().__init__()
         self.proj = nn.Linear(hidden_size, num_branches)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Zero-initialized so all branches fuse equally (``sigmoid(0) = 0.5``)
+        at step 0; the model learns to prefer branches from a balanced
+        start instead of a random early commitment (cf. Highway-network
+        gating, Srivastava et al., 2015).
+        """
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         r"""forward(hidden_states) -> Tensor
@@ -391,6 +431,15 @@ class HeadRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(head_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Unit gain so the norm starts as a pure RMS rescale (identity
+        up to scale), the standard RMSNorm init (Zhang & Sennrich, 2019).
+        """
+        nn.init.ones_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""forward(x) -> Tensor
@@ -435,6 +484,17 @@ class AttentionSink(nn.Module):
     def __init__(self, num_heads: int):
         super().__init__()
         self.sink_logit = nn.Parameter(torch.zeros(num_heads))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Zero sink logit (``exp(0) = 1``) so each head starts with a modest
+        neutral sink mass of ``1 / (Lk + 1)`` per row; the head then learns
+        how much excess mass to absorb (cf. attention-sink behavior, Xiao
+        et al., 2023).
+        """
+        nn.init.zeros_(self.sink_logit)
 
     def weights(self, logits: torch.Tensor) -> torch.Tensor:
         r"""weights(logits) -> Tensor
@@ -451,8 +511,8 @@ class AttentionSink(nn.Module):
         Examples::
 
             >>> import torch
-            >>> AttentionSink(2).weights(torch.zeros(1, 2, 1, 3)).sum()
-            tensor(0.75...)
+            >>> round(float(AttentionSink(2).weights(torch.zeros(1, 2, 1, 3)).sum()), 4)
+            1.5
         """
         denom = torch.exp(logits).sum(dim=-1, keepdim=True) + torch.exp(self.sink_logit).view(1, -1, 1, 1).to(logits.dtype)
         return torch.exp(logits) / denom
@@ -480,7 +540,7 @@ class GroupedOutputProjection(nn.Module):
         >>> import torch
         >>> proj = GroupedOutputProjection(4, 8, num_groups=2, group_dim=16, hidden_size=32)
         >>> proj(torch.randn(1, 4, 5, 8)).shape
-        torch.Size([1, 32, 5])
+        torch.Size([1, 5, 32])
     """
 
     def __init__(self, num_heads: int, head_dim: int, num_groups: int, group_dim: int, hidden_size: int):
@@ -491,6 +551,20 @@ class GroupedOutputProjection(nn.Module):
         self.group_heads = num_heads // num_groups
         self.group_projs = nn.ModuleList([nn.Linear(self.group_heads * head_dim, group_dim, bias=False) for _ in range(num_groups)])
         self.out_proj = nn.Linear(num_groups * group_dim, hidden_size, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Xavier-uniform for the per-group projections; the final
+        ``out_proj`` is zero-initialized so the fused attention output
+        starts as an identity residual (Fixup; ReZero), matching the
+        zero-start of the dense ``o_proj`` it replaces.
+        """
+        for proj in self.group_projs:
+            assert isinstance(proj, nn.Linear)
+            nn.init.xavier_uniform_(proj.weight)
+        nn.init.zeros_(self.out_proj.weight)
 
     def forward(self, heads: torch.Tensor) -> torch.Tensor:
         r"""forward(heads) -> Tensor
@@ -501,14 +575,14 @@ class GroupedOutputProjection(nn.Module):
             heads (Tensor): head outputs of shape ``(B, H, Lq, Dh)``.
 
         Returns:
-            Tensor: fused output of shape ``(B, hidden_size, Lq)``.
+            Tensor: fused output of shape ``(B, Lq, hidden_size)``.
 
         Examples::
 
             >>> import torch
             >>> proj = GroupedOutputProjection(4, 8, 2, 16, 32)
             >>> proj(torch.randn(1, 4, 5, 8)).shape
-            torch.Size([1, 32, 5])
+            torch.Size([1, 5, 32])
         """
         bsz, _, lq, _ = heads.shape
         x = heads.transpose(1, 2)
