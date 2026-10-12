@@ -15,6 +15,7 @@ from .compression import (
     HeadRMSNorm,
     SparseIndexer,
 )
+from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
 from .positioning import CVPEContextBias, FRVMValueGate
@@ -44,12 +45,14 @@ __all__ = [
     "CSA2SharedState",
     "CVPEContextBias",
     "CausalEncoderDecoderStack",
+    "ChunkedBottleneckLinear",
     "CompressedCache",
     "CompressedSparseAttention",
     "CompressedSparseAttention2",
     "DSparkDrafter",
     "EngramMemory",
     "FRVMValueGate",
+    "FactoredLinear",
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HeadRMSNorm",
