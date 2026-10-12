@@ -256,12 +256,19 @@ class SinglePassMHC(nn.Module):
             provides ``mhc_num_streams`` (``n``), ``mhc_sinkhorn_iters``,
             ``hidden_size`` (``d``), and ``rms_norm_eps``.
 
+    Single-pass mHC (DeepSeek-V4.1, §2.4.1 Eq. 6) shifts input
+    mixing by one block: ``X_{l+1} = B_l X_l + C_l F_l(A_{l-1} X_l)``.
+    Input mixing therefore uses the *previous* block's ``A`` rather
+    than coefficients computed from ``X_l``, so the three stages
+    (residual update, input mixing, coefficient prediction) depend on
+    a single coefficient set per block.
+
     Examples::
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> mhc = SinglePassMHC(MemoryMachineConfig(hidden_size=32, mhc_num_streams=2))
         >>> streams = torch.randn(1, 4, 2, 32)
-        >>> out, a = mhc(streams, torch.randn(1, 4, 32))
+        >>> out, a = mhc(streams, lambda h: h)
         >>> out.shape
         torch.Size([1, 4, 2, 32])
     """
@@ -378,6 +385,9 @@ class SinglePassMHC(nn.Module):
         Residual recombination shared by :meth:`forward` and
         :meth:`step`.
 
+        Implements the residual term of Eq. 6:
+        ``B_l X_l + C_l F_l(A_{l-1} X_l)``.
+
         Args:
             streams (Tensor): streams of shape ``(B, L, n, d)``.
             b (Tensor): residual mixing weights of shape ``(B, L, n, n)``.
@@ -392,66 +402,42 @@ class SinglePassMHC(nn.Module):
     def forward(
         self,
         streams: torch.Tensor,
-        branch_out: torch.Tensor,
-        prev_a: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""forward(streams, branch_out, prev_a=None) -> (Tensor, Tensor)
-
-        Combine streams with an already-computed branch output.
-
-        Args:
-            streams (Tensor): streams of shape ``(B, L, n, d)``.
-            branch_out (Tensor): branch output of shape ``(B, L, d)``.
-            prev_a (Tensor, optional): cached input weights of shape
-                ``(B, L, 1, n)``; validated but not used for mixing here.
-                Default: ``None``.
-
-        Returns:
-            Tensor: updated streams of shape ``(B, L, n, d)`` and current
-            input weights ``a`` of shape ``(B, L, 1, n)``.
-
-        Examples::
-
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> mhc = SinglePassMHC(MemoryMachineConfig(hidden_size=16, mhc_num_streams=2))
-            >>> mhc(torch.randn(1, 3, 2, 16), torch.randn(1, 3, 16))[0].shape
-            torch.Size([1, 3, 2, 16])
-        """
-        a, b, c = self.coefficients(streams)
-        if prev_a is not None and (prev_a.shape != a.shape):
-            raise ValueError(f"prev_a shape {tuple(prev_a.shape)} does not match current coefficients {tuple(a.shape)}")
-        out = self._combine(streams, b, c, branch_out)
-        return out, a
-
-    def step(
-        self,
-        streams: torch.Tensor,
         branch_fn: Callable[[torch.Tensor], torch.Tensor],
         prev_a: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""step(streams, branch_fn, prev_a=None) -> (Tensor, Tensor)
+        r"""forward(streams, branch_fn, prev_a=None) -> (Tensor, Tensor)
 
-        Run one hyper-connection step around a branch function.
+        Run one single-pass hyper-connection step around a branch
+        function (Eq. 6).
 
-        Mixes streams with ``prev_a`` (or current ``a``), applies
-        ``branch_fn``, then recombines with ``b`` and ``c``.
+        Computes the block's coefficients ``(a, b, c)`` from ``X_l``,
+        mixes the streams into the branch input with the *previous*
+        block's ``A_{l-1}`` (``prev_a``, falling back to the current
+        ``a`` for the first block), applies ``branch_fn``, then
+        recombines with ``b`` and ``c``:
+
+        .. math::
+            X_{l+1} = B_l X_l + C_l F_l(A_{l-1} X_l)
 
         Args:
-            streams (Tensor): streams of shape ``(B, L, n, d)``.
+            streams (Tensor): streams ``X_l`` of shape ``(B, L, n, d)``.
             branch_fn (Callable): maps the mixed input ``(B, L, d)`` to a
                 branch output of the same shape.
-            prev_a (Tensor, optional): cached input weights of shape
-                ``(B, L, 1, n)``. Default: ``None`` (use current ``a``).
+            prev_a (Tensor, optional): cached input weights ``A_{l-1}``
+                of shape ``(B, L, 1, n)`` from the previous block.
+                ``None`` (the first block) falls back to the current
+                ``a``. Default: ``None``.
 
         Returns:
-            Tensor: updated streams ``(B, L, n, d)`` and current ``a``.
+            Tensor: updated streams ``X_{l+1}`` of shape ``(B, L, n, d)``
+            and this block's input weights ``a`` of shape ``(B, L, 1, n)``
+            (to pass as ``prev_a`` to the next block).
 
         Examples::
 
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> mhc = SinglePassMHC(MemoryMachineConfig(hidden_size=16, mhc_num_streams=2))
-            >>> out, _ = mhc.step(torch.randn(1, 3, 2, 16), lambda t: t)
-            >>> out.shape
+            >>> mhc(torch.randn(1, 3, 2, 16), lambda t: t)[0].shape
             torch.Size([1, 3, 2, 16])
         """
         a, b, c = self.coefficients(streams)
@@ -464,6 +450,9 @@ class SinglePassMHC(nn.Module):
             raise ValueError(f"branch output shape {tuple(branch_out.shape)} does not match mixed input {tuple(mixed.shape)}")
         out = self._combine(streams, b, c, branch_out)
         return out, a
+
+    # ``step`` is a semantic alias for :meth:`forward` — the only execution path.
+    step = forward
 
 
 class EngramMemory(nn.Module):

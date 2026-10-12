@@ -157,14 +157,23 @@ def test_mhc_routing():
     prev_B = torch.zeros(2, 5, 1, 2)
     prev_B[..., 1] = 1.0
 
+    # Single-pass (Eq. 6): input mixing uses the previous block's A,
+    # so different prev_a must produce different outputs through both
+    # the canonical forward path and its ``step`` alias.
+    out_fwd_A, _ = mhc(streams, branch_fn=lambda h: h, prev_a=prev_A)
+    out_fwd_B, _ = mhc(streams, branch_fn=lambda h: h, prev_a=prev_B)
+    assert (out_fwd_A - out_fwd_B).abs().max().item() > 0.0
+
     out_step_A, _ = mhc.step(streams, branch_fn=lambda h: h, prev_a=prev_A)
     out_step_B, _ = mhc.step(streams, branch_fn=lambda h: h, prev_a=prev_B)
     assert (out_step_A - out_step_B).abs().max().item() > 0.0
+    # ``step`` is an alias of the single-pass forward path.
+    torch.testing.assert_close(out_step_A, out_fwd_A, atol=1e-6, rtol=1e-6)
 
-    branch_out = torch.randn(2, 5, 32)
-    out_fwd_A, _ = mhc.forward(streams, branch_out, prev_a=prev_A)
-    out_fwd_B, _ = mhc.forward(streams, branch_out, prev_a=prev_B)
-    assert torch.equal(out_fwd_A, out_fwd_B)
+    # First block (prev_a=None) falls back to the current block's own a.
+    out_first, a_first = mhc(streams, branch_fn=lambda h: h)
+    out_bootstrap, _ = mhc(streams, branch_fn=lambda h: h, prev_a=a_first)
+    torch.testing.assert_close(out_first, out_bootstrap, atol=1e-6, rtol=1e-6)
 
 
 def test_dspark_tail_only():
