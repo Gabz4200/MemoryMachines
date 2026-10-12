@@ -67,10 +67,11 @@ class _DiskGather(torch.autograd.Function):
 
     The forward reads only the gathered rows from the memory-mapped
     file (the OS pages the rest in lazily, so the full table never
-    needs to fit in RAM) and moves them to the compute device. The
-    backward scatters the upstream gradient into a full-sized zero
+    needs to fit in RAM) and moves them to the compute device.
+    The backward scatters the upstream gradient into a full-sized zero
     tensor on the weight's (CPU) device, so ``weight`` receives a
-    dense gradient exactly like a normal :class:`torch.nn.Embedding`.
+    dense gradient exactly like a normal :class:`torch.nn.Embedding`
+    (sparse gradients would break AdamW, the repo's optimizer).
     """
 
     @staticmethod
@@ -100,9 +101,10 @@ class _SsdTable(nn.Module):
 
     The module holds no dedicated RAM or GPU copy of the table: a
     forward gathers only the rows named by ``index`` into the
-    compute device via :class:`_DiskGather`, while ``weight`` (a
-    plain CPU tensor aliasing the memmap) carries a dense gradient
-    for the optimizer and writes through to the file. Automatic
+    compute device via :class:`_DiskGather`, while ``weight`` (an
+    :class:`torch.nn.Parameter` aliasing the memmap, shared
+    storage) carries the gradient for the optimizer and writes
+    through to the file. Automatic
     offloading: the whole table stays on SSD and the OS pages in
     only the touched rows, so a table far larger than RAM is
     usable. Storage is always float32.
@@ -136,12 +138,13 @@ class _SsdTable(nn.Module):
             with open(path, "wb") as f:
                 f.truncate(nbytes)
         self._mmap = np.memmap(str(path), dtype=np.float32, mode="r+", shape=(num_embeddings, embedding_dim))
-        # Plain CPU tensor aliasing the memmap: RAM holds only the OS
-        # page cache (never a dedicated allocation). Marking it as a
-        # leaf that requires grad lets autograd accumulate the scatter
-        # gradient into .grad, and in-place optimizer steps write
+        # Parameter aliasing the memmap (shared storage, no copy):
+        # RAM holds only the OS page cache (never a dedicated
+        # allocation), and being a Parameter puts the SSD table
+        # into module.parameters() so the training optimizer
+        # actually updates it. In-place optimizer steps write
         # through to the file.
-        self.weight = torch.from_numpy(self._mmap).requires_grad_(True)
+        self.weight = nn.Parameter(torch.from_numpy(self._mmap))
         self.embedding_dim = embedding_dim
 
     def forward(self, index: torch.Tensor) -> torch.Tensor:

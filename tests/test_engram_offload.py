@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from memory_machines.models.blocks.memory import EngramMemory, _SsdTable
@@ -58,6 +59,30 @@ def test_ssd_gradients_scatter_to_memmap():
         assert grad is not None
         assert tuple(grad.shape) == (sum(mem.primes), mem.dim)
         assert bool(grad.abs().sum() > 0), "gathered rows must receive nonzero gradient"
+
+
+def test_ssd_weight_is_trainable_parameter():
+    """The memmap weight must be a Parameter in module.parameters()."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _engram_cfg(engram_offload="ssd", engram_offload_dir=d)
+        mem = EngramMemory(cfg)
+        table = mem.multi_head_embedding
+        assert isinstance(table.weight, torch.nn.Parameter), "weight must be a Parameter"
+        assert any(p is table.weight for p in mem.parameters()), "SSD table must appear in module.parameters() so the optimizer updates it"
+        # Shared storage: the Parameter must alias the memmap, not copy it.
+        table._mmap[0, 0] = 123.0
+        assert float(table.weight.detach()[0, 0]) == 123.0
+
+        # An optimizer step through the training path writes through to the file.
+        torch.nn.init.ones_(mem.value_proj.weight)
+        ids = torch.randint(0, 500, (1, 3))
+        hidden = torch.randn(1, 3, cfg.hidden_size)
+        out = mem(ids, hidden, layer_id=0)
+        out.sum().backward()
+        opt = torch.optim.SGD([table.weight], lr=1.0)
+        before = table.weight.detach().clone()
+        opt.step()
+        assert not torch.equal(table.weight.detach(), before), "optimizer step must change weights"
 
 
 def test_auto_offload_threshold():
