@@ -21,7 +21,7 @@ from tests.test_blocks_shapes import tiny_cfg
 def _stack_cfg() -> MemoryMachineConfig:
     return replace(
         tiny_cfg(),
-        swa_window_size=4,
+        window_size=4,
         ced_num_encoder_layers=2,
         ced_num_decoder_layers=3,
         csa_encoder_compression_ratio=2,

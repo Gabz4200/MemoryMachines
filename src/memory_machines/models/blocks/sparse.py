@@ -19,7 +19,7 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
-from .attention import GroupedQueryAttention, SlidingWindowAttention
+from .attention import GroupedQueryAttention
 from .compression import (
     AttentionSink,
     BlockCompressor,
@@ -40,15 +40,17 @@ class CompressedSparseAttention(GroupedQueryAttention):
     query latent (``q_down``/``q_up_main``), a shared
     :class:`~memory_machines.models.blocks.compression.BlockCompressor`, an
     optional :class:`~memory_machines.models.blocks.compression.SparseIndexer`,
-    and an internal :class:`~memory_machines.models.blocks.attention.SlidingWindowAttention`
-    branch. Branch outputs (dense and/or top-``k`` selected + window) are fused
-    by :class:`~memory_machines.models.blocks.compression.BranchGate` and
+    and an internal windowed
+    :class:`~memory_machines.models.blocks.attention.GroupedQueryAttention`
+    branch (SWA by design). Branch outputs (dense and/or top-``k``
+    selected + window) are fused by
+    :class:`~memory_machines.models.blocks.compression.BranchGate` and
     :class:`~memory_machines.models.blocks.compression.GroupedOutputProjection`.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
-            provides hidden sizes, head counts, ``csa_*``/``swa_*`` settings,
-            and CVPE/FRVM toggles.
+            provides hidden sizes, head counts, ``csa_*``/``window_size*``
+            settings, and CVPE/FRVM toggles.
         compression_ratio (int, optional): block size ``m``. Default: ``None``
             (falls back to ``config.csa_compression_ratio``).
         use_indexer (bool, optional): whether to enable top-``k`` retrieval.
@@ -57,14 +59,16 @@ class CompressedSparseAttention(GroupedQueryAttention):
             compressed store. Default: ``False``.
         top_k (int, optional): entries selected per query. Default: ``None``
             (falls back to ``config.csa_top_k``).
-        window_size (int, optional): SWA branch width. Default: ``None``
-            (falls back to ``config.swa_window_size``).
+        window_size (int, optional): SWA branch width, in compressed
+            tokens. Default: ``None`` (falls back to
+            ``config.window_size_compressed``, i.e. ``256 * m``).
 
     Examples::
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> layer = CompressedSparseAttention(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2, csa_top_k=4, csa_num_output_groups=4))
+        ...     num_attention_heads=4, num_key_value_heads=2, csa_top_k=4,
+        ...     csa_num_output_groups=4))
         >>> out, _, cache = layer(torch.randn(1, 8, 32), use_cache=True)
         >>> out.shape
         torch.Size([1, 8, 32])
@@ -89,7 +93,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
         self.use_indexer = use_indexer
         self.use_dense_branch = use_dense_branch
         self.top_k = top_k if top_k is not None else config.csa_top_k
-        self.window_size = window_size if window_size is not None else config.swa_window_size
+        self.window_size = window_size if window_size is not None else config.window_size_compressed
         self.q_latent_dim = config.csa_q_latent_dim if config.csa_q_latent_dim > 0 else config.hidden_size
         self.q_down = nn.Linear(config.hidden_size, self.q_latent_dim, bias=False)
         self.q_up_main = nn.Linear(self.q_latent_dim, self.num_heads * self.head_dim, bias=False)
@@ -101,7 +105,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
         self.kv_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if config.csa_use_qkv_norm else None
         self.sink = AttentionSink(self.num_heads) if config.csa_use_sink else None
         self.grouped_out = GroupedOutputProjection(self.num_heads, self.head_dim, config.csa_num_output_groups, config.csa_output_group_dim, config.hidden_size)
-        self.swa = SlidingWindowAttention(config, self.window_size)
+        self.swa = GroupedQueryAttention(config, self.token_window_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -110,7 +114,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
         Xavier-uniform for the low-rank query path (``q_down``/``q_up_main``)
         and the retained ``v_proj`` reference values; all composed
         submodules (compressor, indexer, branch gate, norms, sink, grouped
-        output, SWA branch) are re-reset to their own neutral-start inits
+        output, window branch) are re-reset to their own neutral-start inits
         so a freshly built sparse layer fuses balanced branches from
         uniform pooling and zero-start residual outputs.
         """
@@ -129,6 +133,37 @@ class CompressedSparseAttention(GroupedQueryAttention):
             self.sink.reset_parameters()
         self.grouped_out.reset_parameters()
         self.swa.reset_parameters()
+
+    @property
+    def token_window_size(self) -> int:
+        r"""token_window_size -> int
+
+        SWA branch width in raw tokens.
+
+        The layer window is specified in compressed tokens; the internal
+        window branch runs over raw tokens, so it scales by the
+        compression ratio (a window of ``w`` compressed entries covers
+        ``w * m`` tokens).
+
+        Returns:
+            int: ``window_size * compression_ratio`` when the window is
+            enabled, else ``window_size`` (<= 0 disables the window).
+
+        Examples::
+
+            >>> import torch
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> layer = CompressedSparseAttention(
+            ...     MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
+            ...         num_key_value_heads=1, csa_top_k=2,
+            ...         csa_compression_ratio=4, csa_num_output_groups=2),
+            ...     window_size=4)
+            >>> layer.token_window_size
+            16
+        """
+        if self.window_size <= 0:
+            return self.window_size
+        return self.window_size * self.compression_ratio
 
     def _core_attend(
         self,
@@ -366,8 +401,8 @@ class CompressedSparseAttention(GroupedQueryAttention):
         Run sparse attention with global compressed + window caches.
 
         Compresses the current chunk, appends it to the cached global store,
-        runs dense and/or top-``k`` selected branches plus the SWA branch, and
-        fuses them into model-dimension outputs.
+        runs dense and/or top-``k`` selected branches plus the window
+        branch, and fuses them into model-dimension outputs.
 
         .. note::
             Full attention maps are never materialized; ``output_attentions``
@@ -375,7 +410,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
 
         Args:
             hidden_states (Tensor): input of shape ``(B, Lq, hidden)``.
-            attention_mask (Tensor, optional): mask forwarded to the SWA
+            attention_mask (Tensor, optional): mask forwarded to the window
                 branch. Default: ``None``.
             position_ids (Tensor, optional): absolute positions. Default: ``None``.
             past (CompressedCache, optional): incremental cache. Default: ``None``.
@@ -461,7 +496,7 @@ class NativeSparseAttention(CompressedSparseAttention):
 
 
 class HeavilyCompressedAttention(CompressedSparseAttention):
-    r"""HeavilyCompressedAttention(config, compression_ratio=None)
+    r"""HeavilyCompressedAttention(config, compression_ratio=None, window_size=None)
 
     HCA variant: dense heavily-compressed + window branches (no indexer).
 
@@ -470,6 +505,9 @@ class HeavilyCompressedAttention(CompressedSparseAttention):
             provides ``hca_compression_ratio`` when ``compression_ratio`` is unset.
         compression_ratio (int, optional): block size ``m``. Default: ``None``
             (falls back to ``config.hca_compression_ratio``).
+        window_size (int, optional): SWA branch width, in compressed
+            tokens. Default: ``None`` (falls back to
+            ``config.window_size_compressed``).
 
     Examples::
 
@@ -480,12 +518,13 @@ class HeavilyCompressedAttention(CompressedSparseAttention):
         torch.Size([1, 8, 16])
     """
 
-    def __init__(self, config: MemoryMachineConfig, compression_ratio: int | None = None):
+    def __init__(self, config: MemoryMachineConfig, compression_ratio: int | None = None, window_size: int | None = None):
         super().__init__(
             config,
             compression_ratio=compression_ratio if compression_ratio is not None else config.hca_compression_ratio,
             use_indexer=False,
             use_dense_branch=True,
+            window_size=window_size,
         )
 
 

@@ -5,7 +5,7 @@ import dataclasses
 import pytest
 import torch
 
-from memory_machines.models.blocks import GroupedQueryAttention, SlidingWindowAttention
+from memory_machines.models.blocks import GroupedQueryAttention
 from tests.test_blocks_shapes import tiny_cfg
 
 
@@ -81,9 +81,9 @@ def test_gqa_bad_mask_shapes_raise(mask):
 
 def test_swa_noncausal_full_window_matches_gqa():
     torch.manual_seed(4)
-    cfg = dataclasses.replace(plain_cfg(), swa_window_size=16)
+    cfg = dataclasses.replace(plain_cfg(), window_size=16)
     gqa = GroupedQueryAttention(cfg).eval()
-    swa = SlidingWindowAttention(cfg)
+    swa = GroupedQueryAttention(cfg)
     swa.load_state_dict(gqa.state_dict())
     swa.eval()
     x = torch.randn(2, 6, 32)
@@ -94,7 +94,7 @@ def test_swa_noncausal_full_window_matches_gqa():
 
 
 def test_swa_noncausal_cache_raises():
-    swa = SlidingWindowAttention(plain_cfg()).eval()
+    swa = GroupedQueryAttention(plain_cfg()).eval()
     x = torch.randn(1, 4, 32)
     with pytest.raises(ValueError):
         swa(x, use_cache=True, is_causal=False)
@@ -110,5 +110,15 @@ def test_gqa_causal_cache_consistency():
     with torch.no_grad():
         o_full, _, _ = m(x, is_causal=True)
         _, _, past = m(x[:, :2, :], use_cache=True, is_causal=True)
-        o2, _, _ = m(x[:, 2:, :], past_key_value=past, use_cache=True, is_causal=True)
+        # tiny_cfg window is 8 >= 6, so the cache is untruncated
+        # here; pass past_positions anyway to exercise the replay
+        # contract.
+        o2, _, _ = m(
+            x[:, 2:, :],
+            past_key_value=past,
+            use_cache=True,
+            past_positions=torch.arange(2).unsqueeze(0).expand(2, -1),
+            position_ids=torch.arange(6).unsqueeze(0).expand(2, -1),
+            is_causal=True,
+        )
     torch.testing.assert_close(o2, o_full[:, 2:, :], atol=1e-5, rtol=1e-5)

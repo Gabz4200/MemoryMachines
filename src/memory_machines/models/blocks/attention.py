@@ -1,8 +1,10 @@
-r"""Dense attention: GQA, sliding-window attention, SwiGLU.
+r"""Dense attention: GQA with built-in sliding window, SwiGLU.
 
-:class:`GroupedQueryAttention` is the dense grouped-query baseline with
-optional CVPE QK bias and FRVM OV gating.
-:class:`SlidingWindowAttention` adds a transient causal window cache, and
+:class:`GroupedQueryAttention` is the grouped-query baseline with
+optional CVPE QK bias, FRVM OV gating, and a built-in sliding window:
+``window_size > 0`` bounds causal attention to the last ``window_size``
+keys and keeps only that window in the returned KV cache, while
+``window_size <= 0`` runs full attention with an untruncated cache.
 :class:`SwiGLU` is the gated feed-forward block.
 """
 
@@ -129,16 +131,60 @@ def _sanitize_attention_weights(weights: torch.Tensor) -> torch.Tensor:
     return torch.where(row_ok, weights, 0.0)
 
 
-class GroupedQueryAttention(nn.Module):
-    r"""GroupedQueryAttention(config)
+def _apply_masks_and_softmax(
+    attn: torch.Tensor,
+    q_pos: torch.Tensor,
+    k_pos: torch.Tensor,
+    window_size: int,
+    is_causal: bool,
+    windowed: bool,
+) -> torch.Tensor:
+    r"""_apply_masks_and_softmax(attn, q_pos, k_pos, window_size, is_causal, windowed) -> Tensor
 
-    Grouped-query attention (GQA) with CVPE QK bias and FRVM OV gating.
+    Apply the causal and sliding-window bounds to raw logits.
+
+    The window bound subsumes the causal half (``_window_mask`` keeps
+    ``0 <= q - k < window``), so the causal mask is applied only when
+    the window is disabled or not requested.
+
+    Args:
+        attn (Tensor): raw logits of shape ``(B, H, Lq, Lk)``.
+        q_pos (Tensor): query positions ``(B, Lq)``.
+        k_pos (Tensor): key positions ``(B, Lk)``.
+        window_size (int): window width; ``<= 0`` disables the window.
+        is_causal (bool): whether to mask future keys.
+        windowed (bool): whether the window bound applies.
+
+    Returns:
+        Tensor: masked logits of the same shape as ``attn``.
+    """
+    if windowed and window_size > 0:
+        win = _window_mask(q_pos, k_pos, window_size).unsqueeze(1)
+        return attn.masked_fill(~win, float("-inf"))
+    if is_causal:
+        return attn.masked_fill(~_causal_key_mask(q_pos, k_pos), float("-inf"))
+    return attn
+
+
+class GroupedQueryAttention(nn.Module):
+    r"""GroupedQueryAttention(config, window_size=None)
+
+    Grouped-query attention (GQA) with CVPE QK bias, FRVM OV gating,
+    and a built-in sliding window.
 
     Queries have ``H`` heads; keys/values have ``Hkv`` heads expanded by
     repetition to ``H``. Scores are scaled dot products plus the optional
     :class:`~memory_machines.models.blocks.positioning.CVPEContextBias`;
     the weighted reduction is either plain matmul or
     :class:`~memory_machines.models.blocks.positioning.FRVMValueGate`.
+
+    Every attention is SWA-enabled by design: ``window_size > 0`` masks
+    each query to the last ``window_size`` keys (sliding-window
+    attention) and the returned KV cache keeps only that window;
+    ``window_size <= 0`` disables the window, running full attention
+    with an untruncated cache. The window is a hyperparameter, not an
+    architectural constraint — compressed/sparse variants pass a
+    mechanism-scaled default (see ``MemoryMachineConfig``).
 
     .. math::
         \mathrm{Attn}(Q, K, V) = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}} + b\right) V
@@ -147,13 +193,18 @@ class GroupedQueryAttention(nn.Module):
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``hidden_size``, ``num_attention_heads`` (``H``),
             ``num_key_value_heads`` (``Hkv``), ``max_position_embeddings``,
-            ``cvpe_*``/``frvm_*`` toggles, and ``attention_dropout``.
+            ``window_size``, ``cvpe_*``/``frvm_*`` toggles, and
+            ``attention_dropout``.
+        window_size (int, optional): window width; ``<= 0`` means full
+            attention. Default: ``None`` (falls back to
+            ``config.window_size``).
 
     Examples::
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2, csa_num_output_groups=4))
+        ...     num_attention_heads=4, num_key_value_heads=2, window_size=8,
+        ...     csa_num_output_groups=4))
         >>> out, w, kv = attn(torch.randn(1, 6, 32), is_causal=True)
         >>> out.shape
         torch.Size([1, 6, 32])
@@ -162,13 +213,14 @@ class GroupedQueryAttention(nn.Module):
     cvpe_bias: CVPEContextBias | None
     frvm_gate: FRVMValueGate | None
 
-    def __init__(self, config: MemoryMachineConfig):
+    def __init__(self, config: MemoryMachineConfig, window_size: int | None = None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.window_size = window_size if window_size is not None else config.window_size
 
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
@@ -420,18 +472,28 @@ class GroupedQueryAttention(nn.Module):
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        is_causal: bool = False,
+        past_len_override: int | None = None,
+        past_positions: torch.Tensor | None = None,
+        is_causal: bool = True,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
         tuple[torch.Tensor, torch.Tensor] | None,
     ]:
-        r"""forward(hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, is_causal=False) -> (Tensor, Tensor | None, tuple | None)
+        r"""forward(hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, past_len_override=None, past_positions=None, is_causal=True) -> (Tensor, Tensor | None, tuple | None)
 
-        Run dense grouped-query attention with optional caching.
+        Run attention with the built-in window and optional caching.
 
-        With ``is_causal=True``, keys are masked by ``k_pos <= q_pos`` so
-        cached prefixes stay correct under incremental decoding.
+        With ``is_causal=True``, keys are masked by ``k_pos <= q_pos``
+        so cached prefixes stay correct under incremental decoding.
+        ``window_size > 0`` further bounds each query to the last
+        ``window_size`` keys, and the returned cache keeps only that
+        window; ``window_size <= 0`` runs full attention with an
+        untruncated cache. Replaying a truncated cache (``past_key_value``
+        set while ``window_size > 0``) requires ``past_positions`` with
+        the cached keys' absolute positions — without them the window
+        would silently attend the wrong keys. ``past_len_override``
+        (when given) must agree with ``past_positions``.
 
         Args:
             hidden_states (Tensor): input of shape ``(B, Lq, hidden)``.
@@ -439,42 +501,90 @@ class GroupedQueryAttention(nn.Module):
                 float additive mask; 2D ``(Lq, Lk)``, 3D ``(B, Lq, Lk)`` /
                 ``(B, 1, Lk)``, or 4D ``(B|1, 1|H, Lq, Lk)``. Default: ``None``.
             position_ids (Tensor, optional): absolute positions. Default: ``None``.
-            past_key_value (tuple of Tensor, optional): cached ``(keys, values)``
-                of shape ``(B, Hkv, Lp, Dh)``. Default: ``None``.
+            past_key_value (tuple of Tensor, optional): cached
+                ``(keys, values)`` of shape ``(B, Hkv, Lp, Dh)``.
+                Default: ``None``.
             output_attentions (bool, optional): whether to return weights.
                 Default: ``False``.
             use_cache (bool, optional): whether to return updated KV.
                 Default: ``False``.
+            past_len_override (int, optional): explicit past length
+                overriding the cached width; must agree with
+                ``past_positions`` when both are given, and requires
+                ``past_key_value``. Default: ``None``.
+            past_positions (Tensor, optional): explicit cached positions
+                of shape ``(B, Wprev)``; required when replaying a
+                truncated ``past_key_value``. Default: ``None``.
             is_causal (bool, optional): whether to apply the causal mask.
-                Default: ``False``.
+                Default: ``True``.
 
         Returns:
             Tensor: hidden outputs ``(B, Lq, hidden)``, attention weights
             ``(B, H, Lq, Lk)`` or ``None``, and the updated ``(keys, values)``
-            cache or ``None``.
+            cache (truncated to the window when ``window_size > 0``) or
+            ``None``.
 
         Examples::
 
             >>> import torch
             >>> from memory_machines.utils.config_schema import MemoryMachineConfig
             >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, csa_num_output_groups=2))
+            ...     num_attention_heads=2, num_key_value_heads=1, window_size=4,
+            ...     csa_num_output_groups=2))
             >>> out, w, _ = attn(torch.randn(1, 4, 16), is_causal=True,
             ...     output_attentions=True)
             >>> out.shape, w.shape
             (torch.Size([1, 4, 16]), torch.Size([1, 2, 4, 4]))
         """
+        if not is_causal and (use_cache or past_key_value is not None):
+            raise ValueError("GroupedQueryAttention with is_causal=False cannot use KV caching (truncated cache is only valid for causal attention)")
         bsz, q_len, _ = hidden_states.size()
 
         query_states, key_states, value_current = self._project_qkv(hidden_states)
 
-        past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
-        total_len = past_len + q_len
+        cached_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
+        if past_len_override is not None:
+            if past_key_value is None and past_len_override != 0:
+                raise ValueError("past_len_override requires past_key_value (a nonzero override with no cached history is meaningless; omit it for a fresh call)")
+            if past_positions is not None:
+                implied_len = int(past_positions.max().item()) + 1
+                if past_len_override != implied_len:
+                    raise ValueError(f"past_len_override ({past_len_override}) disagrees with past_positions (max {implied_len - 1}); pass one or make them consistent")
+            true_past_len = past_len_override
+        elif past_positions is not None:
+            true_past_len = int(past_positions.max().item()) + 1
+        else:
+            true_past_len = cached_len
+        total_len = true_past_len + q_len
 
         if total_len > self.max_position_embeddings:
             raise ValueError(f"Sequence length ({total_len}) exceeds configured max_position_embeddings ({self.max_position_embeddings})")
 
-        q_pos, k_pos = _resolve_positions(hidden_states, q_len, past_len, position_ids)
+        device = hidden_states.device
+        if past_key_value is None:
+            q_pos, k_pos = _resolve_positions(hidden_states, q_len, true_past_len, position_ids)
+        else:
+            # A windowed cache is truncated by construction, so
+            # the caller must pass the cached keys' absolute
+            # positions. Full-attention caches are untruncated
+            # and keep dense positions, so arange is correct.
+            if self.window_size > 0 and past_positions is None:
+                raise ValueError(
+                    "replaying a past_key_value with window_size > 0 requires past_positions (the cached keys' absolute positions); the windowed cache is truncated and its key positions are otherwise unknowable"
+                )
+            if position_ids is not None:
+                if position_ids.dim() == 2:
+                    if position_ids.shape[0] != bsz:
+                        raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
+                    q_pos = position_ids[:, -q_len:].to(device)
+                else:
+                    q_pos = position_ids[-q_len:].to(device).unsqueeze(0).expand(bsz, -1)
+            else:
+                q_pos = torch.arange(true_past_len, true_past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
+            if past_positions is not None:
+                k_pos = torch.cat([past_positions.to(device), q_pos], dim=1)
+            else:
+                k_pos = torch.arange(true_past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
         _check_position_bounds(q_pos, k_pos, self.max_position_embeddings, position_ids)
 
         if past_key_value is not None:
@@ -483,14 +593,11 @@ class GroupedQueryAttention(nn.Module):
         else:
             value_full = value_current
 
-        past_key_value = (key_states, value_full) if use_cache else None
+        key_exp, value_full_exp, value_query_exp = self._expand_kv(key_states, value_full, value_current)
 
-        key_states, value_full_exp, value_query_exp = self._expand_kv(key_states, value_full, value_current)
+        attn_weights = self._score_qk(query_states, key_exp, q_pos, k_pos)
 
-        attn_weights = self._score_qk(query_states, key_states, q_pos, k_pos)
-
-        if is_causal:
-            attn_weights = attn_weights.masked_fill(~_causal_key_mask(q_pos, k_pos), float("-inf"))
+        attn_weights = _apply_masks_and_softmax(attn_weights, q_pos, k_pos, self.window_size, is_causal, windowed=True)
 
         additive_mask = _prepare_attention_mask(attention_mask, bsz, q_len, key_states.shape[2], self.num_heads, attn_weights)
         if additive_mask is not None:
@@ -504,10 +611,138 @@ class GroupedQueryAttention(nn.Module):
 
         attn_output = self._project_heads(attn_output_heads, bsz, q_len)
 
+        past_key_value = None
+        if use_cache:
+            if self.window_size > 0:
+                past_key_value = (
+                    key_states[:, :, -self.window_size :, :],
+                    value_full[:, :, -self.window_size :, :],
+                )
+            else:
+                past_key_value = (key_states, value_full)
+
         if not output_attentions:
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+    def attend(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_full: torch.Tensor,
+        value_query: torch.Tensor,
+        q_pos: torch.Tensor,
+        k_pos_full: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        windowed: bool = True,
+        is_causal: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""attend(query_states, key_states, value_full, value_query, q_pos, k_pos_full, attention_mask=None, windowed=True, is_causal=True) -> (Tensor, Tensor)
+
+        Batched head-parallel attention core over explicit QKV states.
+
+        Args:
+            query_states (Tensor): queries ``(B, H, Lq, Dh)``.
+            key_states (Tensor): keys ``(B, Hkv, Lk, Dh)``.
+            value_full (Tensor): full values ``(B, Hkv, Lk, Dh)``.
+            value_query (Tensor): per-query reference values
+                ``(B, Hkv, Lq, Dh)``.
+            q_pos (Tensor): query positions ``(B, Lq)``.
+            k_pos_full (Tensor): key positions ``(B, Lk)``.
+            attention_mask (Tensor, optional): additive/bool mask.
+                Default: ``None``.
+            windowed (bool, optional): whether to apply the window bound.
+                With ``is_causal=True`` the bound is causal
+                (``0 <= q - k < window_size``); with
+                ``is_causal=False`` it is bidirectional within the
+                window (``|q - k| < window_size``). ``False`` with
+                ``is_causal=True`` is pure causal. Default: ``True``.
+            is_causal (bool, optional): whether to mask futures.
+                Default: ``True``.
+
+        Returns:
+            Tensor: per-head outputs ``(B, H, Lq, Dh)`` and weights
+            ``(B, H, Lq, Lk)``.
+
+        Examples::
+
+            >>> import torch
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
+            ...     num_attention_heads=2, num_key_value_heads=1, window_size=4,
+            ...     csa_num_output_groups=2))
+            >>> out, w = attn.attend(torch.randn(1, 2, 3, 8), torch.randn(1, 1, 5, 8),
+            ...     torch.randn(1, 1, 5, 8), torch.randn(1, 1, 3, 8),
+            ...     torch.tensor([[3, 4, 5]]), torch.tensor([[1, 2, 3, 4, 5]]))
+            >>> out.shape, w.shape
+            (torch.Size([1, 2, 3, 8]), torch.Size([1, 2, 3, 5]))
+        """
+        key_exp, val_exp, vq_exp = self._expand_kv(key_states, value_full, value_query)
+        attn = self._score_qk(query_states, key_exp, q_pos, k_pos_full)
+        # windowed, is_causal=False is bidirectional within the
+        # window: |q - k| < window_size in BOTH directions (the
+        # caller explicitly asked for non-causal attention, so the
+        # bound is symmetric). All other cells are causal-bounded.
+        if windowed and self.window_size > 0 and is_causal:
+            win = _window_mask(q_pos, k_pos_full, self.window_size).unsqueeze(1)
+            attn = attn.masked_fill(~win, float("-inf"))
+        elif windowed and self.window_size > 0:
+            rel = q_pos.unsqueeze(-1) - k_pos_full.unsqueeze(1)
+            attn = attn.masked_fill((rel.abs() >= self.window_size).unsqueeze(1), float("-inf"))
+        elif is_causal:
+            attn = attn.masked_fill(~_causal_key_mask(q_pos, k_pos_full), float("-inf"))
+        additive_mask = _prepare_attention_mask(attention_mask, query_states.shape[0], query_states.shape[2], key_exp.shape[2], self.num_heads, attn)
+        if additive_mask is not None:
+            attn = attn + additive_mask
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn = _sanitize_attention_weights(attn)
+        attn = self.attention_dropout(attn)
+        return self._weights_to_heads(attn, val_exp, vq_exp), attn
+
+    def truncate_for_replay(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""truncate_for_replay(key_states, value_states, positions) -> (Tensor, Tensor, Tensor)
+
+        Truncate a KV window to the last ``window_size`` entries.
+
+        With ``window_size <= 0`` (full attention) the inputs are
+        returned unchanged; otherwise the trailing ``window_size``
+        entries are kept for bounded replay.
+
+        Args:
+            key_states (Tensor): keys of shape ``(B, Hkv, Lk, Dh)``.
+            value_states (Tensor): values with the same shape as
+                ``key_states``.
+            positions (Tensor): positions of shape ``(B, Lk)`` or
+                ``(Lk,)``.
+
+        Returns:
+            Tensor: truncated keys, values, and positions.
+
+        Examples::
+
+            >>> import torch
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> attn = GroupedQueryAttention(MemoryMachineConfig(hidden_size=16,
+            ...     num_attention_heads=2, num_key_value_heads=1, window_size=4,
+            ...     csa_num_output_groups=2))
+            >>> k, v, p = attn.truncate_for_replay(torch.randn(1, 1, 6, 8),
+            ...     torch.randn(1, 1, 6, 8), torch.arange(6))
+            >>> k.shape, p.shape
+            (torch.Size([1, 1, 4, 8]), torch.Size([4]))
+        """
+        if self.window_size <= 0:
+            return key_states, value_states, positions
+        if positions.dim() == 2:
+            positions = positions[:, -self.window_size :]
+        else:
+            positions = positions[-self.window_size :]
+        return key_states[:, :, -self.window_size :, :], value_states[:, :, -self.window_size :, :], positions
 
 
 class SwiGLU(nn.Module):
@@ -577,214 +812,3 @@ class SwiGLU(nn.Module):
         up = self.up_proj(x)
         swish_gate = F.silu(gate)
         return self.down_proj(swish_gate * up)
-
-
-class SlidingWindowAttention(GroupedQueryAttention):
-    r"""SlidingWindowAttention(config, window_size=None)
-
-    Sliding-window attention with a transient fixed-width KV cache.
-
-    Inherits QKV projections, CVPE bias, and FRVM gating from
-    :class:`GroupedQueryAttention`; the forward pass keeps only the last
-    ``window_size`` keys/values in the returned cache. The :meth:`attend` core
-    also supports ``windowed=False`` pure-causal attention over explicit
-    query/key states (used by :class:`~memory_machines.models.blocks.liv.LivPerceiver`).
-
-    Args:
-        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
-            provides the GQA hyperparameters plus ``swa_window_size``.
-        window_size (int, optional): window width. Default: ``None`` (falls
-            back to ``config.swa_window_size``).
-
-    Examples::
-
-        >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-        >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2, swa_window_size=8, csa_num_output_groups=4))
-        >>> out, _, present = swa(torch.randn(1, 6, 32), use_cache=True)
-        >>> out.shape, present[0].shape
-        (torch.Size([1, 6, 32]), torch.Size([1, 2, 6, 8]))
-    """
-
-    def __init__(self, config: MemoryMachineConfig, window_size: int | None = None):
-        super().__init__(config)
-        self.window_size = window_size if window_size is not None else config.swa_window_size
-
-    def attend(
-        self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        value_full: torch.Tensor,
-        value_query: torch.Tensor,
-        q_pos: torch.Tensor,
-        k_pos_full: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        windowed: bool = True,
-        is_causal: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""attend(query_states, key_states, value_full, value_query, q_pos, k_pos_full, attention_mask=None, windowed=True, is_causal=True) -> (Tensor, Tensor)
-
-        Batched head-parallel attention core over explicit QKV states.
-
-        Args:
-            query_states (Tensor): queries ``(B, H, Lq, Dh)``.
-            key_states (Tensor): keys ``(B, Hkv, Lk, Dh)``.
-            value_full (Tensor): full values ``(B, Hkv, Lk, Dh)``.
-            value_query (Tensor): per-query reference values ``(B, Hkv, Lq, Dh)``.
-            q_pos (Tensor): query positions ``(B, Lq)``.
-            k_pos_full (Tensor): key positions ``(B, Lk)``.
-            attention_mask (Tensor, optional): additive/bool mask. Default: ``None``.
-            windowed (bool, optional): whether to apply the window bound.
-                ``windowed=False, is_causal=True`` is pure causal. Default: ``True``.
-            is_causal (bool, optional): whether to mask futures. Default: ``True``.
-
-        Returns:
-            Tensor: per-head outputs ``(B, H, Lq, Dh)`` and weights
-            ``(B, H, Lq, Lk)``.
-
-        Examples::
-
-            >>> import torch
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4, csa_num_output_groups=2))
-            >>> out, w = swa.attend(torch.randn(1, 2, 3, 8), torch.randn(1, 1, 5, 8),
-            ...     torch.randn(1, 1, 5, 8), torch.randn(1, 1, 3, 8),
-            ...     torch.tensor([[3, 4, 5]]), torch.tensor([[1, 2, 3, 4, 5]]))
-            >>> out.shape, w.shape
-            (torch.Size([1, 2, 3, 8]), torch.Size([1, 2, 3, 5]))
-        """
-        key_exp, val_exp, vq_exp = self._expand_kv(key_states, value_full, value_query)
-        attn = self._score_qk(query_states, key_exp, q_pos, k_pos_full)
-        if windowed and is_causal:
-            win = _window_mask(q_pos, k_pos_full, self.window_size).unsqueeze(1)
-            attn = attn.masked_fill(~win, float("-inf"))
-        elif windowed:
-            rel = q_pos.unsqueeze(-1) - k_pos_full.unsqueeze(1)
-            attn = attn.masked_fill((rel.abs() >= self.window_size).unsqueeze(1), float("-inf"))
-        elif is_causal:
-            attn = attn.masked_fill(~_causal_key_mask(q_pos, k_pos_full), float("-inf"))
-        additive_mask = _prepare_attention_mask(attention_mask, query_states.shape[0], query_states.shape[2], key_exp.shape[2], self.num_heads, attn)
-        if additive_mask is not None:
-            attn = attn + additive_mask
-        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn = _sanitize_attention_weights(attn)
-        attn = self.attention_dropout(attn)
-        return self._weights_to_heads(attn, val_exp, vq_exp), attn
-
-    def forward(  # type: ignore[override]
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        past_len_override: int | None = None,
-        past_positions: torch.Tensor | None = None,
-        is_causal: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
-        r"""forward(hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, past_len_override=None, past_positions=None, is_causal=True) -> (Tensor, Tensor | None, tuple | None)
-
-        Run sliding-window attention; ``is_causal=False`` forbids KV caching.
-
-        The transient cache keeps only the last ``window_size`` entries so
-        memory stays bounded; ``past_len_override``/``past_positions`` let
-        callers correct positions when the cache was truncated.
-
-        Args:
-            hidden_states (Tensor): input of shape ``(B, Lq, hidden)``.
-            attention_mask (Tensor, optional): bool/additive mask. Default: ``None``.
-            position_ids (Tensor, optional): absolute positions. Default: ``None``.
-            past_key_value (tuple of Tensor, optional): cached windowed
-                ``(keys, values)``. Default: ``None``.
-            output_attentions (bool, optional): whether to return weights.
-                Default: ``False``.
-            use_cache (bool, optional): whether to return the truncated window
-                cache. Default: ``False``.
-            past_len_override (int, optional): explicit past length overriding
-                the cached width. Default: ``None``.
-            past_positions (Tensor, optional): explicit cached positions of
-                shape ``(B, Wprev)``. Default: ``None``.
-            is_causal (bool, optional): whether attention is causal. Default: ``True``.
-
-        Returns:
-            Tensor: outputs ``(B, Lq, hidden)``, weights or ``None``, and the
-            truncated ``(keys, values)`` window cache or ``None``.
-
-        Examples::
-
-            >>> import torch
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4, csa_num_output_groups=2))
-            >>> out, _, present = swa(torch.randn(1, 6, 16), use_cache=True)
-            >>> out.shape, present[0].shape
-            (torch.Size([1, 6, 16]), torch.Size([1, 1, 4, 8]))
-        """
-        if not is_causal and (use_cache or past_key_value is not None):
-            raise ValueError("SlidingWindowAttention with is_causal=False cannot use KV caching (truncated cache is only valid for causal attention)")
-        bsz, q_len, _ = hidden_states.size()
-        query_states, key_states, value_current = self._project_qkv(hidden_states)
-
-        cached_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
-        if past_len_override is not None:
-            true_past_len = past_len_override
-        elif past_positions is not None:
-            true_past_len = int(past_positions.max().item()) + 1
-        else:
-            true_past_len = cached_len
-        device = hidden_states.device
-        q_pos, _ = _resolve_positions(hidden_states, q_len, true_past_len, position_ids)
-        if past_key_value is None:
-            k_pos_full = q_pos
-        elif past_positions is not None:
-            k_pos_full = torch.cat([past_positions.to(device), q_pos], dim=1)
-        else:
-            k_pos_full = torch.arange(true_past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
-        _check_position_bounds(q_pos, k_pos_full, self.max_position_embeddings, position_ids)
-        if past_key_value is not None:
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_full = torch.cat([past_key_value[1], value_current], dim=2)
-        else:
-            value_full = value_current
-        out_h, attn_w = self.attend(query_states, key_states, value_full, value_current, q_pos, k_pos_full, attention_mask, is_causal=is_causal)
-        out = self._project_heads(out_h, bsz, q_len)
-        present = None
-        if use_cache:
-            present = (
-                key_states[:, :, -self.window_size :, :],
-                value_full[:, :, -self.window_size :, :],
-            )
-        return out, (attn_w if output_attentions else None), present
-
-    def truncate_for_replay(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""truncate_for_replay(key_states, value_states, positions) -> (Tensor, Tensor, Tensor)
-
-        Truncate a KV window to the last ``window_size`` entries for replay.
-
-        Args:
-            key_states (Tensor): keys of shape ``(B, Hkv, Lk, Dh)``.
-            value_states (Tensor): values with the same shape as ``key_states``.
-            positions (Tensor): positions of shape ``(B, Lk)`` or ``(Lk,)``.
-
-        Returns:
-            Tensor: truncated keys, values, and positions.
-
-        Examples::
-
-            >>> import torch
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> swa = SlidingWindowAttention(MemoryMachineConfig(hidden_size=16,
-            ...     num_attention_heads=2, num_key_value_heads=1, swa_window_size=4, csa_num_output_groups=2))
-            >>> k, v, p = swa.truncate_for_replay(torch.randn(1, 1, 6, 8),
-            ...     torch.randn(1, 1, 6, 8), torch.arange(6))
-            >>> k.shape, p.shape
-            (torch.Size([1, 1, 4, 8]), torch.Size([4]))
-        """
-        return key_states[:, :, -self.window_size :, :], value_states[:, :, -self.window_size :, :], positions[-self.window_size :]

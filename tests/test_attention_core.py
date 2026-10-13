@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from memory_machines.models.blocks import GroupedQueryAttention, SlidingWindowAttention, SwiGLU
+from memory_machines.models.blocks import GroupedQueryAttention, SwiGLU
 from tests.test_blocks_shapes import tiny_cfg
 
 
@@ -36,13 +36,22 @@ def test_plain_gqa_matches_manual_sdpa():
 
 def test_swa_truncated_cache_value_consistency():
     torch.manual_seed(1)
-    cfg = dataclasses.replace(plain_cfg(), swa_window_size=4)
-    m = SlidingWindowAttention(cfg).eval()
+    cfg = dataclasses.replace(plain_cfg(), window_size=4)
+    m = GroupedQueryAttention(cfg).eval()
     x = torch.randn(1, 10, 32)
     with torch.no_grad():
         full, _, _ = m(x, is_causal=True)
         _, _, past = m(x[:, :6, :], use_cache=True, is_causal=True)
-        chunk, _, past2 = m(x[:, 6:, :], past_key_value=past, use_cache=True, is_causal=True)
+        # The windowed cache (width 4) holds keys at positions
+        # 2..5; thread them through so positions stay correct.
+        chunk, _, past2 = m(
+            x[:, 6:, :],
+            past_key_value=past,
+            use_cache=True,
+            past_positions=torch.arange(2, 6).unsqueeze(0),
+            position_ids=torch.arange(6, 10).unsqueeze(0),
+            is_causal=True,
+        )
     torch.testing.assert_close(full[:, 6:, :], chunk, atol=1e-5, rtol=1e-5)
     assert past is not None and past2 is not None
     assert past[0].shape[-2] == 4
@@ -78,8 +87,8 @@ def test_swiglu_matches_manual_and_grads():
 
 def test_swa_causal_window_boundaries():
     torch.manual_seed(3)
-    cfg = dataclasses.replace(plain_cfg(), swa_window_size=4)
-    swa = SlidingWindowAttention(cfg).eval()
+    cfg = dataclasses.replace(plain_cfg(), window_size=4)
+    swa = GroupedQueryAttention(cfg).eval()
     gqa = GroupedQueryAttention(cfg).eval()
     gqa.load_state_dict(swa.state_dict())
     gqa.eval()
@@ -111,7 +120,18 @@ def test_position_ids_explicit_and_overflow():
     with torch.no_grad():
         full, _, _ = m(x_full, is_causal=True)
         _, _, past = m(x_full[:, :10, :], use_cache=True, is_causal=True)
-        out_explicit, _, _ = m(x_full[:, 10:, :], past_key_value=past, position_ids=explicit, is_causal=True)
+        # The window cache (width 8) drops early keys; thread the
+        # cached positions through so absolute positions stay correct.
+        # The cache holds keys at absolute positions 2..9, so the new
+        # queries sit at 10..13.
+        past_positions = torch.arange(2, 10).unsqueeze(0)
+        out_explicit, _, _ = m(
+            x_full[:, 10:, :],
+            past_key_value=past,
+            past_positions=past_positions,
+            position_ids=explicit,
+            is_causal=True,
+        )
         out_default, _, _ = m(x_full[:, 10:, :], is_causal=True)
     assert not torch.allclose(out_explicit, out_default, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out_explicit, full[:, 10:, :], atol=1e-5, rtol=1e-5)
@@ -128,10 +148,9 @@ def test_position_ids_explicit_and_overflow():
 def test_output_attentions_and_cache_none_contract():
     torch.manual_seed(5)
     x = torch.randn(1, 5, 32)
-    for cls in (GroupedQueryAttention, SlidingWindowAttention):
-        m = cls(plain_cfg()).eval()
-        with torch.no_grad():
-            out, weights, past = m(x)
-        assert torch.isfinite(out).all()
-        assert weights is None
-        assert past is None
+    m = GroupedQueryAttention(plain_cfg()).eval()
+    with torch.no_grad():
+        out, weights, past = m(x)
+    assert torch.isfinite(out).all()
+    assert weights is None
+    assert past is None

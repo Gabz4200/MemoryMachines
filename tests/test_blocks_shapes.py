@@ -16,7 +16,7 @@ def tiny_cfg() -> MemoryMachineConfig:
         num_attention_heads=4,
         num_key_value_heads=2,
         num_perceiver_query=2,
-        swa_window_size=8,
+        window_size=8,
         csa_compression_ratio=2,
         csa_top_k=2,
         csa_num_output_groups=2,
@@ -47,7 +47,13 @@ def test_gqa_forward_cache_grows():
     assert past is not None
     assert tuple(past[0].shape) == (1, cfg.num_key_value_heads, 5, 8)
     x2 = torch.randn(1, 3, cfg.hidden_size)
-    out2, _, past2 = model(x2, past_key_value=past, use_cache=True)
+    out2, _, past2 = model(
+        x2,
+        past_key_value=past,
+        use_cache=True,
+        past_positions=torch.arange(5).unsqueeze(0),
+        position_ids=torch.arange(5, 8).unsqueeze(0),
+    )
     assert tuple(out2.shape) == (1, 3, cfg.hidden_size)
     assert past2 is not None
     assert tuple(past2[0].shape) == (1, cfg.num_key_value_heads, 8, 8)

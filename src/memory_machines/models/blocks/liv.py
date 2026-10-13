@@ -9,7 +9,7 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
-from .attention import SlidingWindowAttention
+from .attention import GroupedQueryAttention
 
 
 class LivDoubleGatedBase(nn.Module):
@@ -327,21 +327,21 @@ class LivConvBlock(LivDoubleGatedBase):
 class LivPerceiver(LivDoubleGatedBase):
     r"""LivPerceiver(config, window_size=None)
 
-    Perceiver LIV block routing head views through the SWA core.
+    Perceiver LIV block routing head views through the attention core.
 
     Gated head states are compressed into ``num_perceiver_query`` latents
     anchored uniformly over the sequence, then broadcast back: sequence ->
     latents -> sequence. Both cross-attentions run through
-    :class:`~memory_machines.models.blocks.attention.SlidingWindowAttention`
+    :class:`~memory_machines.models.blocks.attention.GroupedQueryAttention`
     with ``windowed=False`` (pure causal, full visibility to the past).
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``hidden_size``, ``num_attention_heads``,
             ``num_perceiver_query`` (must be positive), ``hidden_dropout``, and
-            the SWA/GQA projection hyperparameters.
-        window_size (int, optional): SWA window for the internal core.
-            Default: ``None`` (falls back to ``config.swa_window_size``).
+            the GQA projection hyperparameters.
+        window_size (int, optional): window for the internal core.
+            Default: ``None`` (falls back to ``config.window_size``).
 
     Examples::
 
@@ -356,7 +356,7 @@ class LivPerceiver(LivDoubleGatedBase):
         super().__init__(config)
         if config.num_perceiver_query <= 0:
             raise ValueError(f"num_perceiver_query ({config.num_perceiver_query}) must be positive")
-        self.swa = SlidingWindowAttention(config, window_size)
+        self.swa = GroupedQueryAttention(config, window_size)
         self.num_latents = config.num_perceiver_query
         heads, kv_heads, dh = self.swa.num_heads, self.swa.num_key_value_heads, self.swa.head_dim
         self.latent_queries = nn.Parameter(torch.empty(heads, self.num_latents, dh))

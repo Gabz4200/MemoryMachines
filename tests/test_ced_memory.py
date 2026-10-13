@@ -20,7 +20,7 @@ def _ced_cfg():
     return replace(
         tiny_cfg(),
         swa_bounded_replay=True,
-        swa_window_size=4,
+        window_size=4,
         ced_num_encoder_layers=1,
         ced_num_decoder_layers=2,
         csa_encoder_compression_ratio=2,

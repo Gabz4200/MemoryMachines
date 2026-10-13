@@ -99,7 +99,7 @@ class CausalEncoderDecoderStack(nn.Module):
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``ced_num_encoder_layers``, ``ced_num_decoder_layers``,
             ``csa_encoder_compression_ratio``,
-            ``csa_decoder_compression_ratio``, ``swa_window_size``, and
+            ``csa_decoder_compression_ratio``, ``window_size``, and
             ``swa_bounded_replay``.
         encoder_layers (list of nn.Module, optional): explicit encoder layers.
             Default: ``None`` (build from ``config``).
@@ -137,7 +137,7 @@ class CausalEncoderDecoderStack(nn.Module):
             else [CompressedSparseAttention2(config, config.csa_decoder_compression_ratio, "full" if i == 0 else ("reindex" if i % 4 == 1 else "reuse")) for i in range(dec_n)]
         )
         self.global_projs = nn.ModuleList([CEDGlobalKVProjection(config) for _ in range(dec_n)])
-        self.window_size = config.swa_window_size
+        self.window_size = config.window_size
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -239,7 +239,7 @@ class CausalEncoderDecoderStack(nn.Module):
         Prefill the decoder, optionally replaying only the trailing window.
 
         When ``config.swa_bounded_replay`` is set, only the last
-        ``swa_window_size`` decoder tokens (and their positions) are decoded;
+        ``window_size`` decoder tokens (and their positions) are decoded;
         otherwise this is :meth:`decode_full_context`.
 
         Args:

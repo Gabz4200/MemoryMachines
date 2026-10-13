@@ -40,9 +40,23 @@ class MemoryMachineConfig:
         output_attentions: Whether to output attention weights by default
         output_hidden_states: Whether to output hidden states by default
         num_perceiver_query: Learned latent queries per head (LivPerceiver)
-        swa_window_size: Sliding-window width (V4/V4.1: 128; NSA: 512)
+        window_size: Sliding-window width. ``<= 0`` disables the window
+            (full attention); ``> 0`` bounds causal attention to the last
+            ``window_size`` keys (plain SWA: 256). Compressed/sparse/shared
+            variants scale the window by their mechanism (see the
+            ``window_size_*`` fields); every value stays a tunable
+            hyperparameter, not an architectural guarantee.
         swa_bounded_replay: Enable SWA Bounded Replay (replay last window only)
         csa_compression_ratio: Default m:1 block compression (V4 CSA: 4)
+        window_size_compressed: Window for m:1 compressed attention, in
+            compressed tokens. Scales with ``csa_compression_ratio``:
+            ``256 * 4 = 1024`` covers the same token span as plain SWA.
+        window_size_sparse: Window for compressed-sparse attention, in
+            compressed tokens. The sparse indexer already filters most
+            of the store, so the window can be wider (``256 * 8``).
+        window_size_shared: Window for layers sharing the compressed KV
+            store with other layers; the per-layer budget scales further
+            (``256 * 16``).
         csa_encoder_compression_ratio: CED encoder m (V4.1: 2)
         csa_decoder_compression_ratio: CED decoder m (V4.1: 1 = uncompressed)
         hca_compression_ratio: Heavily Compressed Attention m' (V4: 128)
@@ -107,9 +121,12 @@ class MemoryMachineConfig:
     output_attentions: bool = False
     output_hidden_states: bool = False
     num_perceiver_query: int = 6
-    swa_window_size: int = 128
+    window_size: int = 256
     swa_bounded_replay: bool = True
     csa_compression_ratio: int = 4
+    window_size_compressed: int = 256 * 4
+    window_size_sparse: int = 256 * 8
+    window_size_shared: int = 256 * 16
     csa_encoder_compression_ratio: int = 2
     csa_decoder_compression_ratio: int = 1
     hca_compression_ratio: int = 128
@@ -175,8 +192,6 @@ class MemoryMachineConfig:
             raise ValueError(f"num_perceiver_query ({self.num_perceiver_query}) must be positive")
         if self.max_position_embeddings <= 0:
             raise ValueError(f"max_position_embeddings ({self.max_position_embeddings}) must be positive")
-        if self.swa_window_size <= 0:
-            raise ValueError(f"swa_window_size ({self.swa_window_size}) must be positive")
         if self.csa_compression_ratio <= 0:
             raise ValueError(f"csa_compression_ratio ({self.csa_compression_ratio}) must be positive")
         if self.csa_encoder_compression_ratio <= 0:

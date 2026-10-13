@@ -1,4 +1,4 @@
-r"""Sparse building blocks: compressor, indexer, gates, norms, output projection.
+r"""Sparse attention building blocks: compressor, indexer, gates, norms, output projection.
 
 These modules implement the pieces composed by
 :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention`:
@@ -8,6 +8,8 @@ These modules implement the pieces composed by
 :class:`HeadRMSNorm`, and :class:`GroupedOutputProjection` stabilize and
 project the result.
 """
+
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -113,9 +115,8 @@ class BlockCompressor(nn.Module):
         kv = self.kv_proj(hidden_states).view(bsz, lc, m, self.num_kv_heads, self.head_dim)
         z = self.score_proj(hidden_states).view(bsz, lc, m, self.num_kv_heads) + self.block_bias.unsqueeze(0).unsqueeze(0)
         if pad:
-            valid = torch.ones(bsz, total, 1, device=hidden_states.device)
-            valid[:, seqlen:] = 0.0
-            valid = valid.view(bsz, lc, m, 1)
+            valid = torch.ones(bsz, lc, m, 1, device=hidden_states.device)
+            valid[:, -1, seqlen % m :, 0] = 0.0
             z = z.masked_fill(valid < 0.5, float("-inf"))
         s = F.softmax(z, dim=2)
         comp = (s.unsqueeze(-1) * kv).sum(dim=2)
@@ -257,7 +258,10 @@ class SparseIndexer(nn.Module):
             >>> SparseIndexer.topk(torch.tensor([[[1., 5., 2.]]]), 2)
             tensor([[[1, 2]]])
         """
-        k = min(k, scores.shape[-1])
+        lc = scores.shape[-1]
+        if k > lc and __debug__:
+            warnings.warn(f"SparseIndexer.topk: k ({k}) exceeds the number of entries ({lc}); clamping to {lc}", stacklevel=2)
+        k = min(k, lc)
         return scores.topk(k, dim=-1).indices
 
     def build_pool(
@@ -562,7 +566,7 @@ class GroupedOutputProjection(nn.Module):
         zero-start of the dense ``o_proj`` it replaces.
         """
         for proj in self.group_projs:
-            assert isinstance(proj, nn.Linear)
+            assert isinstance(proj, nn.Linear), "group_projs holds nn.Linear"  # type: ignore[assert-type]
             nn.init.xavier_uniform_(proj.weight)
         nn.init.zeros_(self.out_proj.weight)
 

@@ -5,7 +5,7 @@ mixers, auxiliary memory, positioning, and shared cache helpers so existing
 ``memory_machines.models.blocks`` imports keep working.
 """
 
-from .attention import GroupedQueryAttention, SlidingWindowAttention, SwiGLU
+from .attention import GroupedQueryAttention, SwiGLU
 from .ced import CausalEncoderDecoderStack, CEDGlobalKVProjection
 from .compression import (
     AttentionSink,
@@ -62,7 +62,6 @@ __all__ = [
     "LivPerceiver",
     "NativeSparseAttention",
     "SinglePassMHC",
-    "SlidingWindowAttention",
     "SparseIndexer",
     "SwiGLU",
     "_causal_comp_mask",
