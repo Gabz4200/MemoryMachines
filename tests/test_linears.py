@@ -162,10 +162,11 @@ def test_chunked_bottleneck_reset_two_stage_mixer_xavier():
     assert tuple(first.weight.shape) == (3, 2)
     assert tuple(second.weight.shape) == (2, 3)
     assert not torch.allclose(first.weight, pre)
-    # xavier_uniform_ bound: gain * sqrt(6 / (fan_in + fan_out)), gain=1.
-    bound = math.sqrt(6 / (2 + 3))
-    assert torch.all(first.weight.abs() <= bound)
-    assert torch.all(second.weight.abs() <= bound)
+    # truncated-normal mixer: std = 1/sqrt(num_blocks), clipped
+    # to [-2s, 2s]; fan_in = 2 so s = 1/sqrt(2).
+    s = 1 / math.sqrt(2)
+    assert torch.all(first.weight.abs() <= 2 * s)
+    assert torch.all(second.weight.abs() <= 2 * s)
 
 
 def test_chunked_bottleneck_chunk_isolation():

@@ -74,11 +74,14 @@ class CVPEContextBias(nn.Module):
         begins as the vanilla scaled dot-product; the content/position
         modulation is learned from a disabled start (cf. zero-initialized
         conditioning branches: ControlNet, Zhang et al., 2023; ReZero).
-        The offset MLP input layer uses an explicit Kaiming-uniform init
-        (ReLU gain) so re-init is idempotent; its output is multiplied
-        by the zeroed ``offset_out``/``gamma`` at step 0 regardless.
+        The offset MLP input layer uses a truncated normal
+        ``N(0, (1/sqrt(fan_in))^2)`` (ReLU-compatible scale) so re-init
+        is idempotent; its output is multiplied by the zeroed
+        ``offset_out``/``gamma`` at step 0 regardless.
         """
-        nn.init.kaiming_uniform_(self.mlp_in.weight, a=0, nonlinearity="relu")
+        fan_in = self.mlp_in.in_features
+        mlp_std = 1 / math.sqrt(fan_in)
+        nn.init.trunc_normal_(self.mlp_in.weight, mean=0.0, std=mlp_std, a=-2 * mlp_std, b=2 * mlp_std)
         nn.init.zeros_(self.mlp_in.bias)
         nn.init.zeros_(self.gamma_proj.weight)
         nn.init.zeros_(self.gamma_proj.bias)

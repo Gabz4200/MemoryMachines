@@ -72,16 +72,20 @@ class FactoredLinear(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Variance-matched LeCun-style init (Glorot & Bengio, 2010): with
-        ``Var(A) = 1/fan\_in`` and ``Var(B) = 1/rank``, the effective map
-        ``W = BA`` preserves input variance, since
-        ``Var(y) = fan\_in * rank * Var(A) * Var(B) * Var(x) = Var(x)``.
-        Bias is zeroed. This contrasts with LoRA (Hu et al., 2021), where
-        ``B = 0`` is correct for a residual *adapter* but would kill the
-        signal of this standalone map.
+        Variance-matched truncated normal (Glorot & Bengio, 2010):
+        with ``Var(A) = 1/fan\_in`` and ``Var(B) = 1/rank``, the
+        effective map ``W = BA`` preserves input variance, since
+        ``Var(y) = fan\_in * rank * Var(A) * Var(B) * Var(x) =
+        Var(x)``. Weights are drawn from a truncated normal clipped
+        to ``[-2s, 2s]`` so no single factor starts with an outlier
+        scale. Bias is zeroed. This contrasts with LoRA (Hu et al.,
+        2021), where ``B = 0`` is correct for a residual *adapter*
+        but would kill the signal of this standalone map.
         """
-        nn.init.normal_(self.in_linear.weight, std=1 / math.sqrt(self.input_dim))
-        nn.init.normal_(self.out_linear.weight, std=1 / math.sqrt(self.rank))
+        in_std = 1 / math.sqrt(self.input_dim)
+        out_std = 1 / math.sqrt(self.rank)
+        nn.init.trunc_normal_(self.in_linear.weight, mean=0.0, std=in_std, a=-2 * in_std, b=2 * in_std)
+        nn.init.trunc_normal_(self.out_linear.weight, mean=0.0, std=out_std, a=-2 * out_std, b=2 * out_std)
         if self.out_linear.bias is not None:
             nn.init.zeros_(self.out_linear.bias)
 
@@ -187,23 +191,27 @@ class ChunkedBottleneckLinear(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Down-projection uses a LeCun-uniform bound ``1/sqrt(chunk)`` so each
-        pooled scalar preserves input variance (Glorot & Bengio, 2010); the
-        up-projection uses Xavier-uniform for small, symmetry-breaking
-        broadcast weights; a square mixer is set to the identity (an
-        orthogonal, norm-preserving map per Saxe et al., 2013) so chunks pass
-        through unbiased at init, while a two-stage mixer uses
-        Xavier-uniform; bias is zeroed.
+        Down-projection uses a LeCun truncated normal with std
+        ``1/sqrt(chunk)`` so each pooled scalar preserves input
+        variance; the up-projection uses the matching
+        ``1/sqrt(up_chunk)`` scale for symmetry-breaking broadcast
+        weights; a square mixer is set to the identity (an
+        orthogonal, norm-preserving map per Saxe et al., 2013) so
+        chunks pass through unbiased at init, while a two-stage
+        mixer uses ``1/sqrt(num_blocks)`` truncated normal; bias is
+        zeroed.
         """
-        bound = 1 / math.sqrt(self.down_chunk)
-        nn.init.uniform_(self.down_weight, -bound, bound)
-        nn.init.xavier_uniform_(self.up_weight)
+        down_std = 1 / math.sqrt(self.down_chunk)
+        up_std = 1 / math.sqrt(self.up_chunk)
+        nn.init.trunc_normal_(self.down_weight, mean=0.0, std=down_std, a=-2 * down_std, b=2 * down_std)
+        nn.init.trunc_normal_(self.up_weight, mean=0.0, std=up_std, a=-2 * up_std, b=2 * up_std)
         if isinstance(self.mixer, nn.Linear):
             nn.init.eye_(self.mixer.weight)
         else:
+            mix_std = 1 / math.sqrt(self.num_blocks)
             for module in self.mixer:
                 if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight)
+                    nn.init.trunc_normal_(module.weight, mean=0.0, std=mix_std, a=-2 * mix_std, b=2 * mix_std)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 

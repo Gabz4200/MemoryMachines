@@ -18,6 +18,9 @@ class MemoryMachineConfig:
         vocab_size: Size of the vocabulary
         hidden_size: Hidden dimension size
         intermediate_size: Feedforward intermediate dimension
+        num_layers: Total transformer layers ``N`` (encoder + decoder
+            or single-stack). Scales residual output-projection init by
+            ``1 / sqrt(2N)`` when ``residual_init_scale`` is set.
         num_attention_heads: Number of attention heads
         num_key_value_heads: Number of key-value heads for GQA
         conv_kernel_size: Kernel size for short convolutions
@@ -31,7 +34,14 @@ class MemoryMachineConfig:
         frvm_chunk_size: Query chunk size for the F-RVM gated reduction
         attention_dropout: Dropout rate for attention
         hidden_dropout: Dropout rate for hidden layers
-        initializer_range: Standard deviation for weight initialization
+        initializer_range: Standard deviation for weight
+            initialization (DeepSeek uses 0.006; standard
+            Transformer default 0.02)
+        residual_init_scale: When True, scale residual output
+            projections (attention ``o_proj``, FFN ``down_proj``,
+            grouped output) by ``initializer_range / sqrt(2N)``
+            (Megatron-LM/Qwen depth scaling). When False, residual
+            outputs are zero-initialized (identity residual start).
         use_cache: Whether to use key-value caching
         pad_token_id: Padding token ID
         bos_token_id: Beginning of sequence token ID
@@ -99,6 +109,7 @@ class MemoryMachineConfig:
     vocab_size: int = 32768
     hidden_size: int = 1024
     intermediate_size: int = 2816
+    num_layers: int = 40
     num_attention_heads: int = 16
     num_key_value_heads: int = 4
     conv_kernel_size: int = 3
@@ -112,7 +123,8 @@ class MemoryMachineConfig:
     frvm_chunk_size: int = 128
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
-    initializer_range: float = 0.02
+    initializer_range: float = 0.006
+    residual_init_scale: bool = True
     use_cache: bool = True
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -162,6 +174,8 @@ class MemoryMachineConfig:
         """Validate invariant bounds across configuration fields."""
         if self.hidden_size <= 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be positive")
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers ({self.num_layers}) must be positive")
         if self.num_attention_heads <= 0:
             raise ValueError(f"num_attention_heads ({self.num_attention_heads}) must be positive")
         if self.num_key_value_heads <= 0:

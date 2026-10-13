@@ -7,9 +7,40 @@ sliding-window masks, absolute-position resolution, and the Sinkhorn operator
 used by :class:`~memory_machines.models.blocks.memory.SinglePassMHC`.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
+
+
+def residual_init_scale(std: float, num_layers: int, enabled: bool = True) -> float | None:
+    r"""residual_init_scale(std, num_layers, enabled=True) -> float | None
+
+    Depth-scaled standard deviation for residual output projections
+    (Megatron-LM/Qwen): ``std / sqrt(2 * N)``.
+
+    Args:
+        std (float): base init standard deviation
+            (``config.initializer_range``).
+        num_layers (int): total transformer layers ``N``.
+        enabled (bool): when ``False``, return ``None`` so the caller
+            zero-initializes the residual output (Fixup/ReZero
+            identity-residual start). Default: ``True``.
+
+    Returns:
+        float | None: the depth-scaled std, or ``None`` when
+        ``enabled`` is ``False``.
+
+    Examples::
+
+        >>> residual_init_scale(0.006, 40)
+        0.0006708203932499369
+        >>> residual_init_scale(0.006, 40, enabled=False) is None
+        True
+    """
+    if not enabled:
+        return None
+    return std / math.sqrt(2 * max(num_layers, 1))
 
 
 @dataclass

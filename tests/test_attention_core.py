@@ -28,6 +28,14 @@ def test_plain_gqa_matches_manual_sdpa():
         k = k.repeat_interleave(m.num_key_value_groups, dim=1)
         v = v.repeat_interleave(m.num_key_value_groups, dim=1)
         logits = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(m.head_dim)
+        # forward() always applies the sliding-window mask
+        # (windowed=True), which subsumes the causal half, so
+        # the manual recompute must apply the same mask.
+        from memory_machines.models.blocks import _resolve_positions, _window_mask
+
+        q_pos, k_pos = _resolve_positions(x, seq, 0, None)
+        win = _window_mask(q_pos, k_pos, m.window_size).unsqueeze(1)
+        logits = logits.masked_fill(~win, float("-inf"))
         probs = F.softmax(logits, dim=-1)
         heads = torch.matmul(probs, v)
         expected = m.o_proj(heads.transpose(1, 2).reshape(bsz, seq, m.hidden_size))

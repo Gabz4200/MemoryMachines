@@ -10,6 +10,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .attention import GroupedQueryAttention
+from .shared import residual_init_scale
 
 
 class LivDoubleGatedBase(nn.Module):
@@ -42,6 +43,9 @@ class LivDoubleGatedBase(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.initializer_range: float = config.initializer_range
+        self.num_layers: int = config.num_layers
+        self.residual_init_scale: bool = config.residual_init_scale
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
         self.head_dim = self.hidden_size // self.num_heads
@@ -60,14 +64,25 @@ class LivDoubleGatedBase(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform for the 3-way input projection; the output
-        projection is zero-initialized so the whole double-gated branch
-        starts as an identity residual despite its two multiplicative
-        gatings (Fixup; ReZero). Subclass mixers define their own start
-        (Dirac identity for conv, small-normal latents for perceiver).
+        Truncated normal ``N(0, initializer_range^2)`` for
+        the 3-way input projection; the output projection
+        is either zero-initialized (identity residual start,
+        Fixup/ReZero) or depth-scaled to
+        ``initializer_range / sqrt(2N)`` (Megatron-LM/Qwen
+        residual scaling) per ``residual_init_scale``, so
+        the whole double-gated branch starts as a bounded
+        residual despite its two multiplicative gatings.
+        Subclass mixers define their own start (Dirac
+        identity for conv, small-normal latents for
+        perceiver).
         """
-        nn.init.xavier_uniform_(self.input_projection.weight)
-        nn.init.zeros_(self.output_projection.weight)
+        std = self.initializer_range
+        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
+        nn.init.trunc_normal_(self.input_projection.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        if scale is None:
+            nn.init.zeros_(self.output_projection.weight)
+        else:
+            nn.init.trunc_normal_(self.output_projection.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
 
     def split_gates_heads(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""split_gates_heads(x) -> (Tensor, Tensor, Tensor, Tensor)

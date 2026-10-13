@@ -17,7 +17,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .positioning import CVPEContextBias, FRVMValueGate
-from .shared import _check_position_bounds, _resolve_positions, _window_mask
+from .shared import _check_position_bounds, _resolve_positions, _window_mask, residual_init_scale
 
 
 def _causal_key_mask(q_pos: torch.Tensor, k_pos: torch.Tensor) -> torch.Tensor:
@@ -221,6 +221,9 @@ class GroupedQueryAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.window_size = window_size if window_size is not None else config.window_size
+        self.initializer_range: float = config.initializer_range
+        self.num_layers: int = config.num_layers
+        self.residual_init_scale: bool = config.residual_init_scale
 
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
@@ -272,17 +275,27 @@ class GroupedQueryAttention(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform init for the Q/K/V input projections (variance
-        preserving across widths; Glorot & Bengio, 2010); the output
-        projection is zero-initialized so the attention branch starts as an
-        identity residual (Fixup, Zhang et al., 2019; ReZero, Bachlechner
-        et al., 2020). Submodules (CVPE/FRVM) keep their own neutral-start
+        Q/K/V input projections use truncated normal
+        ``N(0, initializer_range^2)`` clipped to
+        ``[-2*initializer_range, 2*initializer_range]``
+        (DeepSeek's ``initializer_range = 0.006``; the
+        standard Transformer default is 0.02). The output
+        projection is either zero-initialized (identity
+        residual start, Fixup/ReZero) or depth-scaled to
+        ``initializer_range / sqrt(2N)`` (Megatron-LM/Qwen
+        residual scaling) per ``config.residual_init_scale``.
+        Submodules (CVPE/FRVM) keep their own neutral-start
         inits and are left untouched.
         """
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.zeros_(self.o_proj.weight)
+        std = self.initializer_range
+        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
+        nn.init.trunc_normal_(self.q_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.trunc_normal_(self.k_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.trunc_normal_(self.v_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        if scale is None:
+            nn.init.zeros_(self.o_proj.weight)
+        else:
+            nn.init.trunc_normal_(self.o_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
 
     def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""_project_qkv(hidden_states) -> (Tensor, Tensor, Tensor)
@@ -771,6 +784,9 @@ class SwiGLU(nn.Module):
             raise ValueError(f"SwiGLU needs even intermediate_size, got {config.intermediate_size}")
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        self.initializer_range: float = config.initializer_range
+        self.num_layers: int = config.num_layers
+        self.residual_init_scale: bool = config.residual_init_scale
 
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -780,15 +796,26 @@ class SwiGLU(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform for the gate/up projections; the down projection is
-        zero-initialized so the FFN branch starts as an identity residual
-        (Fixup; ReZero). The SiLU-gated product has roughly half the
-        variance of a plain linear path, so a variance-preserving input
-        init plus a zero-start output keeps early-step activations bounded.
+        Gate/up projections use truncated normal
+        ``N(0, initializer_range^2)`` (DeepSeek-style,
+        ``initializer_range = 0.006``). The down projection
+        is either zero-initialized (identity residual start,
+        Fixup/ReZero) or depth-scaled to
+        ``initializer_range / sqrt(2N)`` (Megatron-LM/Qwen
+        residual scaling) per ``config.residual_init_scale``.
+        The SiLU-gated product has roughly half the variance
+        of a plain linear path, so a variance-matched input
+        init plus a small/zero-start output keeps early-step
+        activations bounded.
         """
-        nn.init.xavier_uniform_(self.gate_proj.weight)
-        nn.init.xavier_uniform_(self.up_proj.weight)
-        nn.init.zeros_(self.down_proj.weight)
+        std = self.initializer_range
+        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
+        nn.init.trunc_normal_(self.gate_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.trunc_normal_(self.up_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        if scale is None:
+            nn.init.zeros_(self.down_proj.weight)
+        else:
+            nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""forward(x) -> Tensor

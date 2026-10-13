@@ -277,6 +277,7 @@ class SinglePassMHC(nn.Module):
         super().__init__()
         self.num_streams = config.mhc_num_streams
         self.iters = config.mhc_sinkhorn_iters
+        self.init_std: float = config.initializer_range
         n, d = config.mhc_num_streams, config.hidden_size
         self.pre_norm = nn.RMSNorm(n * d, config.rms_norm_eps)
         self.a_dyn = nn.Linear(n * d, n)
@@ -293,19 +294,21 @@ class SinglePassMHC(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        RMSNorm to unit gain; dynamic mixers Xavier-uniform but
-        temperature-gated by ``alpha = 1e-3``, so coefficients start at
-        the statics: uniform input/residual mixing and unit output scale
-        (near-identity stream mixing). Static biases stay zero, i.e.
-        ``sigmoid(0) = 0.5`` input weights, uniform Sinkhorn rows, and
-        ``2 * sigmoid(0) = 1`` output scales.
+        RMSNorm to unit gain; dynamic mixers use truncated
+        normal ``N(0, init_std^2)`` but are temperature-gated
+        by ``alpha = 1e-3``, so coefficients start at the
+        statics: uniform input/residual mixing and unit output
+        scale (near-identity stream mixing). Static biases stay
+        zero, i.e. ``sigmoid(0) = 0.5`` input weights, uniform
+        Sinkhorn rows, and ``2 * sigmoid(0) = 1`` output scales.
         """
         self.pre_norm.reset_parameters()
-        nn.init.xavier_uniform_(self.a_dyn.weight)
+        std = self.init_std
+        nn.init.trunc_normal_(self.a_dyn.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.zeros_(self.a_dyn.bias)
-        nn.init.xavier_uniform_(self.b_dyn.weight)
+        nn.init.trunc_normal_(self.b_dyn.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.zeros_(self.b_dyn.bias)
-        nn.init.xavier_uniform_(self.c_dyn.weight)
+        nn.init.trunc_normal_(self.c_dyn.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.zeros_(self.c_dyn.bias)
         nn.init.zeros_(self.a_static)
         nn.init.zeros_(self.b_static)
@@ -738,6 +741,7 @@ class DSparkDrafter(nn.Module):
         self.num_drafts = config.dspark_num_drafts
         self.window = config.dspark_window
         d = config.hidden_size
+        self.init_std: float = config.initializer_range
         self.draft_proj = nn.Linear(d, self.num_drafts * d, bias=False)
         self.markov_head = nn.Linear(d, d, bias=False)
         self.confidence_head = nn.Linear(d, self.num_drafts)
@@ -746,13 +750,16 @@ class DSparkDrafter(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform draft proposals; the Markov refinement head
-        zeroed so drafts start unrefined (``tanh(0) = 0`` residual) and
-        the confidence head zeroed for maximal initial uncertainty
-        (``sigmoid(0) = 0.5``). The drafter thus proposes from context
-        statistics first and earns confidence through training.
+        Truncated-normal ``N(0, init_std^2)`` draft
+        proposals; the Markov refinement head zeroed so
+        drafts start unrefined (``tanh(0) = 0`` residual)
+        and the confidence head zeroed for maximal initial
+        uncertainty (``sigmoid(0) = 0.5``). The drafter
+        thus proposes from context statistics first and
+        earns confidence through training.
         """
-        nn.init.xavier_uniform_(self.draft_proj.weight)
+        std = self.init_std
+        nn.init.trunc_normal_(self.draft_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.zeros_(self.markov_head.weight)
         nn.init.zeros_(self.confidence_head.weight)
         nn.init.zeros_(self.confidence_head.bias)

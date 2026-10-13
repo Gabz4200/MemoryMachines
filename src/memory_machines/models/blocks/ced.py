@@ -3,7 +3,9 @@ r"""Causal encoder-decoder stack over CSA2 layers.
 :class:`CausalEncoderDecoderStack` wires
 :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`
 encoder/decoder layers with per-decoder global KV projections
-(:class:`CEDGlobalKVProjection`) built from the encoder-final hidden states.
+(:class:`CEDGlobalKVProjection`) built from the encoder-final hidden
+states. The decoder half is a standalone :class:`CausalDecoder`
+(composable and usable on its own).
 """
 
 import torch
@@ -28,6 +30,9 @@ class CEDGlobalKVProjection(nn.Module):
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``hidden_size``, ``num_attention_heads``,
             ``num_key_value_heads``, and ``csa_decoder_compression_ratio``.
+            ``csa_num_output_groups`` only needs to satisfy the
+            config's head-divisibility invariant (it is not read
+            by this projection itself).
         compression_ratio (int, optional): block size ``m``. Default: ``None``
             (falls back to ``config.csa_decoder_compression_ratio``).
 
@@ -35,7 +40,7 @@ class CEDGlobalKVProjection(nn.Module):
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> proj = CEDGlobalKVProjection(MemoryMachineConfig(hidden_size=32,
-        ...     num_attention_heads=4, num_key_value_heads=2, csa_num_output_groups=4))
+        ...     num_attention_heads=4, num_key_value_heads=2, csa_num_output_groups=2))
         >>> kv, ends = proj(torch.randn(1, 8, 32))
         >>> kv.shape
         torch.Size([1, 8, 2, 8])
@@ -49,6 +54,7 @@ class CEDGlobalKVProjection(nn.Module):
             config.num_key_value_heads,
             head_dim,
             compression_ratio if compression_ratio is not None else config.csa_decoder_compression_ratio,
+            init_std=config.initializer_range,
         )
         self.reset_parameters()
 
@@ -56,8 +62,9 @@ class CEDGlobalKVProjection(nn.Module):
         r"""reset_parameters() -> None
 
         Re-applies the wrapped :class:`BlockCompressor` init
-        (Xavier-uniform KV projection, zero-start scores/bias for uniform
-        pooling at step 0). This module holds no other parameters.
+        (truncated-normal KV projection, zero-start scores/bias for
+        uniform pooling at step 0). This module holds no other
+        parameters.
         """
         self.compressor.reset_parameters()
 
@@ -90,10 +97,11 @@ class CausalEncoderDecoderStack(nn.Module):
 
     Reference causal encoder-decoder (CED) stack over CSA2 layers.
 
-    Encoder layers compress with mode ``full`` (first) then ``reuse``; decoder
-    layers use ``full``/``reindex``/``reuse`` cycling, each seeded with the
-    encoder-final global KV. Decoding supports full-context and bounded-replay
-    (last-window) prefill.
+    Encoder layers compress with mode ``full`` (first) then ``reuse``;
+    the decoder half is a :class:`CausalDecoder` (CSA2 layers in the
+    paper's ``full``/``reindex``/``reuse`` cycle, each seeded with the
+    encoder-final global KV, Eq. 1). Decoding supports full-context and
+    bounded-replay (last-window) prefill.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
@@ -127,30 +135,54 @@ class CausalEncoderDecoderStack(nn.Module):
         super().__init__()
         self.config = config
         enc_n = config.ced_num_encoder_layers
-        dec_n = config.ced_num_decoder_layers
         self.encoder_layers = nn.ModuleList(
             encoder_layers if encoder_layers is not None else [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
         )
-        self.decoder_layers = nn.ModuleList(
-            decoder_layers
-            if decoder_layers is not None
-            else [CompressedSparseAttention2(config, config.csa_decoder_compression_ratio, "full" if i == 0 else ("reindex" if i % 4 == 1 else "reuse")) for i in range(dec_n)]
-        )
-        self.global_projs = nn.ModuleList([CEDGlobalKVProjection(config) for _ in range(dec_n)])
+        # The decoder half is a standalone CausalDecoder so the
+        # Eq. 1 seeding path lives in exactly one place.
+        self.decoder = CausalDecoder(config, layers=decoder_layers)
         self.window_size = config.window_size
         self.reset_parameters()
+
+    @property
+    def decoder_layers(self) -> nn.ModuleList:
+        r"""decoder_layers() -> nn.ModuleList
+
+        Decoder CSA2 layers (backward-compatible view of
+        :attr:`decoder`).
+
+        Returns:
+            nn.ModuleList: the decoder's
+            :class:`CompressedSparseAttention2` layers.
+        """
+        return self.decoder.layers
+
+    @property
+    def global_projs(self) -> nn.ModuleList:
+        r"""global_projs() -> nn.ModuleList
+
+        Per-layer decoder global KV projections (backward-compatible
+        view of :attr:`decoder`).
+
+        Returns:
+            nn.ModuleList: the decoder's
+            :class:`CEDGlobalKVProjection` layers.
+        """
+        return self.decoder.global_projs
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Re-applies every encoder/decoder layer and global-projection init
-        so a freshly built (or re-initialized) stack starts from balanced
-        branch fusion, uniform pooling, and zero-start residual outputs.
+        Re-applies every encoder layer and the decoder init
+        so a freshly built (or re-initialized) stack starts from
+        balanced branch fusion, uniform pooling, and zero-start
+        (or depth-scaled) residual outputs.
         """
-        for layer in (*self.encoder_layers, *self.decoder_layers, *self.global_projs):
+        for layer in self.encoder_layers:
             reset = getattr(layer, "reset_parameters", None)
             if callable(reset):
                 reset()
+        self.decoder.reset_parameters()
 
     def encode(self, hidden_states: torch.Tensor, position_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, CSA2SharedState]:
         r"""encode(hidden_states, position_ids=None) -> (Tensor, CSA2SharedState)
@@ -192,15 +224,39 @@ class CausalEncoderDecoderStack(nn.Module):
         hidden_states: torch.Tensor,
         encoder_final: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        *,
+        start_pos: int | None = None,
+        seeded_store: bool = False,
     ) -> torch.Tensor:
-        r"""decode_full_context(hidden_states, encoder_final, position_ids=None) -> Tensor
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=False) -> Tensor
 
         Decode with every decoder layer seeded from the encoder-final states.
+
+        Delegates to :class:`CausalDecoder.decode_full_context`:
+        the decoder global KV is projected from the encoder-final
+        hidden states with each layer's own weights
+        (:class:`CEDGlobalKVProjection`, Eq. 1); it is *not*
+        derived from the decoder hidden states. The first decoder
+        layer builds the shared store; subsequent ``reindex``/
+        ``reuse`` layers consume it, so the projection runs once.
 
         Args:
             hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
             encoder_final (Tensor): encoder-final states of shape ``(B, Le, D)``.
             position_ids (Tensor, optional): decoder positions. Default: ``None``.
+            start_pos (int, optional): position of ``hidden_states[0]``
+                when the inputs continue a prior sequence. Default:
+                ``None`` (``encoder_final.shape[1]``, i.e. the inputs
+                follow the encoded context — pinned by
+                :func:`tests.test_cross_layer_positions.test_ced_stack_positions_stay_correct_across_layers`).
+            seeded_store (bool, optional): when ``True``, pass the
+                projected global KV to every decoder layer as a
+                pre-built store (``forward_shared(...,
+                seeded_store=True)``) so the ``full`` layer does not
+                recompress decoder hidden states. Used by
+                :meth:`prefill`'s bounded-replay path, which decodes
+                a tail whose own states must *not* enter the global
+                store. Default: ``False``.
 
         Returns:
             Tensor: decoder outputs of shape ``(B, Ld, D)``.
@@ -215,18 +271,13 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> stack.decode_full_context(torch.randn(1, 4, 16), enc).shape
             torch.Size([1, 4, 16])
         """
-        shared: CSA2SharedState | None = None
-        x = hidden_states
-        for layer, proj in zip(self.decoder_layers, self.global_projs):
-            if not isinstance(layer, CompressedSparseAttention2):
-                raise TypeError(f"decoder_layers must hold CompressedSparseAttention2, got {type(layer).__name__}")
-            comp, ends = proj(encoder_final)
-            if shared is None:
-                shared = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=encoder_final.shape[1])
-                if layer.indexer is not None:
-                    shared.indexer_k = layer.indexer.k_index_proj(comp.mean(dim=2))
-            x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
-        return x
+        return self.decoder.decode_full_context(
+            hidden_states,
+            encoder_final,
+            position_ids,
+            start_pos=start_pos,
+            seeded_store=seeded_store,
+        )
 
     def prefill(
         self,
@@ -238,9 +289,16 @@ class CausalEncoderDecoderStack(nn.Module):
 
         Prefill the decoder, optionally replaying only the trailing window.
 
-        When ``config.swa_bounded_replay`` is set, only the last
-        ``window_size`` decoder tokens (and their positions) are decoded;
-        otherwise this is :meth:`decode_full_context`.
+        Delegates to :class:`CausalDecoder.prefill`: when
+        ``config.swa_bounded_replay`` is set, only the last
+        ``window_size`` decoder tokens (and their positions) are
+        decoded; otherwise this is :meth:`decode_full_context`.
+        The replayed tail is anchored at its *true* positions
+        ``[enc_len - n, enc_len)`` and its own states are kept out
+        of the global compressed store (the store is projected from
+        the encoder-final states, Eq. 1), so the tail tokens attend
+        only to causally visible encoder entries and their own SWA
+        window — no future-token leakage.
 
         Args:
             hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
@@ -260,9 +318,275 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> stack.prefill(torch.randn(1, 4, 16), torch.randn(1, 6, 16)).shape
             torch.Size([1, 4, 16])
         """
+        return self.decoder.prefill(hidden_states, encoder_final, position_ids)
+
+
+class CausalDecoder(nn.Module):
+    r"""CausalDecoder(config, layers=None, global_projs=None)
+
+    Standalone causal decoder matching the paper's decoder
+    (§2.2, Eq. 1): decoder global KV is projected from the
+    encoder-final hidden states :math:`H_{L/2}` with
+    layer-dependent weights, *not* derived from the decoder's
+    own hidden states. Each layer retains its own global Q and
+    SWA KV (SWA-capable, per the local modification).
+
+    Wraps :class:`CompressedSparseAttention2` decoder layers in
+    the paper's CSA2 mode cycle (``full`` / ``reindex`` /
+    ``reuse``) and per-layer :class:`CEDGlobalKVProjection`
+    (:math:`C_l = H_{L/2} W^{KV}_l`). Supports full-context
+    decoding and SWA Bounded Replay (§2.3.2) prefill.
+
+    Args:
+        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
+            provides ``ced_num_decoder_layers``,
+            ``csa_decoder_compression_ratio``, ``window_size``,
+            and ``swa_bounded_replay``.
+        layers (list of nn.Module, optional): explicit decoder
+            layers. Default: ``None`` (build from ``config``).
+        global_projs (list of nn.Module, optional): explicit
+            per-layer global KV projections. Default: ``None``
+            (build from ``config``).
+
+    Examples::
+
+        >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+        >>> dec = CausalDecoder(MemoryMachineConfig(hidden_size=16,
+        ...     num_attention_heads=2, num_key_value_heads=1,
+        ...     ced_num_decoder_layers=2, csa_top_k=4,
+        ...     csa_num_output_groups=2))
+        >>> enc = torch.randn(1, 6, 16)
+        >>> dec(torch.randn(1, 4, 16), enc).shape
+        torch.Size([1, 4, 16])
+    """
+
+    def __init__(
+        self,
+        config: MemoryMachineConfig,
+        layers: list[nn.Module] | None = None,
+        global_projs: list[nn.Module] | None = None,
+    ):
+        super().__init__()
+        self.config = config
+        dec_n = config.ced_num_decoder_layers
+        layers_list = list(layers) if layers is not None else None
+        projs_list = list(global_projs) if global_projs is not None else None
+        if layers_list is not None and projs_list is not None and len(layers_list) != len(projs_list):
+            raise ValueError(f"layers ({len(layers_list)}) and global_projs ({len(projs_list)}) must have equal length; each decoder layer pairs with one global KV projection (Eq. 1)")
+        self.layers = nn.ModuleList(
+            layers_list
+            if layers_list is not None
+            else [
+                CompressedSparseAttention2(
+                    config,
+                    config.csa_decoder_compression_ratio,
+                    "full" if i == 0 else ("reindex" if i % 4 == 1 else "reuse"),
+                )
+                for i in range(dec_n)
+            ]
+        )
+        self.global_projs = nn.ModuleList(projs_list if projs_list is not None else [CEDGlobalKVProjection(config) for _ in range(dec_n)])
+        self.window_size = config.window_size
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Re-applies every decoder layer and global-projection init
+        so a freshly built (or re-initialized) decoder starts from
+        balanced branch fusion, uniform pooling, and zero-start
+        (or depth-scaled) residual outputs.
+        """
+        for module in (*self.layers, *self.global_projs):
+            reset = getattr(module, "reset_parameters", None)
+            if callable(reset):
+                reset()
+
+    def decode_full_context(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_final: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        *,
+        start_pos: int | None = None,
+        seeded_store: bool = False,
+    ) -> torch.Tensor:
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=False) -> Tensor
+
+        Decode with every layer seeded from the encoder-final states.
+
+        The decoder global KV is projected from the encoder-final
+        hidden states with each layer's own weights
+        (:class:`CEDGlobalKVProjection`, Eq. 1); it is *not*
+        derived from the decoder hidden states. The first layer
+        builds the shared store; subsequent ``reindex``/``reuse``
+        layers consume it, so the projection runs once.
+
+        Args:
+            hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
+            encoder_final (Tensor): encoder-final states of shape ``(B, Le, D)``.
+            position_ids (Tensor, optional): decoder positions. Default: ``None``.
+            start_pos (int, optional): position of ``hidden_states[0]``
+                when the inputs continue a prior sequence. Default:
+                ``None`` (``encoder_final.shape[1]``).
+            seeded_store (bool, optional): when ``True``, pass the
+                projected global KV to every layer as a pre-built
+                store (``forward_shared(..., seeded_store=True)``)
+                so the ``full`` layer does not recompress decoder
+                hidden states. Default: ``False``.
+
+        Returns:
+            Tensor: decoder outputs of shape ``(B, Ld, D)``.
+
+        Examples::
+
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> dec = CausalDecoder(MemoryMachineConfig(hidden_size=16,
+            ...     num_attention_heads=2, num_key_value_heads=1,
+            ...     ced_num_decoder_layers=1, csa_top_k=4,
+            ...     csa_num_output_groups=2))
+            >>> dec.decode_full_context(torch.randn(1, 4, 16),
+            ...     torch.randn(1, 6, 16)).shape
+            torch.Size([1, 4, 16])
+        """
+        if start_pos is None:
+            start_pos = encoder_final.shape[1]
+        shared: CSA2SharedState | None = None
+        x = hidden_states
+        for layer, proj in zip(self.layers, self.global_projs):
+            if not isinstance(layer, CompressedSparseAttention2):
+                raise TypeError(f"layers must hold CompressedSparseAttention2, got {type(layer).__name__}")
+            if shared is None:
+                # Eq. 1: C_l = H_{L/2} W^KV_l — the global
+                # store is projected from the encoder-final
+                # states once, then shared by every decoder
+                # layer (Full/Reindex/Reuse).
+                comp, ends = proj(encoder_final)
+                shared = CSA2SharedState(
+                    compressed_kv=comp,
+                    comp_end_pos=ends,
+                    total_len=start_pos,
+                )
+                if layer.indexer is not None:
+                    shared.indexer_k = layer.indexer.k_index_proj(comp.mean(dim=2))
+            x, shared = layer.forward_shared(
+                x,
+                shared,
+                position_ids=position_ids,
+                use_cache=True,
+                seeded_store=seeded_store,
+            )
+        return x
+
+    def prefill(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_final: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        r"""prefill(hidden_states, encoder_final, position_ids=None) -> Tensor
+
+        Prefill the decoder, optionally replaying only the trailing window.
+
+        When ``config.swa_bounded_replay`` is set, only the last
+        ``window_size`` decoder tokens (and their positions) are
+        decoded; otherwise this is :meth:`decode_full_context`.
+
+        The replayed tail is anchored at its *true* positions
+        ``[enc_len - n, enc_len)`` and its own states are kept out
+        of the global compressed store (the store is projected from
+        the encoder-final states, Eq. 1), so the tail tokens attend
+        only to causally visible encoder entries and their own SWA
+        window — no future-token leakage.
+
+        Args:
+            hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
+            encoder_final (Tensor): encoder-final states of shape ``(B, Le, D)``.
+            position_ids (Tensor, optional): decoder positions matching
+                ``hidden_states``. Default: ``None``.
+
+        Returns:
+            Tensor: decoder outputs for the (possibly truncated) inputs.
+
+        Examples::
+
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> dec = CausalDecoder(MemoryMachineConfig(hidden_size=16,
+            ...     num_attention_heads=2, num_key_value_heads=1,
+            ...     ced_num_decoder_layers=1, csa_top_k=4,
+            ...     csa_num_output_groups=2))
+            >>> dec.prefill(torch.randn(1, 4, 16),
+            ...     torch.randn(1, 6, 16)).shape
+            torch.Size([1, 4, 16])
+        """
         if not self.config.swa_bounded_replay:
             return self.decode_full_context(hidden_states, encoder_final, position_ids)
-        tail = hidden_states[:, -self.window_size :, :]
-        if position_ids is not None:
-            position_ids = position_ids[:, -self.window_size :] if position_ids.dim() == 2 else position_ids[-self.window_size :]
-        return self.decode_full_context(tail, encoder_final, position_ids)
+        seq_len = hidden_states.shape[1]
+        enc_len = encoder_final.shape[1]
+        if self.window_size <= 0 or seq_len > enc_len:
+            # Nothing to replay (window disabled) or the
+            # prompt exceeds the encoded context, so a tail
+            # cannot be reconstructed from the encoder states
+            # alone: decode the full context.
+            return self.decode_full_context(hidden_states, encoder_final, position_ids)
+        # SWA Bounded Replay (§2.3.2): replay only the last
+        # ``n_win`` tokens, where ``n_win`` is the SWA window
+        # size, to reconstruct the layer-local SWA KV states.
+        # Those tokens' own states must *not* enter the global
+        # compressed store (the store is projected from the
+        # encoder-final states, Eq. 1), so decode with a seeded
+        # store anchored at the tail's true start position.
+        replay_len = min(self.window_size, seq_len)
+        tail = hidden_states[:, -replay_len:, :]
+        start_pos = enc_len - replay_len
+        if position_ids is None:
+            position_ids = torch.arange(start_pos, enc_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.shape[0], -1)
+        else:
+            position_ids = position_ids[:, -replay_len:] if position_ids.dim() == 2 else position_ids[-replay_len:]
+            if position_ids.shape[-1] != replay_len:
+                raise ValueError(f"position_ids (length {position_ids.shape[-1]}) must cover the replay window (replay_len={replay_len})")
+        return self.decode_full_context(
+            tail,
+            encoder_final,
+            position_ids,
+            start_pos=start_pos,
+            seeded_store=True,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_final: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        r"""forward(hidden_states, encoder_final, position_ids=None) -> Tensor
+
+        Prefill the decoder (the default decoding path).
+
+        Delegates to :meth:`prefill`: when
+        ``config.swa_bounded_replay`` is set and the prompt fits
+        the encoded context, only the last ``window_size`` tokens
+        are replayed, so the output's sequence dimension is
+        ``min(window_size, hidden_states.shape[1])`` (the
+        replayed tail), not necessarily the full prompt length.
+        See :meth:`prefill` for the exact truncation rules.
+
+        Args:
+            hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
+            encoder_final (Tensor): encoder-final states of shape ``(B, Le, D)``.
+            position_ids (Tensor, optional): decoder positions. Default: ``None``.
+
+        Returns:
+            Tensor: decoder outputs for the (possibly truncated) inputs.
+
+        Examples::
+
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> dec = CausalDecoder(MemoryMachineConfig(hidden_size=16,
+            ...     num_attention_heads=2, num_key_value_heads=1,
+            ...     ced_num_decoder_layers=1, csa_top_k=4,
+            ...     csa_num_output_groups=2))
+            >>> dec(torch.randn(1, 4, 16), torch.randn(1, 6, 16)).shape
+            torch.Size([1, 4, 16])
+        """
+        return self.prefill(hidden_states, encoder_final, position_ids)

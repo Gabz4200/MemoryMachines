@@ -94,33 +94,52 @@ class CompressedSparseAttention(GroupedQueryAttention):
         self.use_dense_branch = use_dense_branch
         self.top_k = top_k if top_k is not None else config.csa_top_k
         self.window_size = window_size if window_size is not None else config.window_size_compressed
+        self.init_std: float = config.initializer_range
         self.q_latent_dim = config.csa_q_latent_dim if config.csa_q_latent_dim > 0 else config.hidden_size
         self.q_down = nn.Linear(config.hidden_size, self.q_latent_dim, bias=False)
         self.q_up_main = nn.Linear(self.q_latent_dim, self.num_heads * self.head_dim, bias=False)
-        self.compressor = BlockCompressor(config.hidden_size, self.num_key_value_heads, self.head_dim, self.compression_ratio)
-        self.indexer = SparseIndexer(self.q_latent_dim, self.head_dim, config.csa_indexer_heads, config.csa_indexer_dim) if use_indexer else None
+        self.compressor = BlockCompressor(
+            config.hidden_size,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.compression_ratio,
+            init_std=config.initializer_range,
+        )
+        self.indexer = SparseIndexer(self.q_latent_dim, self.head_dim, config.csa_indexer_heads, config.csa_indexer_dim, init_std=config.initializer_range) if use_indexer else None
         n_br = 2 + (1 if use_dense_branch and use_indexer else 0)
         self.branch_gate = BranchGate(config.hidden_size, n_br)
         self.q_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if config.csa_use_qkv_norm else None
         self.kv_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if config.csa_use_qkv_norm else None
         self.sink = AttentionSink(self.num_heads) if config.csa_use_sink else None
-        self.grouped_out = GroupedOutputProjection(self.num_heads, self.head_dim, config.csa_num_output_groups, config.csa_output_group_dim, config.hidden_size)
+        self.grouped_out = GroupedOutputProjection(
+            self.num_heads,
+            self.head_dim,
+            config.csa_num_output_groups,
+            config.csa_output_group_dim,
+            config.hidden_size,
+            init_std=config.initializer_range,
+            num_layers=config.num_layers,
+            residual_init_scale=config.residual_init_scale,
+        )
         self.swa = GroupedQueryAttention(config, self.token_window_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform for the low-rank query path (``q_down``/``q_up_main``)
-        and the retained ``v_proj`` reference values; all composed
-        submodules (compressor, indexer, branch gate, norms, sink, grouped
-        output, window branch) are re-reset to their own neutral-start inits
-        so a freshly built sparse layer fuses balanced branches from
-        uniform pooling and zero-start residual outputs.
+        Truncated normal ``N(0, initializer_range^2)`` for the
+        low-rank query path (``q_down``/``q_up_main``) and the
+        retained ``v_proj`` reference values; all composed
+        submodules (compressor, indexer, branch gate, norms, sink,
+        grouped output, window branch) are re-reset to their own
+        neutral-start inits so a freshly built sparse layer fuses
+        balanced branches from uniform pooling and a zero-start
+        (or depth-scaled) residual output.
         """
-        nn.init.xavier_uniform_(self.q_down.weight)
-        nn.init.xavier_uniform_(self.q_up_main.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
+        std = self.init_std
+        nn.init.trunc_normal_(self.q_down.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.trunc_normal_(self.q_up_main.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.trunc_normal_(self.v_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         self.compressor.reset_parameters()
         if self.indexer is not None:
             self.indexer.reset_parameters()
@@ -605,8 +624,9 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         compress_start_pos: int = 0,
         position_ids: torch.Tensor | None = None,
         use_cache: bool = False,
+        seeded_store: bool = False,
     ) -> tuple[torch.Tensor, CSA2SharedState]:
-        r"""forward_shared(hidden_states, shared=None, compress_from=None, compress_start_pos=0, position_ids=None, use_cache=False) -> (Tensor, CSA2SharedState)
+        r"""forward_shared(hidden_states, shared=None, compress_from=None, compress_start_pos=0, position_ids=None, use_cache=False, seeded_store=False) -> (Tensor, CSA2SharedState)
 
         Run one CSA2 layer with cross-layer shared state.
 
@@ -629,6 +649,13 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             use_cache (bool, optional): accepted for API parity; the SWA
                 branch runs without a persistent cache because SWA KV is
                 layer-local. Default: ``False``.
+            seeded_store (bool, optional): when ``True`` (``full`` mode
+                only), treat ``shared.compressed_kv``/``comp_end_pos``
+                as the already-built global store: no compression of
+                ``hidden_states`` and no concatenation. Used by the CED
+                decoder, whose global KV is projected from the
+                encoder-final states rather than derived from decoder
+                hidden states (CSA2, Eq. 1). Default: ``False``.
 
         Returns:
             Tensor: fused outputs ``(B, Lq, hidden)`` and the updated shared
@@ -655,18 +682,25 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             raise ValueError("forward_shared in full/reindex mode requires an indexer (use_indexer=False)")
         cq, q_main, v_q = self._make_main_queries(hidden_states)
         if self.mode == "full":
-            src = compress_from if compress_from is not None else hidden_states
-            start = compress_start_pos if compress_from is not None else past_len_raw
-            new_comp, new_ends = self.compressor(src, start_pos=start)
-            if compress_from is not None:
-                full_comp, full_ends = new_comp, new_ends
-            elif shared.compressed_kv is not None:
+            if seeded_store:
+                if shared.compressed_kv is None:
+                    raise ValueError("seeded_store=True requires shared.compressed_kv (seed the store before the full layer)")
                 if shared.comp_end_pos is None:
-                    raise ValueError("shared.comp_end_pos is None while shared.compressed_kv is set (corrupt CSA2SharedState)")
-                full_comp = torch.cat([shared.compressed_kv, new_comp], dim=1)
-                full_ends = torch.cat([shared.comp_end_pos.to(new_ends.device), new_ends], dim=0)
+                    raise ValueError("seeded_store=True requires shared.comp_end_pos (corrupt CSA2SharedState)")
+                full_comp, full_ends = shared.compressed_kv, shared.comp_end_pos
             else:
-                full_comp, full_ends = new_comp, new_ends
+                src = compress_from if compress_from is not None else hidden_states
+                start = compress_start_pos if compress_from is not None else past_len_raw
+                new_comp, new_ends = self.compressor(src, start_pos=start)
+                if compress_from is not None:
+                    full_comp, full_ends = new_comp, new_ends
+                elif shared.compressed_kv is not None:
+                    if shared.comp_end_pos is None:
+                        raise ValueError("shared.comp_end_pos is None while shared.compressed_kv is set (corrupt CSA2SharedState)")
+                    full_comp = torch.cat([shared.compressed_kv, new_comp], dim=1)
+                    full_ends = torch.cat([shared.comp_end_pos.to(new_ends.device), new_ends], dim=0)
+                else:
+                    full_comp, full_ends = new_comp, new_ends
             indexer_k = self.indexer.k_index_proj(full_comp.mean(dim=2))
             scores = self.indexer.score(cq, full_comp, q_pos, full_ends)
             topk = self.indexer.topk(scores, self.top_k)

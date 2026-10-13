@@ -6,7 +6,7 @@ mixers, auxiliary memory, positioning, and shared cache helpers so existing
 """
 
 from .attention import GroupedQueryAttention, SwiGLU
-from .ced import CausalEncoderDecoderStack, CEDGlobalKVProjection
+from .ced import CausalDecoder, CausalEncoderDecoderStack, CEDGlobalKVProjection
 from .compression import (
     AttentionSink,
     BlockCompressor,
@@ -44,6 +44,7 @@ __all__ = [
     "CEDGlobalKVProjection",
     "CSA2SharedState",
     "CVPEContextBias",
+    "CausalDecoder",
     "CausalEncoderDecoderStack",
     "ChunkedBottleneckLinear",
     "CompressedCache",

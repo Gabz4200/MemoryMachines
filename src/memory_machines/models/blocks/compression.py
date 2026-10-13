@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .shared import _causal_comp_mask
+from .shared import _causal_comp_mask, residual_init_scale
 
 
 class BlockCompressor(nn.Module):
@@ -49,6 +49,7 @@ class BlockCompressor(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         compression_ratio: int = 4,
+        init_std: float = 0.006,
     ):
         super().__init__()
         if compression_ratio <= 0:
@@ -56,6 +57,7 @@ class BlockCompressor(nn.Module):
         self.compression_ratio = compression_ratio
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.init_std: float = init_std
         kv_dim = num_kv_heads * head_dim
         self.kv_proj = nn.Linear(hidden_size, kv_dim, bias=False)
         self.score_proj = nn.Linear(hidden_size, num_kv_heads, bias=False)
@@ -65,14 +67,18 @@ class BlockCompressor(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform for ``kv_proj``; ``score_proj`` and ``block_bias``
-        are zero-initialized so every block starts as a uniform average
-        pool and the compressor learns selectivity from a neutral,
-        position-independent start (cf. Set Transformer PMA, Lee et al.,
-        2019). A random score init would give sharp arbitrary softmaxes
+        ``kv_proj`` uses truncated normal
+        ``N(0, initializer_range^2)`` (DeepSeek-style,
+        ``initializer_range = 0.006``). ``score_proj`` and
+        ``block_bias`` are zero-initialized so every block
+        starts as a uniform average pool and the compressor
+        learns selectivity from a neutral, position-independent
+        start (cf. Set Transformer PMA, Lee et al., 2019). A
+        random score init would give sharp arbitrary softmaxes
         at step 0.
         """
-        nn.init.xavier_uniform_(self.kv_proj.weight)
+        std = self.init_std
+        nn.init.trunc_normal_(self.kv_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.zeros_(self.score_proj.weight)
         nn.init.zeros_(self.block_bias)
 
@@ -156,10 +162,12 @@ class SparseIndexer(nn.Module):
         kv_head_dim: int,
         num_index_heads: int = 32,
         index_dim: int = 128,
+        init_std: float = 0.006,
     ):
         super().__init__()
         self.num_index_heads = num_index_heads
         self.index_dim = index_dim
+        self.init_std: float = init_std
         self.q_up_index = nn.Linear(q_latent_dim, num_index_heads * index_dim, bias=False)
         self.k_index_proj = nn.Linear(kv_head_dim, index_dim, bias=False)
         self.weight_proj = nn.Linear(q_latent_dim, num_index_heads, bias=False)
@@ -168,14 +176,17 @@ class SparseIndexer(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Kaiming-uniform (ReLU gain) for the index query/key projections,
-        whose dot products pass through a ReLU (He et al., 2015);
-        ``weight_proj`` is zero-initialized so retrieval scores start at
-        zero (neutral ranking) instead of collapsing onto random entries
-        before the index geometry is learned.
+        ``q_up_index``/``k_index_proj`` use truncated normal
+        ``N(0, initializer_range^2)`` (DeepSeek-style,
+        ``initializer_range = 0.006``) for the index query/key
+        projections. ``weight_proj`` is zero-initialized so
+        retrieval scores start at zero (neutral ranking) instead
+        of collapsing onto random entries before the index
+        geometry is learned.
         """
-        nn.init.kaiming_uniform_(self.q_up_index.weight, a=0, nonlinearity="relu")
-        nn.init.kaiming_uniform_(self.k_index_proj.weight, a=0, nonlinearity="relu")
+        std = self.init_std
+        nn.init.trunc_normal_(self.q_up_index.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.trunc_normal_(self.k_index_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.zeros_(self.weight_proj.weight)
 
     def _index_heads(self, query_latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -547,12 +558,25 @@ class GroupedOutputProjection(nn.Module):
         torch.Size([1, 5, 32])
     """
 
-    def __init__(self, num_heads: int, head_dim: int, num_groups: int, group_dim: int, hidden_size: int):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        num_groups: int,
+        group_dim: int,
+        hidden_size: int,
+        init_std: float = 0.006,
+        num_layers: int = 40,
+        residual_init_scale: bool = True,
+    ):
         super().__init__()
         if num_heads % num_groups != 0:
             raise ValueError(f"num_heads ({num_heads}) must be divisible by num_groups ({num_groups})")
         self.num_groups = num_groups
         self.group_heads = num_heads // num_groups
+        self.init_std: float = init_std
+        self.num_layers: int = num_layers
+        self.residual_init_scale: bool = residual_init_scale
         self.group_projs = nn.ModuleList([nn.Linear(self.group_heads * head_dim, group_dim, bias=False) for _ in range(num_groups)])
         self.out_proj = nn.Linear(num_groups * group_dim, hidden_size, bias=False)
         self.reset_parameters()
@@ -560,15 +584,22 @@ class GroupedOutputProjection(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Xavier-uniform for the per-group projections; the final
-        ``out_proj`` is zero-initialized so the fused attention output
-        starts as an identity residual (Fixup; ReZero), matching the
-        zero-start of the dense ``o_proj`` it replaces.
+        Truncated normal ``N(0, init_std^2)`` for the
+        per-group projections; the final ``out_proj`` is
+        either zero-initialized (identity residual start,
+        Fixup/ReZero) or depth-scaled to
+        ``init_std / sqrt(2N)`` (Megatron-LM/Qwen residual
+        scaling) per ``residual_init_scale``.
         """
+        std = self.init_std
+        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
         for proj in self.group_projs:
             assert isinstance(proj, nn.Linear), "group_projs holds nn.Linear"  # type: ignore[assert-type]
-            nn.init.xavier_uniform_(proj.weight)
-        nn.init.zeros_(self.out_proj.weight)
+            nn.init.trunc_normal_(proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        if scale is None:
+            nn.init.zeros_(self.out_proj.weight)
+        else:
+            nn.init.trunc_normal_(self.out_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
 
     def forward(self, heads: torch.Tensor) -> torch.Tensor:
         r"""forward(heads) -> Tensor

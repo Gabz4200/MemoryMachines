@@ -128,21 +128,22 @@ def test_ced_prefill_window_larger_than_sequence():
 def test_ced_prefill_matches_decode_of_tail():
     torch.manual_seed(3)
     model = CausalEncoderDecoderStack(_ced_cfg(window_size=4, swa_bounded_replay=True)).eval()
-    H = torch.randn(1, 10, 32)
-    E = torch.randn(1, 8, 32)
+    L = 10
+    H = torch.randn(1, L, 32)
+    E = torch.randn(1, L, 32)
 
-    pos2d = torch.arange(10).unsqueeze(0)
+    pos2d = torch.arange(L).unsqueeze(0)
     torch.testing.assert_close(
         model.prefill(H, E, pos2d),
-        model.decode_full_context(H[:, -4:, :], E, pos2d[:, -4:]),
+        model.decode_full_context(H[:, -4:, :], E, pos2d[:, -4:], start_pos=L - 4, seeded_store=True),
         atol=1e-5,
         rtol=1e-5,
     )
 
-    pos1d = torch.arange(10)
+    pos1d = torch.arange(L)
     torch.testing.assert_close(
         model.prefill(H, E, pos1d),
-        model.decode_full_context(H[:, -4:, :], E, pos1d[-4:]),
+        model.decode_full_context(H[:, -4:, :], E, pos1d[-4:], start_pos=L - 4, seeded_store=True),
         atol=1e-5,
         rtol=1e-5,
     )
