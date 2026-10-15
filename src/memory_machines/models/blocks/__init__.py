@@ -16,7 +16,7 @@ from .compression import (
     HeadRMSNorm,
     SparseIndexer,
 )
-from .gdn2 import GatedDeltaNet2, apply_beta_guard, gated_delta_rule_2
+from .gdn2 import GatedDeltaNet2, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
@@ -70,7 +70,9 @@ __all__ = [
     "SparseIndexer",
     "SwiGLU",
     "apply_beta_guard",
+    "add_resting_projection",
     "gated_delta_rule_2",
+    "resting_corrected_write",
     "_causal_comp_mask",
     "_check_position_bounds",
     "_past_total_len",

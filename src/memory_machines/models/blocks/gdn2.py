@@ -19,6 +19,17 @@ Functional API (``torch.nn.functional.scaled_dot_product_attention`` style):
   (``fused_recurrent`` kernel equivalent, differentiable).
 - :func:`gated_delta_rule_2_chunk_forward` — chunkwise WY oracle
   (``chunk`` kernel equivalent: intra / solve / inter math from Appendix A).
+- :func:`resting_corrected_write` — pre-processing step of the resting-state
+  wrapper (``z_tilde = z - S0^T e``).
+- :func:`add_resting_projection` — post-processing step (``o = o_tilde + S0^T q``).
+
+All entry points accept an optional ``resting_state`` prior ``S0``. When
+given, the recurrence relaxes toward ``S0`` instead of zero
+(``bar = S0 + D (S_prev - S0)``) via the centered reparameterization, which
+wraps the unmodified canonical kernels: pre-subtract the resting readout
+from the write target, run the standard scan on the centered state, then add
+the static ``S0^T q`` projection. ``resting_state=None`` is exactly the
+canonical Gated Delta Rule-2.
 
 Both paths share one math core, so their outputs agree to numerical precision;
 gradients flow through plain autograd (no manual backward needed). Compiled
@@ -52,10 +63,12 @@ from .causal_conv1d import ShortConvolution
 
 __all__ = [
     "GatedDeltaNet2",
+    "add_resting_projection",
     "apply_beta_guard",
     "gated_delta_rule_2",
     "gated_delta_rule_2_chunk_forward",
     "gated_delta_rule_2_recurrent_forward",
+    "resting_corrected_write",
 ]
 
 _COMPILED_BACKENDS = ("compiled", "triton", "triton_ascend", "ascend", "cuda", "cpu", "taichi", "gpu")
@@ -138,6 +151,34 @@ def apply_beta_guard(
     return torch.where(unsafe, projected, b)
 
 
+def resting_corrected_write(
+    z: torch.Tensor,
+    e: torch.Tensor,
+    resting: torch.Tensor,
+) -> torch.Tensor:
+    r"""resting_corrected_write(z, e, resting) -> Tensor
+
+    Pre-processing step of the resting-state wrapper: ``z_tilde = z - S0^T e``.
+    ``z``/``e`` are ``[..., V]``/``[..., K]`` write/erase rows and ``resting``
+    is the ``[K, V]`` prior ``S0`` (``e @ S0 == S0^T e`` row-wise).
+    """
+    return z - torch.matmul(e, resting)
+
+
+def add_resting_projection(
+    o_tilde: torch.Tensor,
+    q: torch.Tensor,
+    resting: torch.Tensor,
+) -> torch.Tensor:
+    r"""add_resting_projection(o_tilde, q, resting) -> Tensor
+
+    Post-processing step of the resting-state wrapper: ``o = o_tilde + S0^T q``.
+    ``q`` must already carry the path's normalization/scale; ``resting`` is the
+    ``[K, V]`` prior ``S0`` (``q @ S0 == S0^T q`` row-wise).
+    """
+    return o_tilde + torch.matmul(q, resting)
+
+
 def _recurrent_single(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -149,6 +190,7 @@ def _recurrent_single(
     scale: float,
     use_qk_l2norm: bool,
     beta_guard: bool,
+    resting: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Token loop for one head-group row: all ``[T, ...]`` + ``s0 [K, V]``."""
     t = q.shape[0]
@@ -156,7 +198,10 @@ def _recurrent_single(
     alpha = torch.exp(g)  # [T, K]
     e = b * k  # [T, K]
     z = w * v  # [T, V]
-    s = s0
+    # Centered wrapper: canonical scan on (z_tilde, s0 - S0), then shift back.
+    if resting is not None:
+        z = resting_corrected_write(z, e, resting)
+    s = s0 - resting if resting is not None else s0
     outs = []
     for i in range(t):
         s_bar = alpha[i].unsqueeze(-1) * s
@@ -164,6 +209,8 @@ def _recurrent_single(
         s = s_bar + torch.outer(k[i], z[i] - r)
         outs.append(torch.matmul(s.transpose(0, 1), q[i]))
     o = torch.stack(outs, dim=0) if t else q.new_zeros(0, v.shape[-1])
+    if resting is not None:
+        return add_resting_projection(o, q, resting), s + resting
     return o, s
 
 
@@ -179,11 +226,12 @@ def _chunk_single(
     use_qk_l2norm: bool,
     beta_guard: bool,
     chunk_size: int,
+    resting: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunkwise WY forward for one head-group row (paper Appendix A)."""
     t = q.shape[0]
     q, k, b = _prepare_qkb(q, k, g, b, scale, use_qk_l2norm, beta_guard)
-    s = s0
+    s = s0 - resting if resting is not None else s0
     eye_full = torch.eye(chunk_size, dtype=q.dtype, device=q.device)
     outs = []
     for start in range(0, t, chunk_size):
@@ -198,6 +246,8 @@ def _chunk_single(
         k_bar = kc / gamma
         e_bar = gamma * (bc * kc)
         z = wc * vc
+        if resting is not None:
+            z = resting_corrected_write(z, bc * kc, resting)
         eye_c = eye_full[:c, :c]
         tmat = torch.tril(e_bar @ k_bar.transpose(0, 1), diagonal=-1)  # [C, C]
         a_mat = torch.linalg.solve_triangular(eye_c + tmat, eye_c, upper=False)  # A = (I + T)^{-1}
@@ -210,8 +260,10 @@ def _chunk_single(
         r = u - y @ s
         outs.append(q_gamma @ s + aqk @ r)
         s = gamma_c.unsqueeze(-1) * s + k_tail.transpose(0, 1) @ r
-    o = torch.cat(outs, dim=0) if outs else q.new_zeros(0, v.shape[-1])
-    return o, s
+    o_tilde = torch.cat(outs, dim=0) if outs else q.new_zeros(0, v.shape[-1])
+    if resting is not None:
+        return add_resting_projection(o_tilde, q, resting), s + resting
+    return o_tilde, s
 
 
 def _check_shapes(
@@ -223,8 +275,9 @@ def _check_shapes(
     w: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     initial_state: torch.Tensor | None,
+    resting_state: torch.Tensor | None = None,
 ) -> tuple[int, int, int, int, int]:
-    r"""_check_shapes(q, k, v, g, b, w, cu_seqlens, initial_state) -> (B, T, H, HV, K)
+    r"""_check_shapes(q, k, v, g, b, w, cu_seqlens, initial_state, ...) -> (B, T, H, HV, K)
 
     Validate the Gated Delta Rule-2 layouts (``b`` on ``[B, T, HV, K]``, GVA
     divisibility, packed-batch rules) and return the resolved dims.
@@ -252,6 +305,8 @@ def _check_shapes(
         n = len(cu_seqlens) - 1 if cu_seqlens is not None else B
         if tuple(initial_state.shape) != (n, HV, K, V):
             raise ValueError(f"initial_state must be [N, HV, K, V]={(n, HV, K, V)}, got {tuple(initial_state.shape)}")
+    if resting_state is not None and tuple(resting_state.shape) != (HV, K, V):
+        raise ValueError(f"resting_state must be [HV, K, V]={(HV, K, V)}, got {tuple(resting_state.shape)}")
     return B, T, H, HV, K
 
 
@@ -269,20 +324,26 @@ def _run_path(
     beta_guard: bool,
     cu_seqlens: torch.Tensor | None,
     chunk_size: int | None,
+    resting_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""_run_path(...) -> (o, state)
 
     Shared driver for both reference paths: validates shapes, expands key-side
     tensors across value-head groups, splits packed/batched segments, and runs
     ``chunk_size=None`` (recurrent) or ``chunk_size=C`` (WY) per head row.
+    ``resting_state`` is the shared ``[HV, K, V]`` prior each segment relaxes
+    toward (``None`` selects canonical zero-centered decay).
     """
-    B, T, H, HV, K = _check_shapes(q, k, v, g, b, w, cu_seqlens, initial_state)
+    B, T, H, HV, K = _check_shapes(q, k, v, g, b, w, cu_seqlens, initial_state, resting_state)
     V = v.shape[-1]
     if beta_guard and not use_qk_l2norm:
         raise ValueError("beta_guard=True requires use_qk_l2norm=True so the guard sees the normalized key")
     if scale is None:
         scale = K**-0.5
-    cdtype = _compute_dtype(q, k, v, g, b, w)
+    cdtype_tensors = [q, k, v, g, b, w]
+    if resting_state is not None:
+        cdtype_tensors.append(resting_state)
+    cdtype = _compute_dtype(*cdtype_tensors)
     group = HV // H
     # Repeat key-side tensors across value-head groups (GVA); alias when group == 1.
     if group == 1:
@@ -294,6 +355,7 @@ def _run_path(
     br = b.to(cdtype)
     vr = v.to(cdtype)
     wr = w.to(cdtype)
+    rest = resting_state.to(cdtype) if resting_state is not None else None
     bounds = cu_seqlens.tolist() if cu_seqlens is not None else None
     segs: list[tuple[int, int]] = list(itertools.pairwise(bounds)) if bounds is not None else [(0, T) for _ in range(B)]
     outs = torch.empty(B, T, HV, V, dtype=cdtype, device=q.device)
@@ -304,6 +366,7 @@ def _run_path(
         seg_view = outs[0, s:e] if cu_seqlens is not None else outs[n]
         cur = torch.empty_like(s0)
         for hv in range(HV):
+            rest_hv = rest[hv] if rest is not None else None
             if chunk_size is not None:
                 o_hv, cur_hv = _chunk_single(
                     qr[bn, s:e, hv],
@@ -317,6 +380,7 @@ def _run_path(
                     use_qk_l2norm,
                     beta_guard,
                     chunk_size,
+                    rest_hv,
                 )
             else:
                 o_hv, cur_hv = _recurrent_single(
@@ -330,6 +394,7 @@ def _run_path(
                     scale,
                     use_qk_l2norm,
                     beta_guard,
+                    rest_hv,
                 )
             seg_view[:, hv, :] = o_hv
             cur[hv] = cur_hv
@@ -351,6 +416,7 @@ def gated_delta_rule_2_recurrent_forward(
     use_qk_l2norm: bool = False,
     beta_guard: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    resting_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""gated_delta_rule_2_recurrent_forward(q, k, v, g, b, w, ...) -> (o, state)
 
@@ -373,11 +439,13 @@ def gated_delta_rule_2_recurrent_forward(
         beta_guard (bool): erase-contrast projection (requires
             ``use_qk_l2norm``). Default: ``False``.
         cu_seqlens (Tensor, optional): ``[N+1]`` packed offsets (``B == 1``).
+        resting_state (Tensor, optional): shared prior ``[HV, K, V]`` the
+            state relaxes toward instead of zero. Default: ``None``.
 
     Returns:
         Tensor: outputs ``[B, T, HV, V]`` and optional final state.
     """
-    return _run_path(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, None)
+    return _run_path(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, None, resting_state)
 
 
 def gated_delta_rule_2_chunk_forward(
@@ -394,6 +462,7 @@ def gated_delta_rule_2_chunk_forward(
     beta_guard: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
+    resting_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""gated_delta_rule_2_chunk_forward(q, k, v, g, b, w, ...) -> (o, state)
 
@@ -415,13 +484,15 @@ def gated_delta_rule_2_chunk_forward(
         beta_guard (bool): erase-contrast projection. Default: ``False``.
         cu_seqlens (Tensor, optional): ``[N+1]`` packed offsets (``B == 1``).
         chunk_size (int): chunk width. Default: ``64``.
+        resting_state (Tensor, optional): shared prior ``[HV, K, V]`` the
+            state relaxes toward instead of zero. Default: ``None``.
 
     Returns:
         Tensor: outputs ``[B, T, HV, V]`` and optional final state.
     """
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    return _run_path(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, chunk_size)
+    return _run_path(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, chunk_size, resting_state)
 
 
 def gated_delta_rule_2(
@@ -439,6 +510,7 @@ def gated_delta_rule_2(
     cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     backend: str = "naive",
+    resting_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""gated_delta_rule_2(q, k, v, g, b, w, ...) -> (o, state)
 
@@ -464,6 +536,8 @@ def gated_delta_rule_2(
         cu_seqlens (Tensor, optional): ``[N+1]`` packed offsets (``B == 1``).
         chunk_size (int): chunk width for the WY path. Default: ``64``.
         backend (str): reference path selector. Default: ``"naive"``.
+        resting_state (Tensor, optional): shared prior ``[HV, K, V]`` the
+            state relaxes toward instead of zero. Default: ``None``.
 
     Returns:
         Tensor: outputs ``[B, T, HV, V]`` and optional final state.
@@ -481,9 +555,9 @@ def gated_delta_rule_2(
         torch.Size([1, 4, 1, 4])
     """
     if backend in ("naive", "recurrent"):
-        return gated_delta_rule_2_recurrent_forward(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens)
+        return gated_delta_rule_2_recurrent_forward(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, resting_state)
     if backend in ("chunk", "wy_fast"):
-        return gated_delta_rule_2_chunk_forward(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, chunk_size)
+        return gated_delta_rule_2_chunk_forward(q, k, v, g, b, w, scale, initial_state, output_final_state, use_qk_l2norm, beta_guard, cu_seqlens, chunk_size, resting_state)
     if backend in _COMPILED_BACKENDS:
         raise NotImplementedError(f"backend {backend!r} has no GDN-2 kernel yet (TODO); use backend='naive'")
     raise ValueError(f"Unknown backend: {backend!r}. Valid reference backends: {list(_REFERENCE_BACKENDS)}")
@@ -517,6 +591,8 @@ class GatedDeltaNet2(nn.Module):
         chunk_size (int): WY chunk width. Default: ``64``.
         use_qk_l2norm (bool): L2-normalize q/k. Default: ``True``.
         beta_guard (bool): erase-contrast projection. Default: ``False``.
+        use_resting_state (bool): learn a ``[HV, K, V]`` resting prior ``S0``
+            the state relaxes toward instead of zero. Default: ``False``.
 
     Examples::
 
@@ -546,6 +622,7 @@ class GatedDeltaNet2(nn.Module):
         chunk_size: int = 64,
         use_qk_l2norm: bool = True,
         beta_guard: bool = False,
+        use_resting_state: bool = False,
     ) -> None:
         super().__init__()
         if backend not in _REFERENCE_BACKENDS:
@@ -575,6 +652,11 @@ class GatedDeltaNet2(nn.Module):
         self.chunk_size = chunk_size
         self.use_qk_l2norm = use_qk_l2norm
         self.beta_guard = beta_guard
+        self.use_resting_state = use_resting_state
+        if use_resting_state:
+            self.resting_state = nn.Parameter(torch.zeros(self.num_v_heads, head_dim_k, self.head_v_dim))
+        else:
+            self.register_parameter("resting_state", None)
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
@@ -674,6 +756,7 @@ class GatedDeltaNet2(nn.Module):
 
         if last_state is not None and last_state.shape[0] != (len(cu_seqlens) - 1 if cu_seqlens is not None else B):
             raise ValueError(f"cached recurrent_state batch {tuple(last_state.shape)} mismatches input batch {B}")
+        rest = self.resting_state.to(cdtype) if (self.use_resting_state and self.resting_state is not None) else None
 
         o, new_state = gated_delta_rule_2(
             qh,
@@ -689,6 +772,7 @@ class GatedDeltaNet2(nn.Module):
             cu_seqlens=cu_seqlens,
             chunk_size=self.chunk_size,
             backend=self.backend,
+            resting_state=rest,
         )
         gate = self.g_proj(hidden_states)
         gate = gate.view(B, o.shape[1], self.num_v_heads, self.head_v_dim)
