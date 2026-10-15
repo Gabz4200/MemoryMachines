@@ -16,6 +16,7 @@ from .compression import (
     HeadRMSNorm,
     SparseIndexer,
 )
+from .gdn2 import GatedDeltaNet2, apply_beta_guard, gated_delta_rule_2
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
@@ -55,6 +56,7 @@ __all__ = [
     "EngramMemory",
     "FRVMValueGate",
     "FactoredLinear",
+    "GatedDeltaNet2",
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HeadRMSNorm",
@@ -63,10 +65,12 @@ __all__ = [
     "LivDoubleGatedBase",
     "LivPerceiver",
     "NativeSparseAttention",
-    "SinglePassMHC",
     "ShortConvolution",
+    "SinglePassMHC",
     "SparseIndexer",
     "SwiGLU",
+    "apply_beta_guard",
+    "gated_delta_rule_2",
     "_causal_comp_mask",
     "_check_position_bounds",
     "_past_total_len",
