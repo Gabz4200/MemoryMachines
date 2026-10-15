@@ -10,6 +10,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .attention import GroupedQueryAttention
+from .causal_conv1d import ShortConvolution
 from .shared import residual_init_scale
 
 
@@ -263,11 +264,14 @@ class LivDoubleGatedBase(nn.Module):
 class LivConvBlock(LivDoubleGatedBase):
     r"""LivConvBlock(config)
 
-    Short-conv LIV block: grouped convolution with one group per head.
+    Short-conv LIV block: depthwise causal convolution over the merged hidden
+    state via :class:`~memory_machines.models.blocks.causal_conv1d.ShortConvolution`.
 
-    Token mixing is a depthwise-over-heads ``Conv1d`` (``groups=num_heads``),
-    so there is no cross-head mixing. Kernel size comes from
-    ``config.conv_kernel_size`` with ``kernel // 2`` padding to preserve length.
+    Token mixing is strictly per-channel (hence per-head independent), causal
+    (no future leakage — position ``t`` only reads ``<= t``), and stateless
+    here (no cache is threaded through; the mixer runs the full-sequence
+    path). Kernel size comes from ``config.conv_kernel_size``. The mixer is
+    linear (``activation=None``); non-linearity comes from the double gating.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
@@ -285,39 +289,33 @@ class LivConvBlock(LivDoubleGatedBase):
     def __init__(self, config: MemoryMachineConfig):
         super().__init__(config)
 
-        self.conv = nn.Conv1d(
-            self.hidden_size,
-            self.hidden_size,
+        self.conv = ShortConvolution(
+            hidden_size=self.hidden_size,
             kernel_size=config.conv_kernel_size,
-            padding=config.conv_kernel_size // 2,
-            groups=self.num_heads,
             bias=False,
+            activation=None,
+            backend="naive",
         )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Grouped-Dirac (identity) init: output channel ``c`` reads its own
-        group's channel ``c % head_dim`` at the center tap, so the mixer
-        preserves the token stream exactly at step 0 and learns local
-        context from an identity start (DiracNets, Zagoruyko & Komodakis,
-        2016; cf. Fixup identity-start). ``nn.init.dirac_`` cannot be
-        used here: it maps output channel ``c`` to input channel ``c``,
-        which leaves all but the first group dead for grouped convolutions
-        with ``out_channels > in_channels // groups``.
+        Causal-Dirac (identity) init: each channel reads only its own
+        current token (last tap = 1, rest = 0), so the mixer preserves the
+        token stream exactly at step 0 and learns local past context from
+        an identity start (DiracNets, Zagoruyko & Komodakis, 2016; cf.
+        Fixup identity-start).
         """
         LivDoubleGatedBase.reset_parameters(self)
         with torch.no_grad():
             self.conv.weight.zero_()
-            center = self.conv.kernel_size[0] // 2
-            for c in range(self.conv.out_channels):
-                self.conv.weight[c, c % self.head_dim, center] = 1.0
+            self.conv.weight[:, 0, -1] = 1.0
 
     def mix_heads(self, x_gated: torch.Tensor) -> torch.Tensor:
         r"""mix_heads(x_gated) -> Tensor
 
-        Apply the per-head short convolution.
+        Apply the per-channel causal short convolution.
 
         Args:
             x_gated (Tensor): gated inputs of shape ``(B, L, H, Dh)``.
@@ -334,9 +332,9 @@ class LivConvBlock(LivDoubleGatedBase):
             torch.Size([1, 6, 2, 8])
         """
         bsz, seqlen, _, _ = x_gated.shape
-        x_merged = x_gated.reshape(bsz, seqlen, self.hidden_size).transpose(1, 2)
-        x_conv = self.conv(x_merged)
-        return x_conv.transpose(1, 2).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        x_merged = x_gated.reshape(bsz, seqlen, self.hidden_size)
+        x_conv, _ = self.conv(x_merged)
+        return x_conv.reshape(bsz, seqlen, self.num_heads, self.head_dim)
 
 
 class LivPerceiver(LivDoubleGatedBase):

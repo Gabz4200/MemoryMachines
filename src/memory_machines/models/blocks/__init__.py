@@ -6,6 +6,7 @@ mixers, auxiliary memory, positioning, and shared cache helpers so existing
 """
 
 from .attention import GroupedQueryAttention, SwiGLU
+from .causal_conv1d import ShortConvolution
 from .ced import CausalDecoder, CausalEncoderDecoderStack, CEDGlobalKVProjection
 from .compression import (
     AttentionSink,
@@ -63,6 +64,7 @@ __all__ = [
     "LivPerceiver",
     "NativeSparseAttention",
     "SinglePassMHC",
+    "ShortConvolution",
     "SparseIndexer",
     "SwiGLU",
     "_causal_comp_mask",
