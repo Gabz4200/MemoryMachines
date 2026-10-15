@@ -302,6 +302,15 @@ def _check_shapes(
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError(f"cu_seqlens packing requires batch 1, got {B}")
+        if cu_seqlens.dim() != 1:
+            raise ValueError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
+        if cu_seqlens.dtype not in (torch.int32, torch.int64, torch.long):
+            raise ValueError(f"cu_seqlens must be integer dtype, got {cu_seqlens.dtype}")
+        bounds = cu_seqlens.tolist()
+        if not bounds or bounds[0] != 0:
+            raise ValueError(f"cu_seqlens must start at 0, got {bounds[:3] if bounds else bounds}")
+        if any(b < a for a, b in zip(bounds, bounds[1:])):
+            raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
         if int(cu_seqlens[-1].item()) != T:
             raise ValueError(f"cu_seqlens must end at T={T}, got {int(cu_seqlens[-1].item())}")
     if initial_state is not None:
@@ -361,7 +370,7 @@ def _run_path(
     rest = resting_state.to(cdtype) if resting_state is not None else None
     bounds = cu_seqlens.tolist() if cu_seqlens is not None else None
     segs: list[tuple[int, int]] = list(itertools.pairwise(bounds)) if bounds is not None else [(0, T) for _ in range(B)]
-    outs = torch.empty(B, T, HV, V, dtype=cdtype, device=q.device)
+    outs = torch.zeros(B, T, HV, V, dtype=cdtype, device=q.device)
     finals = []
     for n, (s, e) in enumerate(segs):
         bn = 0 if cu_seqlens is not None else n
@@ -702,6 +711,7 @@ class GatedDeltaNet2(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
         cu_seqlens: torch.Tensor | None = None,
+        chunk_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, dict | None]:
         r"""forward(hidden_states, ...) -> (o, None, cache)
 
@@ -713,6 +723,9 @@ class GatedDeltaNet2(nn.Module):
             use_cache (bool): whether to return the updated cache.
             output_attentions (bool): unused, kept for interface compat.
             cu_seqlens (Tensor, optional): ``[N+1]`` packed offsets (``B == 1``).
+            chunk_size (int, optional): WY chunk width override for this call;
+                defaults to ``self.chunk_size``. Passed through (never mutates
+                module state, so thread-safe and torch.compile-friendly).
 
         Returns:
             Tensor: outputs ``[B, T, hidden]``, ``None`` (no attention map),
@@ -727,7 +740,6 @@ class GatedDeltaNet2(nn.Module):
 
         last_state = past_key_values.get("recurrent_state") if past_key_values is not None else None
         conv_states = past_key_values.get("conv_state") if past_key_values is not None else None
-
         if attention_mask is not None:
             return self._forward_masked(hidden_states, attention_mask, last_state, conv_states, use_cache)
 
@@ -760,6 +772,9 @@ class GatedDeltaNet2(nn.Module):
         if last_state is not None and last_state.shape[0] != (len(cu_seqlens) - 1 if cu_seqlens is not None else B):
             raise ValueError(f"cached recurrent_state batch {tuple(last_state.shape)} mismatches input batch {B}")
         rest = self.resting_state.to(cdtype) if (self.use_resting_state and self.resting_state is not None) else None
+        width = self.chunk_size if chunk_size is None else chunk_size
+        if width <= 0:
+            raise ValueError(f"chunk_size must be positive, got {width}")
 
         o, new_state = gated_delta_rule_2(
             qh,
@@ -773,7 +788,7 @@ class GatedDeltaNet2(nn.Module):
             use_qk_l2norm=self.use_qk_l2norm,
             beta_guard=self.beta_guard,
             cu_seqlens=cu_seqlens,
-            chunk_size=self.chunk_size,
+            chunk_size=width,
             backend=self.backend,
             resting_state=rest,
         )
@@ -803,9 +818,10 @@ class GatedDeltaNet2(nn.Module):
             raise ValueError("attention_mask with use_cache=True is not supported in the naive reference; pass explicit positions via cu_seqlens or decode without padding")
         keeps = [attention_mask[i].to(torch.bool) for i in range(B)]
         if all(not keep.any() for keep in keeps):
-            # Legacy collapse: a fully-masked batch has no live tokens, so the
-            # output keeps the batch dim with zero tokens instead of T zeros.
-            return torch.cat([hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size) for i in range(B)], dim=0), None, None
+            # Canonical contract: fully-masked input returns full-width zeros
+            # (B, T, D), matching the mixed-batch convention (empty rows read
+            # as zeros). Callers can always rely on fixed T.
+            return hidden_states.new_zeros(B, T, self.hidden_size), None, None
         outs = []
         for i, keep in enumerate(keeps):
             xi = hidden_states[i : i + 1, keep]
@@ -987,25 +1003,13 @@ class GatedDeltaNet2Mixer(nn.Module):
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if cu_seqlens is not None and use_cache:
             raise ValueError("cu_seqlens with use_cache=True is not supported; decode packed segments without caching")
-        if chunk_size is None:
-            return self.layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                cu_seqlens=cu_seqlens,
-            )
-        prev = self.layer.chunk_size
-        self.layer.chunk_size = chunk_size
-        try:
-            return self.layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                cu_seqlens=cu_seqlens,
-            )
-        finally:
-            self.layer.chunk_size = prev
+        # Pass through without mutating layer state.
+        return self.layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size if chunk_size is not None else self.layer.chunk_size,
+        )

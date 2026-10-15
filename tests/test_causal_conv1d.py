@@ -107,11 +107,14 @@ def test_ref_fwd_varlen_packed_matches_dense_no_leakage():
     weight = _d64(D, W)
     for packed_x in (packed, packed.squeeze(0)):  # [1, L, D] and [L, D]
         y = reference_causal_conv1d_fwd(packed_x, weight, cu_seqlens=cu)
-        assert tuple(y.shape) == (1, 8, D)
+        # Rank is preserved: 3D packed -> [1, L, D], 2D packed -> [L, D].
+        expected_shape = (1, 8, D) if packed_x.dim() == 3 else (8, D)
+        assert tuple(y.shape) == expected_shape
         y1 = reference_causal_conv1d_fwd(s1.unsqueeze(0), weight)
         y2 = reference_causal_conv1d_fwd(s2.unsqueeze(0), weight)
-        torch.testing.assert_close(y[:, :3], y1, atol=1e-12, rtol=1e-12)
-        torch.testing.assert_close(y[:, 3:], y2, atol=1e-12, rtol=1e-12)
+        y3d = y.unsqueeze(0) if y.dim() == 2 else y
+        torch.testing.assert_close(y3d[:, :3], y1, atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(y3d[:, 3:], y2, atol=1e-12, rtol=1e-12)
 
 
 def test_ref_fwd_prefill_continue():

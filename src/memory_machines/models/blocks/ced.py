@@ -226,9 +226,9 @@ class CausalEncoderDecoderStack(nn.Module):
         position_ids: torch.Tensor | None = None,
         *,
         start_pos: int | None = None,
-        seeded_store: bool = False,
+        seeded_store: bool = True,
     ) -> torch.Tensor:
-        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=False) -> Tensor
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True) -> Tensor
 
         Decode with every decoder layer seeded from the encoder-final states.
 
@@ -249,14 +249,14 @@ class CausalEncoderDecoderStack(nn.Module):
                 ``None`` (``encoder_final.shape[1]``, i.e. the inputs
                 follow the encoded context — pinned by
                 :func:`tests.test_cross_layer_positions.test_ced_stack_positions_stay_correct_across_layers`).
-            seeded_store (bool, optional): when ``True``, pass the
+            seeded_store (bool, optional): when ``True`` (default), pass the
                 projected global KV to every decoder layer as a
                 pre-built store (``forward_shared(...,
                 seeded_store=True)``) so the ``full`` layer does not
                 recompress decoder hidden states. Used by
                 :meth:`prefill`'s bounded-replay path, which decodes
                 a tail whose own states must *not* enter the global
-                store. Default: ``False``.
+                store. Default: ``True``.
 
         Returns:
             Tensor: decoder outputs of shape ``(B, Ld, D)``.
@@ -373,6 +373,10 @@ class CausalDecoder(nn.Module):
         projs_list = list(global_projs) if global_projs is not None else None
         if layers_list is not None and projs_list is not None and len(layers_list) != len(projs_list):
             raise ValueError(f"layers ({len(layers_list)}) and global_projs ({len(projs_list)}) must have equal length; each decoder layer pairs with one global KV projection (Eq. 1)")
+        if layers_list is not None and projs_list is None and len(layers_list) != dec_n:
+            raise ValueError(f"layers ({len(layers_list)}) must have length dec_n={dec_n} when global_projs is defaulted (zip would silently truncate)")
+        if projs_list is not None and layers_list is None and len(projs_list) != dec_n:
+            raise ValueError(f"global_projs ({len(projs_list)}) must have length dec_n={dec_n} when layers is defaulted (zip would silently truncate)")
         self.layers = nn.ModuleList(
             layers_list
             if layers_list is not None
@@ -409,11 +413,11 @@ class CausalDecoder(nn.Module):
         position_ids: torch.Tensor | None = None,
         *,
         start_pos: int | None = None,
-        seeded_store: bool = False,
+        seeded_store: bool = True,
     ) -> torch.Tensor:
-        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=False) -> Tensor
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True) -> Tensor
 
-        Decode with every layer seeded from the encoder-final states.
+        Decode with every decoder layer seeded from the encoder-final states.
 
         The decoder global KV is projected from the encoder-final
         hidden states with each layer's own weights
@@ -429,11 +433,13 @@ class CausalDecoder(nn.Module):
             start_pos (int, optional): position of ``hidden_states[0]``
                 when the inputs continue a prior sequence. Default:
                 ``None`` (``encoder_final.shape[1]``).
-            seeded_store (bool, optional): when ``True``, pass the
-                projected global KV to every layer as a pre-built
-                store (``forward_shared(..., seeded_store=True)``)
-                so the ``full`` layer does not recompress decoder
-                hidden states. Default: ``False``.
+            seeded_store (bool, optional): when ``True`` (default), pass the
+                projected global KV to every decoder layer as a
+                pre-built store (``forward_shared(...,
+                seeded_store=True)``) so the ``full`` layer does not
+                recompress decoder hidden states and double-count them
+                onto the encoder store. Set ``False`` only to ablate the
+                Eq. 1 seeding (decoder self-compression). Default: ``True``.
 
         Returns:
             Tensor: decoder outputs of shape ``(B, Ld, D)``.
@@ -467,8 +473,8 @@ class CausalDecoder(nn.Module):
                     comp_end_pos=ends,
                     total_len=start_pos,
                 )
-                if layer.indexer is not None:
-                    shared.indexer_k = layer.indexer.k_index_proj(comp.mean(dim=2))
+                # NOTE: indexer_k is (re)computed inside forward_shared;
+                # do not pre-seed it here (dead compute, immediately overwritten).
             x, shared = layer.forward_shared(
                 x,
                 shared,
@@ -538,7 +544,12 @@ class CausalDecoder(nn.Module):
         # store anchored at the tail's true start position.
         replay_len = min(self.window_size, seq_len)
         tail = hidden_states[:, -replay_len:, :]
-        start_pos = enc_len - replay_len
+        if seq_len != enc_len and position_ids is None:
+            raise ValueError(
+                f"bounded replay needs explicit position_ids when decoder length ({seq_len}) != encoder length ({enc_len}); "
+                "pass position_ids covering the replay window so the tail anchors at its true positions"
+            )
+        start_pos = enc_len - replay_len if seq_len == enc_len else seq_len - replay_len
         if position_ids is None:
             position_ids = torch.arange(start_pos, enc_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.shape[0], -1)
         else:

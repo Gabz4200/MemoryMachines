@@ -32,8 +32,25 @@ def _check_activation(activation: str | None) -> None:
 
 def _apply_activation(y: torch.Tensor, activation: str | None) -> torch.Tensor:
     if activation in ("silu", "swish"):
-        return y * torch.sigmoid(y)
+        # SiLU/Swish are identical; use the fused kernel.
+        return F.silu(y)
     return y
+
+
+def _check_cu_seqlens(cu_seqlens: torch.Tensor, total_len: int) -> list[int]:
+    """Validate packed offsets: 1D integer, starts at 0, non-decreasing, ends at L."""
+    if cu_seqlens.dim() != 1:
+        raise ValueError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
+    if cu_seqlens.dtype not in (torch.int32, torch.int64, torch.long):
+        raise ValueError(f"cu_seqlens must be integer dtype, got {cu_seqlens.dtype}")
+    bounds = cu_seqlens.tolist()
+    if not bounds or bounds[0] != 0:
+        raise ValueError(f"cu_seqlens must start at 0, got {bounds[:3] if bounds else bounds}")
+    if any(b < a for a, b in zip(bounds, bounds[1:])):
+        raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
+    if bounds[-1] != total_len:
+        raise ValueError(f"cu_seqlens must end at L={total_len}, got {bounds[-1]}")
+    return bounds
 
 
 def _split_packed(x: torch.Tensor, cu_seqlens: torch.Tensor) -> tuple[list[torch.Tensor], int, int]:
@@ -42,6 +59,8 @@ def _split_packed(x: torch.Tensor, cu_seqlens: torch.Tensor) -> tuple[list[torch
         x = x.unsqueeze(0)
     if x.dim() != 3 or x.shape[0] != 1:
         raise ValueError(f"packed x must be [1, L, D] or [L, D], got {tuple(x.shape)}")
+    total = x.shape[1]
+    _check_cu_seqlens(cu_seqlens, total)
     seqs = x.squeeze(0)
     lens = cu_seqlens.diff().tolist()
     out, pos = [], 0
@@ -70,11 +89,14 @@ def reference_causal_conv1d_fwd(
     if bias is not None and tuple(bias.shape) != (d,):
         raise ValueError(f"bias must be [D], got {tuple(bias.shape)}")
 
-    w_conv = weight.to(x.dtype).unsqueeze(1)  # [D, 1, W]
+    w_conv = weight.to(x.dtype) if weight.dtype != x.dtype else weight
+    w_conv = w_conv.unsqueeze(1)  # [D, 1, W]
 
     def _conv_seq(seq: torch.Tensor, hist: torch.Tensor | None) -> torch.Tensor:
         # seq: [T, D]; hist: [W-1, D] effective history (most-recent-last) or None.
         t = seq.shape[0]
+        if t == 0:
+            return seq[:0]
         if hist is not None and hist.shape[0] != w - 1:
             raise ValueError(f"history must have W-1={w - 1} tokens, got {hist.shape[0]}")
         inp = seq if hist is None else torch.cat([hist.to(seq.dtype), seq], dim=0)
@@ -100,6 +122,7 @@ def reference_causal_conv1d_fwd(
         ys = [_conv_seq(x[i], h) for i, h in enumerate(hists)]
         y = torch.stack(ys, dim=0)
     else:
+        was_2d = x.dim() == 2
         seqs, n, _ = _split_packed(x, cu_seqlens)
         if initial_state is not None:
             if initial_state.shape != (n, d, w):
@@ -108,10 +131,14 @@ def reference_causal_conv1d_fwd(
         else:
             hists = [None] * n
         ys = [_conv_seq(s, h) for s, h in zip(seqs, hists)]
-        y = torch.cat(ys, dim=0).unsqueeze(0)
+        # Preserve input rank: 2D packed [L, D] -> 2D out, [1, L, D] -> 3D out.
+        # NOTE: per-sequence loop is oracle-only (O(N) launches, not torch.compile-fullgraph safe).
+        y = torch.cat(ys, dim=0)
+        if not was_2d:
+            y = y.unsqueeze(0)
 
     if bias is not None:
-        y = y + bias.to(y.dtype)
+        y = y + (bias.to(y.dtype) if bias.dtype != y.dtype else bias)
     y = _apply_activation(y, activation)
     if residual is not None:
         if residual.shape != y.shape:
@@ -138,24 +165,24 @@ def reference_causal_conv1d_update_states(
         if x.dim() != 3:
             raise ValueError(f"dense x must be [B, T, D], got {tuple(x.shape)}")
         b, t, d_ = x.shape
+        if initial_state is not None and initial_state.shape != (b, d_, w):
+            raise ValueError(f"initial_state must be {(b, d_, w)}, got {tuple(initial_state.shape)}")
         final = x.new_zeros(b, d_, w)
         for i in range(b):
             seq = x[i]  # [T, D]
             take = min(t, w)
             if initial_state is not None:
-                if initial_state.shape != (b, d_, w):
-                    raise ValueError(f"initial_state must be {(b, d_, w)}, got {tuple(initial_state.shape)}")
                 final[i] = initial_state[i]
             if take:
                 final[i, :, w - take :] = seq[t - take :].transpose(0, 1)
         return final
     seqs, n, d_ = _split_packed(x, cu_seqlens)
+    if initial_state is not None and initial_state.shape != (n, d_, w):
+        raise ValueError(f"initial_state must be {(n, d_, w)}, got {tuple(initial_state.shape)}")
     final = x.new_zeros(n, d_, w)
     for i, seq in enumerate(seqs):
         take = min(seq.shape[0], w)
         if initial_state is not None:
-            if initial_state.shape != (n, d_, w):
-                raise ValueError(f"initial_state must be {(n, d_, w)}, got {tuple(initial_state.shape)}")
             final[i] = initial_state[i]
         if take:
             final[i, :, w - take :] = seq[seq.shape[0] - take :].transpose(0, 1)
@@ -176,6 +203,10 @@ def reference_causal_conv1d_update(
     ``[N, 1, D]``. ``cache`` is ``[N, D, W]`` and is updated **in place**
     (left-shift, new token at the end), mirroring the kernel. Returns
     ``(y, cache)`` with ``y`` shaped like ``x``.
+
+    Inference-only: ``cache`` history is mutated under ``no_grad`` and prior
+    steps are not differentiable w.r.t. the cache/initial history. ``y`` is
+    differentiable w.r.t. the current token/weight/bias only.
     """
     _check_activation(activation)
     shape = x.shape

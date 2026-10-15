@@ -208,10 +208,13 @@ class ChunkedBottleneckLinear(nn.Module):
         if isinstance(self.mixer, nn.Linear):
             nn.init.eye_(self.mixer.weight)
         else:
-            mix_std = 1 / math.sqrt(self.num_blocks)
-            for module in self.mixer:
-                if isinstance(module, nn.Linear):
-                    nn.init.trunc_normal_(module.weight, mean=0.0, std=mix_std, a=-2 * mix_std, b=2 * mix_std)
+            # Two-stage G->R->G: first factor 1/sqrt(G) (fan-in G), second
+            # 1/sqrt(R) (fan-in R) so product variance is 1/G (variance-matched).
+            in_std = 1 / math.sqrt(self.num_blocks)
+            out_std = 1 / math.sqrt(self.bottleneck_dim)
+            mods = list(self.mixer)
+            nn.init.trunc_normal_(mods[0].weight, mean=0.0, std=in_std, a=-2 * in_std, b=2 * in_std)
+            nn.init.trunc_normal_(mods[1].weight, mean=0.0, std=out_std, a=-2 * out_std, b=2 * out_std)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 

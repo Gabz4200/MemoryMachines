@@ -137,8 +137,9 @@ def test_mixer_mask_all_padded_row_is_zeros():
     mask = torch.zeros(1, 4, dtype=torch.long)
     with torch.no_grad():
         out, _, _ = mixer(x, attention_mask=mask)
-    # Fully-padded rows collapse to an empty sequence (GDN2 masked convention).
-    assert tuple(out.shape) == (1, 0, 16)
+    # Fully-padded rows return full-width zeros (canonical masked convention).
+    assert tuple(out.shape) == (1, 4, 16)
+    assert out.abs().amax().item() == 0.0
 
 
 def test_mixer_mask_error_paths():

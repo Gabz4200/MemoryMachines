@@ -1,13 +1,13 @@
 """Strategy dispatcher.
 
-Backends:
+Backends (case-insensitive, whitespace-tolerant):
   - "naive": pure PyTorch reference (testing/debugging oracle only)
-  - "cpu":   first-class C++ kernel (requires compiled extension)
-  - "gpu"/"taichi": Taichi kernel from one source. Which backend runs is chosen
-    by ensure_taichi(): CUDA if available, else CPU; set TARCH=vulkan for a
-    Vulkan backend (an Intel/AMD iGPU counts). Vulkan and CPU take ordinary CPU
-    tensors — PyTorch has no "vulkan" device type, so nothing here needs widening
-    to use them.
+  - "cpu"/"gpu"/"taichi"/"compiled": compiled kernel entry point. These are
+    currently aliases for "run the compiled op if available, else raise" —
+    physical device placement is chosen inside ``ensure_taichi()``
+    (CUDA if available, else CPU; ``TARCH=vulkan`` for Vulkan), not by the
+    label. A requested compiled backend that cannot run is an actionable
+    error, not a silent downgrade.
 
 The naive path is NEVER an implicit fallback: a requested compiled backend
 that cannot run is an actionable error, not a silent downgrade.
@@ -15,21 +15,36 @@ that cannot run is an actionable error, not a silent downgrade.
 
 import torch
 
+from memory_machines.ops.causal_conv1d import causal_conv1d_naive
 from memory_machines.ops.dw_scale import dw_scale as _compiled_op
-from memory_machines.ops.references.dw_scale_reference import reference_dw_scale
+from memory_machines.ops.interfaces import ElementwiseOp
 from memory_machines.ops.references.causal_conv1d_reference import (
-    reference_causal_conv1d_fwd,
     reference_causal_conv1d_update,
-    reference_causal_conv1d_update_states,
 )
+from memory_machines.ops.references.dw_scale_reference import reference_dw_scale
+
+# Wire the ElementwiseOp protocol: both the reference and compiled dw_scale
+# entry points satisfy it (checked statically, not at runtime).
+_compiled_dw_scale_op: ElementwiseOp = _compiled_op
+_reference_dw_scale_op: ElementwiseOp = reference_dw_scale
+
+_VALID_BACKENDS = ("naive", "cpu", "gpu", "taichi", "compiled")
+
+
+def _normalize_backend(backend: str) -> str:
+    if not isinstance(backend, str):
+        raise ValueError(f"Unknown backend: {backend!r}. Valid: {list(_VALID_BACKENDS)}")
+    norm = backend.strip().lower()
+    if norm not in _VALID_BACKENDS:
+        raise ValueError(f"Unknown backend: '{backend}'. Valid: {list(_VALID_BACKENDS)}")
+    return norm
 
 
 def dispatch_dw_scale(x: torch.Tensor, weight: torch.Tensor, backend: str = "naive") -> torch.Tensor:
+    backend = _normalize_backend(backend)
     if backend == "naive":
         return reference_dw_scale(x, weight)
-    if backend in ("cpu", "gpu", "taichi", "compiled"):
-        return _compiled_op(x, weight)
-    raise ValueError(f"Unknown backend: '{backend}'. Valid: ['naive', 'cpu', 'gpu', 'taichi']")
+    return _compiled_op(x, weight)
 
 
 def dispatch_causal_conv1d(
@@ -47,30 +62,22 @@ def dispatch_causal_conv1d(
 
     Only ``backend="naive"`` (pure-PyTorch reference) exists until the
     compiled kernel lands. A requested compiled backend is an actionable
-    error, never a silent downgrade.
+    error, never a silent downgrade. The naive path delegates to
+    :func:`causal_conv1d_naive` so semantics live in one place.
     """
+    backend = _normalize_backend(backend)
     if backend == "naive":
-        y = reference_causal_conv1d_fwd(
+        return causal_conv1d_naive(
             x=x,
             weight=weight,
             bias=bias,
             residual=residual,
             initial_state=initial_state,
+            output_final_state=output_final_state,
             activation=activation,
             cu_seqlens=cu_seqlens,
         )
-        final_state = None
-        if output_final_state:
-            final_state = reference_causal_conv1d_update_states(
-                x=x,
-                state_len=weight.shape[1],
-                initial_state=initial_state,
-                cu_seqlens=cu_seqlens,
-            )
-        return y, final_state
-    if backend in ("cpu", "gpu", "taichi", "compiled"):
-        raise NotImplementedError(f"backend='{backend}' has no causal_conv1d kernel yet (TODO); use backend='naive'")
-    raise ValueError(f"Unknown backend: '{backend}'. Valid: ['naive', 'cpu', 'gpu', 'taichi']")
+    raise NotImplementedError(f"backend='{backend}' has no causal_conv1d kernel yet (TODO); use backend='naive'")
 
 
 def dispatch_causal_conv1d_update(
@@ -82,8 +89,13 @@ def dispatch_causal_conv1d_update(
     activation: str | None = None,
     backend: str = "naive",
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-token decode-step dispatcher.
+
+    Returns ``(y, cache)`` where ``cache`` is updated **in place** and
+    returned aliased (``y_cache is cache``); callers must not treat the
+    return as a fresh tensor.
+    """
+    backend = _normalize_backend(backend)
     if backend == "naive":
         return reference_causal_conv1d_update(x=x, cache=cache, weight=weight, bias=bias, residual=residual, activation=activation)
-    if backend in ("cpu", "gpu", "taichi", "compiled"):
-        raise NotImplementedError(f"backend='{backend}' has no causal_conv1d kernel yet (TODO); use backend='naive'")
-    raise ValueError(f"Unknown backend: '{backend}'. Valid: ['naive', 'cpu', 'gpu', 'taichi']")
+    raise NotImplementedError(f"backend='{backend}' has no causal_conv1d kernel yet (TODO); use backend='naive'")

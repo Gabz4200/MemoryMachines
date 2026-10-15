@@ -10,7 +10,6 @@ import torch
 
 from memory_machines.ops.references.causal_conv1d_reference import (
     reference_causal_conv1d_fwd,
-    reference_causal_conv1d_update,
     reference_causal_conv1d_update_states,
 )
 
@@ -20,6 +19,11 @@ def causal_conv1d_op(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    activation: str | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     raise NotImplementedError("memory_machines::causal_conv1d has no compiled kernel yet (TODO); use backend='naive'")
 
@@ -29,7 +33,20 @@ def _causal_conv1d_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    activation: str | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if weight.dim() != 2:
+        raise ValueError(f"weight must be [D, W], got {tuple(weight.shape)}")
+    if x.shape[-1] != weight.shape[0]:
+        raise ValueError(f"x last dim ({x.shape[-1]}) must match weight dim 0 ({weight.shape[0]})")
+    if bias is not None and tuple(bias.shape) != (weight.shape[0],):
+        raise ValueError(f"bias must be [D], got {tuple(bias.shape)}")
+    if residual is not None and residual.shape != x.shape:
+        raise ValueError(f"residual shape {tuple(residual.shape)} != x shape {tuple(x.shape)}")
     return torch.empty_like(x)
 
 
@@ -43,6 +60,8 @@ def causal_conv1d_naive(
     activation: str | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # Single implementation of the naive path; the dispatcher delegates here
+    # so validation and semantics live in exactly one place (see dispatch.py).
     y = reference_causal_conv1d_fwd(
         x=x,
         weight=weight,

@@ -28,7 +28,7 @@ def test_compressor_uneven_tail_ignores_pad():
     with torch.no_grad():
         expected_tail = comp_mod.kv_proj(x7[:, -1]).view(1, nheads, hd)
     torch.testing.assert_close(comp7[:, -1], expected_tail, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(end7, torch.tensor([1, 3, 5, 7]))
+    torch.testing.assert_close(end7, torch.tensor([1, 3, 5, 6]))
     torch.testing.assert_close(end8, torch.tensor([1, 3, 5, 7]))
 
 

@@ -35,7 +35,8 @@ def test_block_compressor_shapes_and_block_ends():
     x = torch.randn(1, 7, cfg.hidden_size)
     c, ends = comp(x)
     assert tuple(c.shape) == (1, 4, cfg.num_key_value_heads, 8)
-    assert ends.tolist() == [1, 3, 5, 7]
+    # Trailing partial block is clamped to the last real token (6), not padding (7).
+    assert ends.tolist() == [1, 3, 5, 6]
 
 
 def test_gqa_forward_cache_grows():

@@ -87,7 +87,15 @@ class _DiskGather(torch.autograd.Function):
     def backward(ctx, *grad_outputs):
         grad_output = grad_outputs[0]
         (index,) = ctx.saved_tensors
-        grad = torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
+        # Dense-grad is intentional (AdamW-compatible); see the error below.
+        try:
+            grad = torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
+        except (RuntimeError, torch.OutOfMemoryError) as e:
+            raise RuntimeError(
+                f"_DiskGather.backward needs a dense {ctx.weight_shape} gradient "
+                f"({torch.tensor(ctx.weight_shape).prod().item()} elements); table too large for dense AdamW. "
+                "Use a smaller table, RAM embedding, or a sparse optimizer."
+            ) from e
         idx = index.to(device=ctx.weight_device, dtype=torch.long)
         grad.index_add_(0, idx, grad_output.to(device=ctx.weight_device, dtype=ctx.weight_dtype))
         return grad, None
@@ -160,6 +168,10 @@ class _SsdTable(nn.Module):
             Tensor: gathered rows of shape ``(*index.shape, embedding_dim)``
             on the compute device.
         """
+        if bool((index < 0).any()):
+            raise ValueError("index must hold non-negative row ids")
+        if bool((index >= self._mmap.shape[0]).any()):
+            raise ValueError(f"index out of range for table with {self._mmap.shape[0]} rows")
         flat = index.reshape(-1).to(torch.long)
         gathered = _DiskGather.apply(self.weight, flat)
         return gathered.reshape(*index.shape, self.embedding_dim)
@@ -227,6 +239,10 @@ class _EngramShortConv(nn.Module):
         r"""forward(x) -> Tensor
 
         Apply the depthwise causal convolution.
+
+        Symmetric ``padding=(K-1)*d`` with ``[...,:L]`` slicing is
+        intentionally causal: left-pad carries history, right-pad is
+        future and gets dropped by the slice.
 
         Args:
             x (Tensor): value tensor of shape ``(B, L, streams, hidden_size)``.
@@ -634,6 +650,10 @@ class EngramMemory(nn.Module):
             >>> mem._ngram_hashes(torch.tensor([[1, 2], [3, 4]]), 0).shape
             torch.Size([2, 2, 12])
         """
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids must be [B, Lq], got {tuple(input_ids.shape)}")
+        if bool((input_ids < 0).any()):
+            raise ValueError("input_ids must hold non-negative token ids (negative ids give wrong negative-mod hashes)")
         x = input_ids.to(torch.int64)
         bsz, lq = x.shape
         multipliers = self._get_multipliers(layer_id)
@@ -691,6 +711,11 @@ class EngramMemory(nn.Module):
             raise ValueError("input_ids must be non-negative token ids")
         hashes = self._ngram_hashes(input_ids, layer_id)
         embeddings = self.multi_head_embedding(hashes).flatten(start_dim=-2)
+        # SSD storage is float32; cast rows to the compute dtype (.to() on the
+        # parent breaks mmap sharing, so re-mmap after .to()).
+        target_dtype = self.value_proj.weight.dtype
+        if embeddings.dtype != target_dtype:
+            embeddings = embeddings.to(target_dtype)
         gates: list[torch.Tensor] = []
         for stream in range(self.streams):
             key = self.key_projs[stream](embeddings)
@@ -700,6 +725,7 @@ class EngramMemory(nn.Module):
             query = hidden_states[:, :, stream] if hidden_states.dim() == 4 else hidden_states
             normed_query = self.norm2[stream](query)
             gate = (normed_key * normed_query).sum(dim=-1) / (self.hidden_size**0.5)
+            # Signed-sqrt sharpens small similarities; the clamp keeps grad alive for |gate|>0.
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gates.append(torch.sigmoid(gate).unsqueeze(-1))
         gate = torch.stack(gates, dim=2)

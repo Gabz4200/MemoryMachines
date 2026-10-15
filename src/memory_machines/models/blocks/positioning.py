@@ -136,8 +136,11 @@ class CVPEContextBias(nn.Module):
         if self.use_log_transform:
             tilde_f32 = torch.log1p(tilde_f32 * 9.0) / math.log(10.0)
 
-        f_f32 = self.offset_out(self.mlp_act(self.mlp_in(tilde_f32.unsqueeze(-1)))).squeeze(-1)
-        f = f_f32.unsqueeze(1).to(query_states.dtype)
+        # Run the offset MLP in its own weight dtype: after model.to(bf16) the
+        # weights are bf16 while tilde is fp32 -> runtime dtype error otherwise.
+        mlp_dtype = self.mlp_in.weight.dtype
+        f_f32 = self.offset_out(self.mlp_act(self.mlp_in(tilde_f32.unsqueeze(-1).to(mlp_dtype)))).squeeze(-1)
+        f = f_f32.float().unsqueeze(1).to(query_states.dtype)
 
         gamma = self.gamma_proj(query_states).squeeze(-1).unsqueeze(-1)
         beta = self.beta_proj(query_states).squeeze(-1).unsqueeze(-1)

@@ -90,6 +90,12 @@ class LivDoubleGatedBase(nn.Module):
 
         Split the input into per-head gate and value views.
 
+        Gates are raw linear products (``pre * x``, ``post * mixed``) with no
+        bounded activation by design (LIV): unbounded variance is contained by
+        the zero-start/depth-scaled output projection, which keeps the whole
+        branch a bounded residual at init. Do not add SiLU/sigmoid without
+        re-tuning parity tests.
+
         Args:
             x (Tensor): input of shape ``(B, L, hidden)``.
 
@@ -355,6 +361,9 @@ class LivPerceiver(LivDoubleGatedBase):
             the GQA projection hyperparameters.
         window_size (int, optional): window for the internal core.
             Default: ``None`` (falls back to ``config.window_size``).
+            NOTE: the perceiver core runs with ``windowed=False`` (pure
+            causal); the window is reserved for future use and currently
+            has no effect on ``mix_heads``. Kept for API compatibility.
 
     Examples::
 
@@ -402,7 +411,9 @@ class LivPerceiver(LivDoubleGatedBase):
 
         Returns:
             Tensor: anchors of shape ``(1, num_latents)`` linearly spaced over
-            ``[0, seqlen - 1]``.
+            ``[0, seqlen - 1]``. When ``num_latents > seqlen`` anchors
+            necessarily duplicate (multiple latents share a position);
+            harmless but wastes latent budget — prefer ``num_latents <= seqlen``.
 
         Examples::
 

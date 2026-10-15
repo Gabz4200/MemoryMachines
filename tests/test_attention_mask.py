@@ -80,6 +80,10 @@ def test_gqa_bad_mask_shapes_raise(mask):
 
 
 def test_swa_noncausal_full_window_matches_gqa():
+    # With is_causal=False the window is bidirectional (|q-k| < w). A window
+    # covering the sequence (16 >= 6) is therefore full bidirectional attention,
+    # which must NOT equal causal GQA (future-masked). It must equal manual
+    # unmasked SDPA.
     torch.manual_seed(4)
     cfg = dataclasses.replace(plain_cfg(), window_size=16)
     gqa = GroupedQueryAttention(cfg).eval()
@@ -90,7 +94,22 @@ def test_swa_noncausal_full_window_matches_gqa():
     with torch.no_grad():
         out_gqa, _, _ = gqa(x)
         out_swa, _, _ = swa(x, is_causal=False)
-    torch.testing.assert_close(out_swa, out_gqa, atol=1e-5, rtol=1e-5)
+    assert (out_swa - out_gqa).abs().max().item() > 1e-5
+    # Manual unmasked SDPA parity for the noncausal path.
+    import math
+
+    import torch.nn.functional as F
+
+    bsz, seq, _ = x.shape
+    m = swa
+    q = m.q_proj(x).view(bsz, seq, m.num_heads, m.head_dim).transpose(1, 2)
+    k = m.k_proj(x).view(bsz, seq, m.num_key_value_heads, m.head_dim).transpose(1, 2)
+    v = m.v_proj(x).view(bsz, seq, m.num_key_value_heads, m.head_dim).transpose(1, 2)
+    k = k.repeat_interleave(m.num_key_value_groups, dim=1)
+    v = v.repeat_interleave(m.num_key_value_groups, dim=1)
+    logits = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(m.head_dim)
+    expected = m.o_proj(torch.matmul(F.softmax(logits, dim=-1), v).transpose(1, 2).reshape(bsz, seq, m.hidden_size))
+    torch.testing.assert_close(out_swa, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_swa_noncausal_cache_raises():

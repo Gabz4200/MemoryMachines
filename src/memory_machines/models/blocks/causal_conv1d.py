@@ -113,7 +113,8 @@ class ShortConvolution(nn.Conv1d):
         n = x.shape[0] if cu_seqlens is None else int(len(cu_seqlens) - 1)
         # Single-token-per-sequence inference (grad off) always takes the
         # decode path; step() creates the cache when None, like FLA.
-        if not torch.is_grad_enabled() and x.numel() // self.hidden_size == n:
+        # The dim()==3 gate keeps 2D [L, D] inputs on the grad-carrying path.
+        if x.dim() == 3 and not torch.is_grad_enabled() and x.numel() // self.hidden_size == n:
             return self.step(x, residual, cache, output_final_state, cu_seqlens)
 
         y = reference_causal_conv1d_fwd(

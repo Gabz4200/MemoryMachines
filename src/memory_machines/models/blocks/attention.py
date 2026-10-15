@@ -101,7 +101,8 @@ def _prepare_attention_mask(
     else:
         raise ValueError(f"attention_mask must be 2D/3D/4D, got {mask.dim()}D {tuple(mask.shape)}")
     if mask.dtype == torch.bool:
-        return torch.zeros((), dtype=logits.dtype, device=logits.device).masked_fill(mask, float("-inf"))
+        # True = masked out.
+        return torch.where(mask, torch.tensor(float("-inf"), dtype=logits.dtype, device=logits.device), torch.zeros((), dtype=logits.dtype, device=logits.device))
     if not mask.is_floating_point():
         raise ValueError(f"attention_mask must be bool or a floating additive mask, got {mask.dtype}")
     return mask
@@ -144,8 +145,8 @@ def _apply_masks_and_softmax(
     Apply the causal and sliding-window bounds to raw logits.
 
     The window bound subsumes the causal half (``_window_mask`` keeps
-    ``0 <= q - k < window``), so the causal mask is applied only when
-    the window is disabled or not requested.
+    ``0 <= q - k < window``) when causal; with ``is_causal=False`` the
+    bound is symmetric (``|q - k| < window``), matching ``attend``.
 
     Args:
         attn (Tensor): raw logits of shape ``(B, H, Lq, Lk)``.
@@ -159,8 +160,11 @@ def _apply_masks_and_softmax(
         Tensor: masked logits of the same shape as ``attn``.
     """
     if windowed and window_size > 0:
-        win = _window_mask(q_pos, k_pos, window_size).unsqueeze(1)
-        return attn.masked_fill(~win, float("-inf"))
+        if is_causal:
+            win = _window_mask(q_pos, k_pos, window_size).unsqueeze(1)
+            return attn.masked_fill(~win, float("-inf"))
+        rel = q_pos.unsqueeze(-1) - k_pos.unsqueeze(1)
+        return attn.masked_fill((rel.abs() >= window_size).unsqueeze(1), float("-inf"))
     if is_causal:
         return attn.masked_fill(~_causal_key_mask(q_pos, k_pos), float("-inf"))
     return attn
@@ -552,20 +556,35 @@ class GroupedQueryAttention(nn.Module):
         if not is_causal and (use_cache or past_key_value is not None):
             raise ValueError("GroupedQueryAttention with is_causal=False cannot use KV caching (truncated cache is only valid for causal attention)")
         bsz, q_len, _ = hidden_states.size()
+        device = hidden_states.device
 
         query_states, key_states, value_current = self._project_qkv(hidden_states)
 
         cached_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
+
+        # NOTE: past_positions.max() incurs one GPU->CPU sync; required because
+        # windowed caches are truncated and width alone does not give absolute positions.
+        def _implied_len(pos: torch.Tensor) -> int:
+            if pos.dim() not in (1, 2):
+                raise ValueError(f"past_positions must be 1D (Lk,) or 2D (B, Lk), got {pos.dim()}D {tuple(pos.shape)}")
+            p = pos.to(device) if pos.dim() == 2 else pos.to(device).unsqueeze(0).expand(bsz, -1)
+            if p.shape[0] != bsz:
+                raise ValueError(f"past_positions batch ({p.shape[0]}) does not match input batch ({bsz})")
+            return int(p.max().item()) + 1
+
         if past_len_override is not None:
             if past_key_value is None and past_len_override != 0:
                 raise ValueError("past_len_override requires past_key_value (a nonzero override with no cached history is meaningless; omit it for a fresh call)")
             if past_positions is not None:
-                implied_len = int(past_positions.max().item()) + 1
+                implied_len = _implied_len(past_positions)
                 if past_len_override != implied_len:
                     raise ValueError(f"past_len_override ({past_len_override}) disagrees with past_positions (max {implied_len - 1}); pass one or make them consistent")
+                if past_len_override != cached_len and self.window_size <= 0:
+                    # Full-attention caches are untruncated: override must match cached width.
+                    raise ValueError(f"past_len_override ({past_len_override}) does not match cached width ({cached_len})")
             true_past_len = past_len_override
         elif past_positions is not None:
-            true_past_len = int(past_positions.max().item()) + 1
+            true_past_len = _implied_len(past_positions)
         else:
             true_past_len = cached_len
         total_len = true_past_len + q_len
@@ -573,7 +592,6 @@ class GroupedQueryAttention(nn.Module):
         if total_len > self.max_position_embeddings:
             raise ValueError(f"Sequence length ({total_len}) exceeds configured max_position_embeddings ({self.max_position_embeddings})")
 
-        device = hidden_states.device
         if past_key_value is None:
             q_pos, k_pos = _resolve_positions(hidden_states, q_len, true_past_len, position_ids)
         else:
@@ -595,7 +613,12 @@ class GroupedQueryAttention(nn.Module):
             else:
                 q_pos = torch.arange(true_past_len, true_past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
             if past_positions is not None:
-                k_pos = torch.cat([past_positions.to(device), q_pos], dim=1)
+                pp = past_positions.to(device)
+                if pp.dim() == 1:
+                    pp = pp.unsqueeze(0).expand(bsz, -1)
+                elif pp.dim() != 2:
+                    raise ValueError(f"past_positions must be 1D (Lk,) or 2D (B, Lk), got {pp.dim()}D {tuple(pp.shape)}")
+                k_pos = torch.cat([pp, q_pos], dim=1)
             else:
                 k_pos = torch.arange(true_past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
         _check_position_bounds(q_pos, k_pos, self.max_position_embeddings, position_ids)
@@ -618,6 +641,8 @@ class GroupedQueryAttention(nn.Module):
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = _sanitize_attention_weights(attn_weights)
+        # Dropout after sanitize is safe: sanitized rows are exact zeros and
+        # 0 * dropout_scale == 0, so fully-masked rows stay zero (not NaN).
         attn_weights = self.attention_dropout(attn_weights)
 
         attn_output_heads = self._weights_to_heads(attn_weights, value_full_exp, value_query_exp)

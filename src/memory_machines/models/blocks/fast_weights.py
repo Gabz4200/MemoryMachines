@@ -251,7 +251,11 @@ class TitansFastWeightsMemory(nn.Module):
         mom: list[torch.Tensor],
         create_graph: bool,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
-        r"""_step(k, v, q, ...) -> (y, fast', mom', loss) — one Eq. 13-15 update."""
+        r"""_step(k, v, q, ...) -> (y, fast', mom', loss) — one Eq. 13-15 update.
+
+        Reference-only: per-token loop with per-step autograd (~100x slower
+        than a fused kernel); not for long contexts in production.
+        """
         for w in fast:
             w.requires_grad_(True)
         with torch.enable_grad():
@@ -852,6 +856,10 @@ class SelfReferentialTitanMixer(nn.Module):
             raise ValueError(f"cu_seqlens packing requires batch 1, got {hidden_states.shape[0]}")
         bounds = cu_seqlens.tolist()
         total = hidden_states.shape[1]
+        if cu_seqlens.dim() != 1 or not bounds or bounds[0] != 0:
+            raise ValueError(f"cu_seqlens must be 1D starting at 0, got {bounds[:3] if bounds else bounds}")
+        if any(b < a for a, b in zip(bounds, bounds[1:])):
+            raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
         if int(cu_seqlens[-1].item()) != total:
             raise ValueError(f"cu_seqlens must end at T={total}, got {int(cu_seqlens[-1].item())}")
         if use_cache:
@@ -884,9 +892,9 @@ class SelfReferentialTitanMixer(nn.Module):
         outs = []
         keeps = [attention_mask[i].to(torch.bool) for i in range(bsz)]
         if all(not keep.any() for keep in keeps):
-            # Legacy collapse: a fully-masked batch has no live tokens, so the
-            # output keeps the batch dim with zero tokens instead of T zeros.
-            return torch.cat([hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size) for i in range(bsz)], dim=0), None, None
+            # Canonical contract: fully-masked input returns full-width zeros
+            # (B, T, D), matching the mixed-batch convention. Fixed T always.
+            return hidden_states.new_zeros(bsz, tlen, self.hidden_size), None, None
         for i, keep in enumerate(keeps):
             xi = hidden_states[i : i + 1, keep]
             if xi.shape[1] == 0:

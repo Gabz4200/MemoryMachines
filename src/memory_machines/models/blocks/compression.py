@@ -121,12 +121,17 @@ class BlockCompressor(nn.Module):
         kv = self.kv_proj(hidden_states).view(bsz, lc, m, self.num_kv_heads, self.head_dim)
         z = self.score_proj(hidden_states).view(bsz, lc, m, self.num_kv_heads) + self.block_bias.unsqueeze(0).unsqueeze(0)
         if pad:
-            valid = torch.ones(bsz, lc, m, 1, device=hidden_states.device)
-            valid[:, -1, seqlen % m :, 0] = 0.0
-            z = z.masked_fill(valid < 0.5, float("-inf"))
+            valid = torch.ones(bsz, lc, m, 1, device=hidden_states.device, dtype=torch.bool)
+            valid[:, -1, seqlen % m :, 0] = False
+            z = z.masked_fill(~valid, float("-inf"))
         s = F.softmax(z, dim=2)
         comp = (s.unsqueeze(-1) * kv).sum(dim=2)
         comp_end = torch.arange(start_pos + m - 1, start_pos + total, m, device=hidden_states.device)
+        # Clamp the trailing partial block to the last real token: without this
+        # the final entry points into padding (e.g. L=6,m=4 -> end 7 vs real 5)
+        # and stays invisible until q>=7 (over-masking by up to m-1).
+        if pad:
+            comp_end[-1] = min(int(comp_end[-1].item()), start_pos + seqlen - 1)
         return comp, comp_end
 
 
@@ -270,7 +275,7 @@ class SparseIndexer(nn.Module):
             tensor([[[1, 2]]])
         """
         lc = scores.shape[-1]
-        if k > lc and __debug__:
+        if k > lc:
             warnings.warn(f"SparseIndexer.topk: k ({k}) exceeds the number of entries ({lc}); clamping to {lc}", stacklevel=2)
         k = min(k, lc)
         return scores.topk(k, dim=-1).indices
@@ -295,7 +300,11 @@ class SparseIndexer(nn.Module):
 
         Returns:
             Tensor: pooled entry ids of shape ``(B, Lq, nb * block_size)``
-            clamped to ``[0, Lc - 1]``.
+            clamped to ``[0, Lc - 1]``. Clamping can duplicate the last
+            valid id when ``Lc`` is not divisible by ``block_size``; the
+            duplicates are harmless (rescore masks them consistently and
+            they consume at most ``block_size - 1`` slots) but waste a
+            small amount of top-k budget.
 
         Examples::
 
@@ -305,11 +314,13 @@ class SparseIndexer(nn.Module):
             torch.Size([1, 2, 8])
         """
         bsz, lq, lc = scores.shape
-        nb = min(pool_blocks, (lc + block_size - 1) // block_size)
-        pad = nb * block_size - lc
+        num_blocks = (lc + block_size - 1) // block_size
+        nb = min(pool_blocks, num_blocks)
+        # Pad to a whole number of blocks, then select the top-nb by block-max.
+        pad = num_blocks * block_size - lc
         if pad:
             scores = F.pad(scores, (0, pad), value=float("-inf"))
-        blocked = scores.view(bsz, lq, nb, block_size)
+        blocked = scores.view(bsz, lq, num_blocks, block_size)
         block_scores = blocked.amax(dim=-1)
         top_blocks = block_scores.topk(nb, dim=-1).indices
         base = (top_blocks * block_size).unsqueeze(-1) + torch.arange(block_size, device=scores.device).view(1, 1, 1, -1)
@@ -529,8 +540,12 @@ class AttentionSink(nn.Module):
             >>> round(float(AttentionSink(2).weights(torch.zeros(1, 2, 1, 3)).sum()), 4)
             1.5
         """
-        denom = torch.exp(logits).sum(dim=-1, keepdim=True) + torch.exp(self.sink_logit).view(1, -1, 1, 1).to(logits.dtype)
-        return torch.exp(logits) / denom
+        # Upcast to float32: exp() in fp16 overflows at >11 (bf16 at >88) giving
+        # inf/inf=NaN; compute in fp32 then cast back.
+        l32 = logits.float()
+        sink = self.sink_logit.to(torch.float32).view(1, -1, 1, 1)
+        denom = torch.exp(l32).sum(dim=-1, keepdim=True) + torch.exp(sink)
+        return (torch.exp(l32) / denom).to(logits.dtype)
 
 
 class GroupedOutputProjection(nn.Module):

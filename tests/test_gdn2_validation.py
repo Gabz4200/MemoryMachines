@@ -95,17 +95,15 @@ def test_forward_mask_with_cache_raises():
 
 
 def test_all_zero_mask_row_outputs_zeros():
-    # NOTE: a mixed batch (one fully-masked row + one live row) currently
-    # crashes in _forward_masked (torch.cat of [1,0,D] with [1,T,D]), so this
-    # covers the single-row fully-masked path that runs: output keeps batch
-    # and hidden dims with zero tokens, i.e. vacuously all zeros.
+    # Canonical contract: fully-masked input returns full-width zeros (B, T, D),
+    # matching the mixed-batch convention. Fixed T always.
     torch.manual_seed(0)
     blk = G.GatedDeltaNet2(hidden_size=16, num_heads=2, head_dim_k=4, use_short_conv=False)
     x = torch.randn(1, 4, 16)
     mask = torch.zeros(1, 4)
     o, _, _ = blk(x, attention_mask=mask)
-    assert o.shape == (1, 0, 16)
-    assert o.numel() == 0
+    assert tuple(o.shape) == (1, 4, 16)
+    assert o.abs().amax().item() == 0.0
 
 
 def test_allow_neg_eigval_changes_output():
@@ -171,8 +169,9 @@ def test_masked_all_empty_batch_collapses():
     x = torch.randn(2, 4, 16)
     with torch.no_grad():
         out, _, _ = blk(x, attention_mask=torch.zeros(2, 4))
-    assert tuple(out.shape) == (2, 0, 16)
-    assert out.numel() == 0
+    # Canonical contract: full-width zeros, not a (B, 0, D) collapse.
+    assert tuple(out.shape) == (2, 4, 16)
+    assert out.abs().amax().item() == 0.0
 
 
 def test_masked_wrong_shape_raises():

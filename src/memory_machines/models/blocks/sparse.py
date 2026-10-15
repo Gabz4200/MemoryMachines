@@ -89,6 +89,15 @@ class CompressedSparseAttention(GroupedQueryAttention):
         window_size: int | None = None,
     ):
         super().__init__(config)
+        # CSA drops the parent dense Q/K/O projections (only v_proj is kept as
+        # reference values); replace the unused linears with Identity so new
+        # checkpoints/optimizers do not carry dead params. NOTE: checkpoints
+        # saved before this change contain q_proj/k_proj/o_proj weights —
+        # load them with strict=False.
+        for _dead in ("q_proj", "k_proj", "o_proj"):
+            if hasattr(self, _dead):
+                delattr(self, _dead)
+            setattr(self, _dead, nn.Identity())
         self.compression_ratio = compression_ratio if compression_ratio is not None else config.csa_compression_ratio
         self.use_indexer = use_indexer
         self.use_dense_branch = use_dense_branch
@@ -123,6 +132,9 @@ class CompressedSparseAttention(GroupedQueryAttention):
         )
         self.swa = GroupedQueryAttention(config, self.token_window_size)
         self.reset_parameters()
+
+    def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raise NotImplementedError("CompressedSparseAttention drops the parent dense Q/K/O projections; use _make_main_queries() instead")
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
@@ -231,6 +243,7 @@ class CompressedSparseAttention(GroupedQueryAttention):
         if q_norm is not None and kv_norm is not None:
             q_heads = q_norm(q_heads)
             kv = kv_norm(kv)
+        # NOTE: repeat_interleave materializes H copies (general GQA only).
         kv_exp = kv.repeat_interleave(self.num_key_value_groups, dim=1)
         logits = torch.matmul(q_heads, kv_exp.transpose(2, 3)) / math.sqrt(self.head_dim)
         if self.cvpe_bias is not None:
@@ -462,12 +475,24 @@ class CompressedSparseAttention(GroupedQueryAttention):
         if past is not None and past.compressed_kv is not None:
             if past.comp_end_pos is None:
                 raise ValueError("past.comp_end_pos is None while past.compressed_kv is set (corrupt CompressedCache)")
-            full_comp = torch.cat([past.compressed_kv, new_comp], dim=1)
-            full_ends = torch.cat([past.comp_end_pos.to(new_ends.device), new_ends], dim=0)
+            full_comp = torch.cat([past.compressed_kv.to(new_comp.device, new_comp.dtype), new_comp], dim=1)
+            past_ends = past.comp_end_pos.to(new_ends.device)
+            if past_ends.dim() == 1:
+                # Broadcast a shared (Lc,) store across the batch.
+                full_ends = torch.cat([past_ends, new_ends], dim=0)
+                k_pos_full = full_ends.unsqueeze(0).expand(bsz, -1)
+            elif past_ends.dim() == 2:
+                if past_ends.shape[0] != bsz:
+                    raise ValueError(f"past.comp_end_pos batch ({past_ends.shape[0]}) does not match input batch ({bsz})")
+                new_ends_b = new_ends.unsqueeze(0).expand(bsz, -1)
+                full_ends = torch.cat([past_ends, new_ends_b], dim=-1)
+                k_pos_full = full_ends
+            else:
+                raise ValueError(f"past.comp_end_pos must be (Lc,) or (B, Lc), got {tuple(past_ends.shape)}")
         else:
             full_comp, full_ends = new_comp, new_ends
+            k_pos_full = full_ends.unsqueeze(0).expand(bsz, -1) if full_ends.dim() == 1 else full_ends
         cq, q_main, v_q = self._make_main_queries(hidden_states)
-        k_pos_full = full_ends.unsqueeze(0).expand(bsz, -1)
         branches: list[torch.Tensor] = []
         if self.use_dense_branch or not self.use_indexer:
             branches.append(self._core_attend(q_main, full_comp.transpose(1, 2), v_q, q_pos, k_pos_full, causal=True))
@@ -697,8 +722,16 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                 elif shared.compressed_kv is not None:
                     if shared.comp_end_pos is None:
                         raise ValueError("shared.comp_end_pos is None while shared.compressed_kv is set (corrupt CSA2SharedState)")
-                    full_comp = torch.cat([shared.compressed_kv, new_comp], dim=1)
-                    full_ends = torch.cat([shared.comp_end_pos.to(new_ends.device), new_ends], dim=0)
+                    past_ends = shared.comp_end_pos.to(new_ends.device)
+                    full_comp = torch.cat([shared.compressed_kv.to(new_comp.device, new_comp.dtype), new_comp], dim=1)
+                    if past_ends.dim() == 1:
+                        full_ends = torch.cat([past_ends, new_ends], dim=0)
+                    elif past_ends.dim() == 2:
+                        if past_ends.shape[0] != bsz:
+                            raise ValueError(f"shared.comp_end_pos batch ({past_ends.shape[0]}) does not match input batch ({bsz})")
+                        full_ends = torch.cat([past_ends, new_ends.unsqueeze(0).expand(bsz, -1)], dim=-1)
+                    else:
+                        raise ValueError(f"shared.comp_end_pos must be (Lc,) or (B, Lc), got {tuple(past_ends.shape)}")
                 else:
                     full_comp, full_ends = new_comp, new_ends
             indexer_k = self.indexer.k_index_proj(full_comp.mean(dim=2))
@@ -740,9 +773,12 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             full_ends = shared.comp_end_pos
             topk = shared.topk_indices
             if topk.shape[1] != q_len:
+                # Reuse the last query's selection (exact only for single-token decode).
                 topk = topk[:, -1:, :].expand(bsz, q_len, -1)
         sel = self._gather_selected(full_comp, topk)
         sparse_out = self._selected_branch(q_main, sel, self._selected_positions(full_ends, topk), v_q, q_pos)
-        win_out, _, _ = self.swa(hidden_states, None, position_ids, None, False, use_cache=False)
+        # Thread explicit positions into the SWA branch so both branches share
+        # the same absolute position base.
+        win_out, _, _ = self.swa(hidden_states, None, q_pos, None, False, use_cache=False)
         out = self.grouped_out(self._fuse_branches([sparse_out, win_out], hidden_states))
         return out, shared

@@ -324,11 +324,10 @@ def test_19_masked_forward_with_resting():
         assert torch.equal(o[i : i + 1, ~keep], torch.zeros_like(o[i : i + 1, ~keep]))
         o_compact, _, _ = blk(x[i : i + 1, keep])
         torch.testing.assert_close(o[i : i + 1, keep], o_compact, atol=1e-10, rtol=1e-10)
-    # All-masked single-row batch is safe (returns empty-length output, no crash).
-    # NOTE: mixing an all-masked row with non-empty rows is unsupported by
-    # _forward_masked (it appends an empty slice that cannot cat); not tested.
+    # All-masked single-row batch is safe (returns full-width zeros, no crash).
     o_empty, _, _ = blk(x[0:1], attention_mask=torch.zeros(1, 5, dtype=torch.long))
-    assert o_empty.shape == (1, 0, 16) and torch.isfinite(o_empty).all()
+    assert tuple(o_empty.shape) == (1, 5, 16) and torch.isfinite(o_empty).all()
+    assert o_empty.abs().amax().item() == 0.0
 
 
 def test_20_block_cache_replay_chunk_backend_resting():

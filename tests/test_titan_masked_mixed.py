@@ -2,7 +2,8 @@
 
 A batch mixing fully-masked (empty) rows with live rows must not crash: empty
 rows come back as zeros with the full sequence width, matching the GDN2 masked
-convention. Fully-empty batches keep the legacy collapse to ``(B, 0, D)``.
+convention. Fully-empty batches return full-width zeros ``(B, T, D)`` (canonical
+contract, fixed T always).
 """
 
 import torch
@@ -50,5 +51,5 @@ def test_masked_all_empty_batch_collapses():
     x = torch.randn(2, 4, 16)
     with torch.no_grad():
         out, _, _ = mixer(x, attention_mask=torch.zeros(2, 4))
-    assert tuple(out.shape) == (2, 0, 16)
-    assert out.numel() == 0
+    assert tuple(out.shape) == (2, 4, 16)
+    assert out.abs().amax().item() == 0.0

@@ -382,6 +382,8 @@ def _sinkhorn(M: torch.Tensor, iters: int) -> torch.Tensor:
     if not bool(torch.isfinite(M).all()):
         raise ValueError("Sinkhorn input must be finite (got NaN/Inf logits)")
     n = M.shape[-1]
+    # Max-subtract for overflow safety: exp(M) alone overflows to inf -> NaN.
+    M = M - M.max(dim=-1, keepdim=True).values
     P = torch.exp(M)
     for _ in range(iters):
         P = P / P.sum(dim=-1, keepdim=True).clamp_min(1e-12)
