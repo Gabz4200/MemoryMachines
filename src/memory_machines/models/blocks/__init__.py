@@ -16,6 +16,7 @@ from .compression import (
     HeadRMSNorm,
     SparseIndexer,
 )
+from .fast_weights import TitansFastWeightsMemory, TitansMAGBlock
 from .gdn2 import GatedDeltaNet2, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
@@ -69,10 +70,8 @@ __all__ = [
     "SinglePassMHC",
     "SparseIndexer",
     "SwiGLU",
-    "apply_beta_guard",
-    "add_resting_projection",
-    "gated_delta_rule_2",
-    "resting_corrected_write",
+    "TitansFastWeightsMemory",
+    "TitansMAGBlock",
     "_causal_comp_mask",
     "_check_position_bounds",
     "_past_total_len",
@@ -80,4 +79,8 @@ __all__ = [
     "_sinkhorn",
     "_update_swa_pos",
     "_window_mask",
+    "add_resting_projection",
+    "apply_beta_guard",
+    "gated_delta_rule_2",
+    "resting_corrected_write",
 ]
