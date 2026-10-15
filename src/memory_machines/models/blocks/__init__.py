@@ -21,6 +21,7 @@ from .fast_weights import (
     HopeAttentionBlock,
     HopeBlock,
     SelfReferentialTitanMemory,
+    SelfReferentialTitanMixer,
     TitansFastWeightsMemory,
     TitansMAGBlock,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "LivPerceiver",
     "NativeSparseAttention",
     "SelfReferentialTitanMemory",
+    "SelfReferentialTitanMixer",
     "ShortConvolution",
     "SinglePassMHC",
     "SparseIndexer",

@@ -44,9 +44,13 @@ Examples::
 
 from __future__ import annotations
 
+import itertools
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .causal_conv1d import ShortConvolution
 
@@ -55,6 +59,7 @@ __all__ = [
     "HopeAttentionBlock",
     "HopeBlock",
     "SelfReferentialTitanMemory",
+    "SelfReferentialTitanMixer",
     "TitansFastWeightsMemory",
     "TitansMAGBlock",
 ]
@@ -711,6 +716,183 @@ class SelfReferentialTitanMemory(nn.Module):
                 "seq_len": start + total,
             }
         return out, cache
+
+
+class SelfReferentialTitanMixer(nn.Module):
+    r"""SelfReferentialTitanMixer(config, ...) — config-driven MultiHead mixer.
+
+    Thin config-driven wrapper around :class:`SelfReferentialTitanMemory`
+    matching the other token-mixer blocks (:class:`GatedDeltaNet2`,
+    :class:`GroupedQueryAttention`): ``hidden_size``/``num_heads`` come from
+    ``config`` (``hidden_size`` / ``num_attention_heads``), heads stay batched
+    as ``[B, T, H, Dh]`` inside the wrapped memory, and forward follows the
+    ``(hidden_states, attention_mask, past_key_values, use_cache,
+    output_attentions, cu_seqlens, chunk_size) -> (out, None, cache)`` triple.
+
+    The math is exactly the wrapped memory's Eq. 86-88 path; this class only
+    translates the mixer interface (padding mask, packed ``cu_seqlens``,
+    incremental ``past_key_values``) onto it. The Continuum Memory System
+    chain stays separate (see :class:`HopeBlock`).
+
+    Args:
+        config: provides ``hidden_size``, ``num_attention_heads``,
+            ``rms_norm_eps``, and ``initializer_range``.
+        memory_depth: fast-MLP layers per box (``1`` = linear matrix memory).
+        fast_expansion: fast hidden width multiplier.
+        objective: ``"l2"`` regression or ``"dot"`` similarity.
+        use_short_conv: local depthwise causal conv on the input.
+        conv_kernel_size: conv width (paper uses 4).
+        chunk_size: default positions per state-carry chunk (exact; bounds
+            peak activation lifetime). Per-call ``chunk_size`` overrides it.
+
+    Examples::
+
+        >>> import torch
+        >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+        >>> from memory_machines.models.blocks.fast_weights import SelfReferentialTitanMixer
+        >>> cfg = MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
+        ...     num_key_value_heads=2, csa_num_output_groups=2)
+        >>> m = SelfReferentialTitanMixer(cfg, memory_depth=1, use_short_conv=False)
+        >>> m(torch.randn(1, 4, 16))[0].shape
+        torch.Size([1, 4, 16])
+    """
+
+    def __init__(
+        self,
+        config: MemoryMachineConfig,
+        memory_depth: int = 2,
+        fast_expansion: float = 1.0,
+        objective: str = "l2",
+        use_short_conv: bool = True,
+        conv_kernel_size: int = 4,
+        chunk_size: int | None = None,
+    ) -> None:
+        super().__init__()
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
+        self.head_dim = self.hidden_size // self.num_heads
+        self.chunk_size = chunk_size
+        self.memory = SelfReferentialTitanMemory(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            memory_depth=memory_depth,
+            fast_expansion=fast_expansion,
+            objective=objective,
+            use_short_conv=use_short_conv,
+            conv_kernel_size=conv_kernel_size,
+            norm_eps=config.rms_norm_eps,
+            init_std=config.initializer_range,
+        )
+
+    def reset_parameters(self) -> None:
+        """reset_parameters() -> None — re-init the wrapped memory."""
+        self.memory.reset_parameters()
+
+    @property
+    def fast_init(self) -> nn.ModuleDict:
+        """Fast-weight priors owned by the wrapped memory."""
+        return self.memory.fast_init
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: dict | None = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_size: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict | None]:
+        r"""forward(hidden_states, ...) -> (out, None, cache).
+
+        Args:
+            hidden_states: input ``[B, T, D]`` (only *new* tokens when
+                ``past_key_values`` continues a stream).
+            attention_mask: optional ``[B, T]`` 0/1 padding mask.
+            past_key_values: cache from a previous call (continued
+                memorization).
+            use_cache: whether to return the updated cache.
+            output_attentions: unused, kept for interface compat.
+            cu_seqlens: optional ``[N+1]`` packed offsets (``B == 1``);
+                each segment runs from a fresh memory.
+            chunk_size: positions per state-carry chunk (exact); defaults to
+                the constructor ``chunk_size`` (``None`` = whole sequence).
+
+        Returns:
+            ``[B, T, D]`` outputs, ``None`` (no attention map), and the
+            updated cache (or ``None``).
+        """
+        if hidden_states.dim() != 3 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(f"hidden_states must be [B, T, D={self.hidden_size}], got {tuple(hidden_states.shape)}")
+        if attention_mask is not None and cu_seqlens is not None:
+            raise ValueError("attention_mask and cu_seqlens cannot be provided at the same time")
+        width = chunk_size if chunk_size is not None else self.chunk_size
+        if width is not None and width <= 0:
+            raise ValueError(f"chunk_size must be positive, got {width}")
+        if cu_seqlens is not None:
+            return self._forward_packed(hidden_states, cu_seqlens, use_cache, width)
+        if attention_mask is not None:
+            return self._forward_masked(hidden_states, attention_mask, past_key_values, use_cache, width)
+        out, cache = self.memory(hidden_states, state=past_key_values, output_final_state=use_cache, chunk_size=width)
+        return out, None, cache
+
+    def _forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        use_cache: bool,
+        chunk_size: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict | None]:
+        if hidden_states.shape[0] != 1:
+            raise ValueError(f"cu_seqlens packing requires batch 1, got {hidden_states.shape[0]}")
+        bounds = cu_seqlens.tolist()
+        total = hidden_states.shape[1]
+        if int(cu_seqlens[-1].item()) != total:
+            raise ValueError(f"cu_seqlens must end at T={total}, got {int(cu_seqlens[-1].item())}")
+        if use_cache:
+            raise ValueError("cu_seqlens with use_cache=True is not supported; decode packed segments without caching")
+        outs = []
+        for s, e in itertools.pairwise(bounds):
+            seg = hidden_states[:, s:e, :]
+            if seg.shape[1] == 0:
+                outs.append(seg)
+                continue
+            o, _ = self.memory(seg, state=None, output_final_state=False, chunk_size=chunk_size)
+            outs.append(o)
+        return torch.cat(outs, dim=1), None, None
+
+    def _forward_masked(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_key_values: dict | None,
+        use_cache: bool,
+        chunk_size: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict | None]:
+        if past_key_values is not None:
+            raise ValueError("attention_mask with cached past_key_values is not supported in the naive reference; decode without padding")
+        if use_cache:
+            raise ValueError("attention_mask with use_cache=True is not supported in the naive reference; pass explicit positions via cu_seqlens or decode without padding")
+        bsz, tlen, _ = hidden_states.shape
+        if tuple(attention_mask.shape) != (bsz, tlen):
+            raise ValueError(f"attention_mask must be [B, T]=({bsz}, {tlen}), got {tuple(attention_mask.shape)}")
+        outs = []
+        for i in range(bsz):
+            keep = attention_mask[i].to(torch.bool)
+            xi = hidden_states[i : i + 1, keep]
+            if xi.shape[1] == 0:
+                outs.append(hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size))
+                continue
+            oi, _ = self.memory(xi, state=None, output_final_state=False, chunk_size=chunk_size)
+            full = oi.new_zeros(1, tlen, self.hidden_size)
+            full[0, keep] = oi[0]
+            outs.append(full)
+        return torch.cat(outs, dim=0), None, None
 
 
 class ContinuumMemorySystem(nn.Module):
