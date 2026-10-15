@@ -16,7 +16,14 @@ from .compression import (
     HeadRMSNorm,
     SparseIndexer,
 )
-from .fast_weights import TitansFastWeightsMemory, TitansMAGBlock
+from .fast_weights import (
+    ContinuumMemorySystem,
+    HopeAttentionBlock,
+    HopeBlock,
+    SelfReferentialTitanMemory,
+    TitansFastWeightsMemory,
+    TitansMAGBlock,
+)
 from .gdn2 import GatedDeltaNet2, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
@@ -53,6 +60,7 @@ __all__ = [
     "CompressedCache",
     "CompressedSparseAttention",
     "CompressedSparseAttention2",
+    "ContinuumMemorySystem",
     "DSparkDrafter",
     "EngramMemory",
     "FRVMValueGate",
@@ -62,10 +70,13 @@ __all__ = [
     "GroupedQueryAttention",
     "HeadRMSNorm",
     "HeavilyCompressedAttention",
+    "HopeAttentionBlock",
+    "HopeBlock",
     "LivConvBlock",
     "LivDoubleGatedBase",
     "LivPerceiver",
     "NativeSparseAttention",
+    "SelfReferentialTitanMemory",
     "ShortConvolution",
     "SinglePassMHC",
     "SparseIndexer",
