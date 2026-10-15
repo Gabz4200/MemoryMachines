@@ -25,7 +25,7 @@ from .fast_weights import (
     TitansFastWeightsMemory,
     TitansMAGBlock,
 )
-from .gdn2 import GatedDeltaNet2, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
+from .gdn2 import GatedDeltaNet2, GatedDeltaNet2Mixer, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
@@ -67,6 +67,7 @@ __all__ = [
     "FRVMValueGate",
     "FactoredLinear",
     "GatedDeltaNet2",
+    "GatedDeltaNet2Mixer",
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HeadRMSNorm",

@@ -59,10 +59,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from memory_machines.utils.config_schema import MemoryMachineConfig
+
 from .causal_conv1d import ShortConvolution
 
 __all__ = [
     "GatedDeltaNet2",
+    "GatedDeltaNet2Mixer",
     "add_resting_projection",
     "apply_beta_guard",
     "gated_delta_rule_2",
@@ -794,15 +797,215 @@ class GatedDeltaNet2(nn.Module):
         if last_state is not None or conv_states is not None:
             raise ValueError("attention_mask with cached past_key_values is not supported in the naive reference; pass explicit positions via cu_seqlens or decode without padding")
         B, T, _ = hidden_states.shape
+        if tuple(attention_mask.shape) != (B, T):
+            raise ValueError(f"attention_mask must be [B, T]=({B}, {T}), got {tuple(attention_mask.shape)}")
+        if use_cache:
+            raise ValueError("attention_mask with use_cache=True is not supported in the naive reference; pass explicit positions via cu_seqlens or decode without padding")
+        keeps = [attention_mask[i].to(torch.bool) for i in range(B)]
+        if all(not keep.any() for keep in keeps):
+            # Legacy collapse: a fully-masked batch has no live tokens, so the
+            # output keeps the batch dim with zero tokens instead of T zeros.
+            return torch.cat([hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size) for i in range(B)], dim=0), None, None
         outs = []
-        for i in range(B):
-            keep = attention_mask[i].to(torch.bool)
+        for i, keep in enumerate(keeps):
             xi = hidden_states[i : i + 1, keep]
             if xi.shape[1] == 0:
-                outs.append(hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size))
+                # Mixed batch: the empty row keeps the full width as zeros so
+                # the per-row outputs stay concatenable (cf. padded slots of
+                # partial rows, which also read as zeros).
+                outs.append(hidden_states.new_zeros(1, T, self.hidden_size))
                 continue
             oi, _, _ = self.forward(xi, use_cache=False)
             full = oi.new_zeros(1, T, self.hidden_size)
             full[0, keep] = oi[0]
             outs.append(full)
         return torch.cat(outs, dim=0), None, None
+
+
+class GatedDeltaNet2Mixer(nn.Module):
+    r"""GatedDeltaNet2Mixer(config, ...) — config-driven MultiHead mixer.
+
+    Thin config-driven wrapper around :class:`GatedDeltaNet2` matching the
+    other token-mixer blocks (:class:`GroupedQueryAttention`,
+    ``SelfReferentialTitanMixer``): ``hidden_size``/``num_heads`` come from
+    ``config`` (``hidden_size`` / ``num_attention_heads``), heads stay batched
+    as ``[B, T, H, Dh]`` inside the wrapped layer, and forward follows the
+    ``(hidden_states, attention_mask, past_key_values, use_cache,
+    output_attentions, cu_seqlens, chunk_size) -> (out, None, cache)`` triple.
+
+    The math is exactly the wrapped layer's Gated Delta Rule-2 path; this
+    class only translates the mixer interface (padding mask, packed
+    ``cu_seqlens``, incremental ``past_key_values``, per-call ``chunk_size``)
+    onto it. ``GatedDeltaNet2`` itself is already multi-head; this wrapper
+    is what makes it constructible from ``MemoryMachineConfig`` like the
+    rest of :mod:`memory_machines.models.blocks`.
+
+    Args:
+        config: provides ``hidden_size``, ``num_attention_heads``,
+            ``conv_kernel_size``, ``rms_norm_eps``.
+        head_dim (int, optional): key/value head dim ``Dh``. Default: ``None``
+            (``hidden_size // num_attention_heads``, pure MultiHead).
+        num_v_heads (int, optional): value heads ``HV``; must equal or be a
+            multiple of ``num_heads`` (GVA). Default: ``None`` (``num_heads``).
+        expand_v (float): value-dim expansion ratio (``head_dim_v =
+            head_dim * expand_v``, must stay integral). Default: ``1.0``.
+        use_short_conv (bool): depthwise short convs on q/k/v. Default: ``True``.
+        conv_size (int, optional): conv width. Default: ``None``
+            (``config.conv_kernel_size``).
+        conv_bias (bool): conv bias. Default: ``False``.
+        allow_neg_eigval (bool): scale erase gate to ``[0, 2]``. Default: ``False``.
+        norm_eps (float, optional): RMSNorm epsilon. Default: ``None``
+            (``config.rms_norm_eps``).
+        backend (str): reference path (``"naive"``/``"recurrent"``/``"chunk"``/
+            ``"wy_fast"``). Default: ``"naive"``.
+        chunk_size (int): default WY chunk width. Default: ``64``.
+        use_qk_l2norm (bool): L2-normalize q/k. Default: ``True``.
+        beta_guard (bool): erase-contrast projection. Default: ``False``.
+        use_resting_state (bool): learn a resting prior ``S0``. Default: ``False``.
+
+    Examples::
+
+        >>> import torch
+        >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+        >>> from memory_machines.models.blocks.gdn2 import GatedDeltaNet2Mixer
+        >>> cfg = MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
+        ...     num_key_value_heads=2, csa_num_output_groups=2)
+        >>> m = GatedDeltaNet2Mixer(cfg, use_short_conv=False)
+        >>> m(torch.randn(1, 4, 16))[0].shape
+        torch.Size([1, 4, 16])
+    """
+
+    def __init__(
+        self,
+        config: MemoryMachineConfig,
+        head_dim: int | None = None,
+        num_v_heads: int | None = None,
+        expand_v: float = 1.0,
+        use_short_conv: bool = True,
+        conv_size: int | None = None,
+        conv_bias: bool = False,
+        allow_neg_eigval: bool = False,
+        norm_eps: float | None = None,
+        backend: str = "naive",
+        chunk_size: int = 64,
+        use_qk_l2norm: bool = True,
+        beta_guard: bool = False,
+        use_resting_state: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
+        resolved_head_dim = self.hidden_size // self.num_heads if head_dim is None else head_dim
+        self.layer = GatedDeltaNet2(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            head_dim_k=resolved_head_dim,
+            head_dim_v=None,
+            expand_v=expand_v,
+            num_v_heads=num_v_heads if num_v_heads is not None else self.num_heads,
+            use_short_conv=use_short_conv,
+            conv_size=conv_size if conv_size is not None else config.conv_kernel_size,
+            conv_bias=conv_bias,
+            allow_neg_eigval=allow_neg_eigval,
+            norm_eps=norm_eps if norm_eps is not None else config.rms_norm_eps,
+            backend=backend,
+            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
+            beta_guard=beta_guard,
+            use_resting_state=use_resting_state,
+        )
+
+    @property
+    def head_dim(self) -> int:
+        """Key/value head dim (equal in the default MultiHead build)."""
+        return self.layer.head_k_dim
+
+    @property
+    def head_dim_k(self) -> int:
+        """Key head dim ``K`` of the wrapped layer."""
+        return self.layer.head_k_dim
+
+    @property
+    def head_dim_v(self) -> int:
+        """Value head dim ``V`` of the wrapped layer."""
+        return self.layer.head_v_dim
+
+    @property
+    def chunk_size(self) -> int:
+        """Default WY chunk width of the wrapped layer."""
+        return self.layer.chunk_size
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Re-applies the wrapped :class:`GatedDeltaNet2` init (Xavier input
+        projections with gain ``2**-2.5``, zero-start output biases) so a
+        freshly built (or re-initialized) mixer starts from the same
+        neutral point as the raw block.
+        """
+        layer = self.layer
+        for m in layer.modules():
+            if "_is_hf_initialized" in m.__dict__:
+                del m.__dict__["_is_hf_initialized"]
+        layer.apply(layer._initialize_weights)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: dict | None = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_size: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict | None]:
+        r"""forward(hidden_states, ...) -> (out, None, cache).
+
+        Args:
+            hidden_states: input ``[B, T, D]`` (only *new* tokens when
+                ``past_key_values`` continues a stream).
+            attention_mask: optional ``[B, T]`` 0/1 padding mask.
+            past_key_values: cache from a previous call (continued
+                memorization).
+            use_cache: whether to return the updated cache.
+            output_attentions: unused, kept for interface compat.
+            cu_seqlens: optional ``[N+1]`` packed offsets (``B == 1``);
+                each segment runs from a fresh state.
+            chunk_size: WY chunk width override for this call; defaults to
+                the constructor ``chunk_size``.
+
+        Returns:
+            ``[B, T, D]`` outputs, ``None`` (no attention map), and the
+            updated cache (or ``None``).
+        """
+        if hidden_states.dim() != 3 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(f"hidden_states must be [B, T, D={self.hidden_size}], got {tuple(hidden_states.shape)}")
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        if cu_seqlens is not None and use_cache:
+            raise ValueError("cu_seqlens with use_cache=True is not supported; decode packed segments without caching")
+        if chunk_size is None:
+            return self.layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                cu_seqlens=cu_seqlens,
+            )
+        prev = self.layer.chunk_size
+        self.layer.chunk_size = chunk_size
+        try:
+            return self.layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                cu_seqlens=cu_seqlens,
+            )
+        finally:
+            self.layer.chunk_size = prev

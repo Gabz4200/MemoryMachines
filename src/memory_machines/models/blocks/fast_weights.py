@@ -882,11 +882,18 @@ class SelfReferentialTitanMixer(nn.Module):
         if tuple(attention_mask.shape) != (bsz, tlen):
             raise ValueError(f"attention_mask must be [B, T]=({bsz}, {tlen}), got {tuple(attention_mask.shape)}")
         outs = []
-        for i in range(bsz):
-            keep = attention_mask[i].to(torch.bool)
+        keeps = [attention_mask[i].to(torch.bool) for i in range(bsz)]
+        if all(not keep.any() for keep in keeps):
+            # Legacy collapse: a fully-masked batch has no live tokens, so the
+            # output keeps the batch dim with zero tokens instead of T zeros.
+            return torch.cat([hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size) for i in range(bsz)], dim=0), None, None
+        for i, keep in enumerate(keeps):
             xi = hidden_states[i : i + 1, keep]
             if xi.shape[1] == 0:
-                outs.append(hidden_states[i : i + 1, :0].new_zeros(1, 0, self.hidden_size))
+                # Mixed batch: the empty row keeps the full width as zeros so
+                # the per-row outputs stay concatenable (cf. padded slots of
+                # partial rows, which also read as zeros).
+                outs.append(hidden_states.new_zeros(1, tlen, self.hidden_size))
                 continue
             oi, _ = self.memory(xi, state=None, output_final_state=False, chunk_size=chunk_size)
             full = oi.new_zeros(1, tlen, self.hidden_size)
