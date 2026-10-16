@@ -65,6 +65,10 @@ __all__ = [
     "SelfReferentialTitanMixer",
     "TitansFastWeightsMemory",
     "TitansMAGBlock",
+    "apply_qk_projection",
+    "self_referential_titan",
+    "self_referential_titan_chunk_forward",
+    "self_referential_titan_recurrent_forward",
 ]
 
 #: Boxes of the self-referential system (Eq. 88/96): the five adaptive
@@ -120,8 +124,14 @@ class TitansFastWeightsMemory(nn.Module):
         conv_kernel_size: int = 3,
         norm_eps: float = 1e-6,
         init_std: float = 0.02,
+        backend: str = "naive",
+        chunk_size: int = 64,
     ) -> None:
         super().__init__()
+        if backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
+            raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if hidden_size <= 0 or num_heads <= 0:
             raise ValueError("hidden_size/num_heads must be positive")
         if hidden_size % num_heads != 0:
@@ -141,6 +151,8 @@ class TitansFastWeightsMemory(nn.Module):
         self.use_short_conv = use_short_conv
         self.norm_eps = norm_eps
         self.init_std = init_std
+        self.backend = backend
+        self.chunk_size = chunk_size
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -364,23 +376,55 @@ class TitansFastWeightsMemory(nn.Module):
             fast = [w.to(device=x.device, dtype=qf.dtype) for w in state["fast_weights"]]
             mom = [w.to(device=x.device, dtype=qf.dtype) for w in state["momentum"]]
         total = qf.shape[1]
-        width = total if chunk_size is None else chunk_size
+        width = self.chunk_size if chunk_size is None else chunk_size
+        if width <= 0:
+            width = total
         outs: list[torch.Tensor] = []
         for pos in range(0, total, width):
-            for t in range(pos, min(pos + width, total)):
-                y, fast, mom, _ = self._step(
-                    kf[:, t],
-                    vf[:, t],
-                    qf[:, t],
-                    eta_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2))),
-                    theta_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2))),
-                    alpha_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2))),
-                    fast,
-                    mom,
-                    create_graph=create_graph,
-                )
-                if t >= np_:
-                    outs.append(y)
+            end = min(pos + width, total)
+            if self.backend in ("chunk", "tnt", "wy_fast"):
+                # TNT approximation (arXiv:2511.07343): gradients are evaluated
+                # relative to the chunk-start state, but the state and momentum
+                # are carried across tokens within the chunk.
+                fast_start = [w.clone() for w in fast]
+                for t in range(pos, end):
+                    for w in fast_start:
+                        w.requires_grad_(True)
+                    with torch.enable_grad():
+                        pred = self._mlp(kf[:, t], fast_start)
+                        loss = ((pred - vf[:, t]) ** 2).mean()
+                        grads = torch.autograd.grad(loss, fast_start, create_graph=create_graph, allow_unused=False)
+                    eta = eta_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2)))
+                    theta = theta_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2)))
+                    alpha = alpha_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2)))
+                    new_mom, new_fast = [], []
+                    for s_prev, g, w_prev in zip(mom, grads, fast):
+                        s = eta * s_prev - theta * g.to(s_prev.dtype) if self.use_momentum else -theta * g.to(s_prev.dtype)
+                        w = w_prev if create_graph else w_prev.detach()
+                        if self.use_weight_decay:
+                            w = (1.0 - alpha) * w
+                        new_mom.append(s.detach() if not create_graph else s)
+                        w_new = w + s
+                        new_fast.append(w_new.detach() if not create_graph else w_new)
+                    fast, mom = new_fast, new_mom
+                    y = self._mlp(qf[:, t], [w.detach() if not create_graph else w for w in fast])
+                    if t >= np_:
+                        outs.append(y)
+            else:
+                for t in range(pos, end):
+                    y, fast, mom, _ = self._step(
+                        kf[:, t],
+                        vf[:, t],
+                        qf[:, t],
+                        eta_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2))),
+                        theta_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2))),
+                        alpha_all[:, t].view(bsz, self.num_heads, *([1] * (fast[0].dim() - 2))),
+                        fast,
+                        mom,
+                        create_graph=create_graph,
+                    )
+                    if t >= np_:
+                        outs.append(y)
         mem_out = torch.stack(outs, dim=1) if outs else x.new_zeros(bsz, 0, self.num_heads, self.head_dim)
         mem_out = mem_out.reshape(bsz, mem_out.shape[1], self.hidden_size).to(x.dtype)
         gated = self.out_norm(mem_out) * F.silu(self.gate_proj(x).to(mem_out.dtype))
@@ -494,6 +538,293 @@ def _gate_shape(eta: torch.Tensor, w: torch.Tensor) -> list[int]:
     return [eta.shape[0], eta.shape[1], *([1] * (w.dim() - 2))]
 
 
+def apply_qk_projection(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    m_carry: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""apply_qk_projection(q, k, m_carry=None) -> (q_proj, m_carry_next)
+
+    Project queries onto the subspace spanned by keys (TNT arXiv:2511.07343 Sec. 4.1.2 / Appendix C).
+
+    For normalized keys :math:`\|k\| = 1`, the running projection matrix is
+    :math:`\mathcal{M}_t = \mathcal{M}_{\text{carry}} + \sum_{\tau \le t} k_\tau k_\tau^\top`.
+    The projected query is :math:`\mathcal{M}_t q_t = \mathcal{M}_{\text{carry}} q_t + \sum_{\tau \le t} (q_t^\top k_\tau) k_\tau`.
+
+    Args:
+        q: queries ``[B, T, H, d]``.
+        k: normalized keys ``[B, T, H, d]``.
+        m_carry: optional carry-over matrix ``[B, H, d, d]``.
+
+    Returns:
+        Projected queries ``[B, T, H, d]`` and updated ``m_carry_next`` ``[B, H, d, d]``.
+    """
+    _, tlen, _, _ = q.shape
+    if m_carry is not None:
+        q_carry = torch.einsum("bthd,bhde->bthe", q, m_carry)
+        m_carry_next = m_carry + torch.einsum("bthd,bthe->bhde", k, k)
+    else:
+        q_carry = None
+        m_carry_next = torch.einsum("bthd,bthe->bhde", k, k)
+
+    s = torch.einsum("bthd,bshd->bhts", q, k)
+    causal_mask = torch.tril(torch.ones(tlen, tlen, dtype=torch.bool, device=q.device))
+    s_causal = torch.where(causal_mask, s, torch.zeros_like(s))
+    q_intra = torch.einsum("bhts,bshd->bthd", s_causal, k)
+
+    q_proj = q_intra if q_carry is None else (q_carry + q_intra)
+    return q_proj, m_carry_next
+
+
+def self_referential_titan_recurrent_forward(
+    heads: torch.Tensor,
+    q_all: torch.Tensor,
+    fast_init_state: dict[str, list[torch.Tensor]],
+    chunk_size: int | None = None,
+    memory_depth: int = 1,
+    objective: str = "l2",
+    norm_eps: float = 1e-6,
+    create_graph: bool = False,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    r"""self_referential_titan_recurrent_forward(...) -> (mem_out, final_fast)
+
+    Token-by-token recurrence oracle for multihead Self-Referential Titans (HOPE Eq. 86-88).
+    """
+    bsz = heads.shape[0]
+    total = q_all.shape[1]
+    width = total if chunk_size is None or chunk_size <= 0 else chunk_size
+    fast = {box: [w.clone() for w in fast_init_state[box]] for box in HOPE_BOXES}
+    outs: list[torch.Tensor] = []
+    for pos in range(0, total, width):
+        for t in range(pos, min(pos + width, total)):
+            xh = heads[:, t]
+            kh = _l2norm(_sr_mlp(xh, fast["k"]), norm_eps)
+            vh = _sr_mlp(xh, fast["v"])
+            qh = q_all[:, t]
+            eta = torch.sigmoid(_sr_mlp(xh, fast["eta"]).mean(dim=-1))
+            alpha = torch.sigmoid(_sr_mlp(xh, fast["alpha"]).mean(dim=-1))
+            vhat = {box: _sr_mlp(vh, fast[box]) for box in HOPE_BOXES}
+            outs.append(_sr_mlp(qh, fast["memory"]))
+            if memory_depth == 1:
+                for box in HOPE_BOXES:
+                    w_old = fast[box][0]
+                    kk = torch.einsum("...d,...e->...de", kh, kh)
+                    dgd = torch.einsum("...de,...ev->...dv", kk, w_old)
+                    pred = torch.einsum("...d,...dv->...v", kh, w_old)
+                    if objective == "l2":
+                        grad = torch.einsum("...d,...v->...dv", kh, pred - vhat[box])
+                    else:
+                        grad = -torch.einsum("...d,...v->...dv", kh, vhat[box])
+                    shape = _gate_shape(eta, w_old)
+                    w_new = alpha.view(*shape) * w_old - eta.view(*shape) * dgd - eta.view(*shape) * grad
+                    fast[box][0] = w_new if create_graph else w_new.detach()
+            else:
+                for box in HOPE_BOXES:
+                    for w in fast[box]:
+                        w.requires_grad_(True)
+                with torch.enable_grad():
+                    grads: dict[str, list[torch.Tensor]] = {}
+                    for box in HOPE_BOXES:
+                        pred_b = _sr_mlp(kh, fast[box])
+                        loss_b = ((pred_b - vhat[box]) ** 2).mean() if objective == "l2" else -(pred_b * vhat[box]).mean()
+                        grads[box] = list(torch.autograd.grad(loss_b, fast[box], create_graph=create_graph, allow_unused=False))
+                for box in HOPE_BOXES:
+                    for i, (w_prev, g) in enumerate(zip(fast[box], grads[box])):
+                        w = w_prev if create_graph else w_prev.detach()
+                        shape = _gate_shape(eta, w)
+                        w_new = alpha.view(*shape) * w - eta.view(*shape) * g.to(w.dtype)
+                        fast[box][i] = w_new if create_graph else w_new.detach()
+    mem_out = torch.stack(outs, dim=1) if outs else heads.new_zeros(bsz, 0, heads.shape[2], heads.shape[3])
+    return mem_out, fast
+
+
+def self_referential_titan_chunk_forward(
+    heads: torch.Tensor,
+    q_all: torch.Tensor,
+    fast_init_state: dict[str, list[torch.Tensor]],
+    chunk_size: int = 64,
+    memory_depth: int = 1,
+    objective: str = "l2",
+    norm_eps: float = 1e-6,
+    create_graph: bool = False,
+    use_qk_projection: bool = False,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    r"""self_referential_titan_chunk_forward(...) -> (mem_out, final_fast)
+
+    TNT chunkwise parallel forward for multihead Self-Referential Titans (arXiv:2511.07343).
+
+    Gradients and updates within each chunk of size ``C`` are evaluated relative to
+    the chunk-start memory state :math:`W_{\text{start}}`, breaking token-to-token
+    sequential dependencies and enabling full chunkwise parallel execution.
+    The updated memory state is carried over between chunks.
+    """
+    bsz = heads.shape[0]
+    total = q_all.shape[1]
+    width = total if chunk_size <= 0 else chunk_size
+    fast = {box: [w.clone() for w in fast_init_state[box]] for box in HOPE_BOXES}
+    outs: list[torch.Tensor] = []
+    m_carry: torch.Tensor | None = None
+
+    for pos in range(0, total, width):
+        end = min(pos + width, total)
+        c_len = end - pos
+        xc = heads[:, pos:end]  # [B, C, H, d]
+        qc = q_all[:, pos:end]  # [B, C, H, d]
+
+        if memory_depth == 1:
+            w_k = fast["k"][0]
+            w_v = fast["v"][0]
+            w_eta = fast["eta"][0]
+            w_alpha = fast["alpha"][0]
+
+            kc = _l2norm(torch.einsum("bchd,bhde->bche", xc, w_k), norm_eps)
+            vc = torch.einsum("bchd,bhde->bche", xc, w_v)
+            eta_raw = torch.einsum("bchd,bhde->bche", xc, w_eta).mean(dim=-1)
+            eta_c = torch.sigmoid(eta_raw)
+            alpha_raw = torch.einsum("bchd,bhde->bche", xc, w_alpha).mean(dim=-1)
+            alpha_c = torch.sigmoid(alpha_raw)
+
+            eta_broad = eta_c.unsqueeze(-1).unsqueeze(-1)
+            alpha_broad = alpha_c.unsqueeze(-1).unsqueeze(-1)
+            kk_c = torch.einsum("bchd,bche->bchde", kc, kc)
+
+            cum_delta: dict[str, torch.Tensor] = {}
+            w_retrieval: dict[str, torch.Tensor] = {}
+
+            for box in HOPE_BOXES:
+                w_box = fast[box][0]
+                vhat_box = torch.einsum("bchd,bhde->bche", vc, w_box)
+                pred_box = torch.einsum("bchd,bhde->bche", kc, w_box)
+                dgd_box = torch.einsum("bchde,bhef->bchdf", kk_c, w_box)
+
+                if objective == "l2":
+                    grad_box = torch.einsum("bchd,bche->bchde", kc, pred_box - vhat_box)
+                else:
+                    grad_box = -torch.einsum("bchd,bche->bchde", kc, vhat_box)
+
+                delta = (alpha_broad - 1.0) * w_box.unsqueeze(1) - eta_broad * (dgd_box + grad_box)
+                cdelta = torch.cumsum(delta, dim=1)
+                cum_delta[box] = cdelta
+
+                if c_len > 1:
+                    w_ret = torch.cat([w_box.unsqueeze(1), w_box.unsqueeze(1) + cdelta[:, :-1]], dim=1)
+                else:
+                    w_ret = w_box.unsqueeze(1)
+                w_retrieval[box] = w_ret
+
+            if use_qk_projection:
+                qc_proj, m_carry = apply_qk_projection(qc, kc, m_carry)
+            else:
+                qc_proj = qc
+
+            out_c = torch.einsum("bchd,bchde->bche", qc_proj, w_retrieval["memory"])
+            outs.append(out_c)
+
+            for box in HOPE_BOXES:
+                w_end = fast[box][0] + cum_delta[box][:, -1]
+                fast[box][0] = w_end if create_graph else w_end.detach()
+        else:
+            w_start = {box: [w.clone() for w in fast[box]] for box in HOPE_BOXES}
+            kc_list, vhat_dict, q_list, eta_list, alpha_list = [], {box: [] for box in HOPE_BOXES}, [], [], []
+            for t_idx in range(c_len):
+                xh = xc[:, t_idx]
+                kh = _l2norm(_sr_mlp(xh, w_start["k"]), norm_eps)
+                vh = _sr_mlp(xh, w_start["v"])
+                qh = qc[:, t_idx]
+                eta = torch.sigmoid(_sr_mlp(xh, w_start["eta"]).mean(dim=-1))
+                alpha = torch.sigmoid(_sr_mlp(xh, w_start["alpha"]).mean(dim=-1))
+                kc_list.append(kh)
+                q_list.append(qh)
+                eta_list.append(eta)
+                alpha_list.append(alpha)
+                for box in HOPE_BOXES:
+                    vhat_dict[box].append(_sr_mlp(vh, w_start[box]))
+
+            for box in HOPE_BOXES:
+                for w in w_start[box]:
+                    w.requires_grad_(True)
+
+            with torch.enable_grad():
+                grads: dict[str, list[list[torch.Tensor]]] = {box: [] for box in HOPE_BOXES}
+                for t_idx in range(c_len):
+                    kh = kc_list[t_idx]
+                    for box in HOPE_BOXES:
+                        pred_b = _sr_mlp(kh, w_start[box])
+                        vh_b = vhat_dict[box][t_idx]
+                        loss_b = ((pred_b - vh_b) ** 2).mean() if objective == "l2" else -(pred_b * vh_b).mean()
+                        g_step = list(torch.autograd.grad(loss_b, w_start[box], create_graph=create_graph, allow_unused=False))
+                        grads[box].append(g_step)
+
+            cur_fast = {box: [w if create_graph else w.detach() for w in w_start[box]] for box in HOPE_BOXES}
+            for t_idx in range(c_len):
+                qh = q_list[t_idx]
+                if use_qk_projection:
+                    qh_proj, m_carry = apply_qk_projection(qh.unsqueeze(1), kc_list[t_idx].unsqueeze(1), m_carry)
+                    outs.append(_sr_mlp(qh_proj.squeeze(1), cur_fast["memory"]))
+                else:
+                    outs.append(_sr_mlp(qh, cur_fast["memory"]))
+                eta = eta_list[t_idx]
+                alpha = alpha_list[t_idx]
+                for box in HOPE_BOXES:
+                    for i, (w_prev, g) in enumerate(zip(cur_fast[box], grads[box][t_idx])):
+                        shape = _gate_shape(eta, w_prev)
+                        w_new = alpha.view(*shape) * w_prev - eta.view(*shape) * g.to(w_prev.dtype)
+                        cur_fast[box][i] = w_new if create_graph else w_new.detach()
+            fast = cur_fast
+
+    if memory_depth == 1 and outs:
+        mem_out = torch.cat(outs, dim=1)
+    elif outs:
+        mem_out = torch.stack(outs, dim=1)
+    else:
+        mem_out = heads.new_zeros(bsz, 0, heads.shape[2], heads.shape[3])
+    return mem_out, fast
+
+
+def self_referential_titan(
+    heads: torch.Tensor,
+    q_all: torch.Tensor,
+    fast_init_state: dict[str, list[torch.Tensor]],
+    backend: str = "naive",
+    chunk_size: int = 64,
+    memory_depth: int = 1,
+    objective: str = "l2",
+    norm_eps: float = 1e-6,
+    create_graph: bool = False,
+    use_qk_projection: bool = False,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    r"""self_referential_titan(...) -> (mem_out, final_fast)
+
+    MultiHead Self-Referential Titan functional dispatcher.
+    ``backend in ("naive", "recurrent")`` -> :func:`self_referential_titan_recurrent_forward`
+    ``backend in ("chunk", "tnt", "wy_fast")`` -> :func:`self_referential_titan_chunk_forward`
+    """
+    if backend in ("naive", "recurrent"):
+        return self_referential_titan_recurrent_forward(
+            heads,
+            q_all,
+            fast_init_state,
+            chunk_size=chunk_size,
+            memory_depth=memory_depth,
+            objective=objective,
+            norm_eps=norm_eps,
+            create_graph=create_graph,
+        )
+    if backend in ("chunk", "tnt", "wy_fast"):
+        return self_referential_titan_chunk_forward(
+            heads,
+            q_all,
+            fast_init_state,
+            chunk_size=chunk_size,
+            memory_depth=memory_depth,
+            objective=objective,
+            norm_eps=norm_eps,
+            create_graph=create_graph,
+            use_qk_projection=use_qk_projection,
+        )
+    raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
+
+
 class SelfReferentialTitanMemory(nn.Module):
     r"""SelfReferentialTitanMemory(...) — self-modifying Titans (Sec. 8.1, Eq. 86-89).
 
@@ -537,8 +868,15 @@ class SelfReferentialTitanMemory(nn.Module):
         conv_kernel_size: int = 4,
         norm_eps: float = 1e-6,
         init_std: float = 0.02,
+        backend: str = "naive",
+        chunk_size: int = 64,
+        use_qk_projection: bool = False,
     ) -> None:
         super().__init__()
+        if backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
+            raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if hidden_size <= 0 or num_heads <= 0:
             raise ValueError("hidden_size/num_heads must be positive")
         if hidden_size % num_heads != 0:
@@ -556,6 +894,9 @@ class SelfReferentialTitanMemory(nn.Module):
         self.use_short_conv = use_short_conv
         self.norm_eps = norm_eps
         self.init_std = init_std
+        self.backend = backend
+        self.chunk_size = chunk_size
+        self.use_qk_projection = use_qk_projection
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         if use_short_conv:
             self.input_conv = ShortConvolution(hidden_size=hidden_size, kernel_size=conv_kernel_size, bias=False)
@@ -652,6 +993,16 @@ class SelfReferentialTitanMemory(nn.Module):
         shape = _gate_shape(eta, w)
         return alpha.view(*shape) * w - eta.view(*shape) * dgd - eta.view(*shape) * grad
 
+    @property
+    def head_k_dim(self) -> int:
+        """Key head dimension."""
+        return self.head_dim
+
+    @property
+    def head_v_dim(self) -> int:
+        """Value head dimension."""
+        return self.head_dim
+
     def forward(
         self,
         x: torch.Tensor,
@@ -685,41 +1036,22 @@ class SelfReferentialTitanMemory(nn.Module):
         else:
             fast = {box: [w.to(device=x.device, dtype=q_all.dtype) for w in state["fast_weights"][box]] for box in HOPE_BOXES}
         total = q_all.shape[1]
-        width = total if chunk_size is None else chunk_size
-        outs: list[torch.Tensor] = []
-        for pos in range(0, total, width):
-            for t in range(pos, min(pos + width, total)):
-                xh = heads[:, t]
-                kh = _l2norm(_sr_mlp(xh, fast["k"]), self.norm_eps)
-                vh = _sr_mlp(xh, fast["v"])
-                qh = q_all[:, t]
-                eta = self._box_scalars(_sr_mlp(xh, fast["eta"]))
-                alpha = self._box_scalars(_sr_mlp(xh, fast["alpha"]))
-                vhat = {box: _sr_mlp(vh, fast[box]) for box in HOPE_BOXES}
-                outs.append(_sr_mlp(qh, fast["memory"]))
-                if self.memory_depth == 1:
-                    for box in HOPE_BOXES:
-                        w_old = fast[box][0]
-                        fast[box][0] = self._update_linear_box(w_old, kh, vhat[box], eta, alpha)
-                        if not create_graph:
-                            fast[box][0] = fast[box][0].detach()
-                else:
-                    for box in HOPE_BOXES:
-                        for w in fast[box]:
-                            w.requires_grad_(True)
-                    with torch.enable_grad():
-                        grads: dict[str, list[torch.Tensor]] = {}
-                        for box in HOPE_BOXES:
-                            pred_b = _sr_mlp(kh, fast[box])
-                            loss_b = ((pred_b - vhat[box]) ** 2).mean() if self.objective == "l2" else -(pred_b * vhat[box]).mean()
-                            grads[box] = list(torch.autograd.grad(loss_b, fast[box], create_graph=create_graph, allow_unused=False))
-                    for box in HOPE_BOXES:
-                        for i, (w_prev, g) in enumerate(zip(fast[box], grads[box])):
-                            w = w_prev if create_graph else w_prev.detach()
-                            shape = _gate_shape(eta, w)
-                            w_new = alpha.view(*shape) * w - eta.view(*shape) * g.to(w.dtype)
-                            fast[box][i] = w_new if create_graph else w_new.detach()
-        mem_out = torch.stack(outs, dim=1).reshape(bsz, total, self.hidden_size).to(x.dtype)
+        width = self.chunk_size if chunk_size is None else chunk_size
+        if width is not None and width <= 0:
+            width = total
+        mem_out, fast = self_referential_titan(
+            heads,
+            q_all,
+            fast,
+            backend=self.backend,
+            chunk_size=width,
+            memory_depth=self.memory_depth,
+            objective=self.objective,
+            norm_eps=self.norm_eps,
+            create_graph=create_graph,
+            use_qk_projection=self.use_qk_projection,
+        )
+        mem_out = mem_out.reshape(bsz, total, self.hidden_size).to(x.dtype)
         gated = self.out_norm(mem_out) * F.silu(self.gate_proj(x).to(mem_out.dtype))
         out = self.o_proj(gated.to(x.dtype)) + x
         cache = None
@@ -788,6 +1120,8 @@ class SelfReferentialTitanMixer(nn.Module):
         use_short_conv: bool | None = None,
         conv_kernel_size: int | None = None,
         chunk_size: int | None = None,
+        backend: str | None = None,
+        use_qk_projection: bool | None = None,
     ) -> None:
         super().__init__()
         memory_depth = config.titan_memory_depth if memory_depth is None else memory_depth
@@ -795,17 +1129,20 @@ class SelfReferentialTitanMixer(nn.Module):
         objective = config.titan_objective if objective is None else objective
         use_short_conv = config.titan_use_short_conv if use_short_conv is None else use_short_conv
         conv_kernel_size = config.titan_conv_kernel_size if conv_kernel_size is None else conv_kernel_size
+        resolved_backend = getattr(config, "titan_backend", "naive") if backend is None else backend
+        resolved_qk_proj = getattr(config, "titan_use_qk_projection", False) if use_qk_projection is None else use_qk_projection
         if chunk_size is None and config.titan_chunk_size:
             chunk_size = config.titan_chunk_size
-        if chunk_size is not None and chunk_size <= 0:
-            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        resolved_chunk_size = chunk_size if chunk_size is not None else 64
+        if resolved_chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {resolved_chunk_size}")
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
         self.head_dim = self.hidden_size // self.num_heads
-        self.chunk_size = chunk_size
+        self.chunk_size = resolved_chunk_size
         self.memory = SelfReferentialTitanMemory(
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
@@ -816,7 +1153,30 @@ class SelfReferentialTitanMixer(nn.Module):
             conv_kernel_size=conv_kernel_size,
             norm_eps=config.rms_norm_eps,
             init_std=config.initializer_range,
+            backend=resolved_backend,
+            chunk_size=resolved_chunk_size,
+            use_qk_projection=resolved_qk_proj,
         )
+
+    @property
+    def layer(self) -> SelfReferentialTitanMemory:
+        """Alias for the underlying memory layer, matching GatedDeltaNet2Mixer.layer."""
+        return self.memory
+
+    @property
+    def backend(self) -> str:
+        """Backend for fast weights ('naive', 'recurrent', 'chunk', 'tnt', 'wy_fast')."""
+        return self.memory.backend
+
+    @property
+    def head_dim_k(self) -> int:
+        """Key head dimension."""
+        return self.head_dim
+
+    @property
+    def head_dim_v(self) -> int:
+        """Value head dimension."""
+        return self.head_dim
 
     def reset_parameters(self) -> None:
         """reset_parameters() -> None — re-init the wrapped memory."""

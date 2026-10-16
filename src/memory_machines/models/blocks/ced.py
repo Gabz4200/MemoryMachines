@@ -45,7 +45,7 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .compression import BlockCompressor
 from .ffn import DenseFFN
-from .mhc_parallel import MHCAttentionGDN2, from_streams, to_streams
+from .mhc_parallel import MHCAttentionGDN2, MHCAttentionTitan, from_streams, to_streams
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention2
 
@@ -295,7 +295,13 @@ class CausalEncoderDecoderStack(nn.Module):
         if encoder_layers is not None:
             enc = list(encoder_layers)
         elif config.ced_attention_gdn2_parallel:
-            enc = [MHCAttentionGDN2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
+            enc: list[nn.Module] = []
+            for i in range(enc_n):
+                mode = "full" if i == 0 else "reuse"
+                if config.ced_encoder_alternating and i % 2 == 1:
+                    enc.append(MHCAttentionTitan(config, config.csa_encoder_compression_ratio, mode))
+                else:
+                    enc.append(MHCAttentionGDN2(config, config.csa_encoder_compression_ratio, mode))
         else:
             enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
         self.encoder_layers = nn.ModuleList(enc)
@@ -394,7 +400,7 @@ class CausalEncoderDecoderStack(nn.Module):
         for layer in layers:
             if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
                 raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
-        if layers and all(isinstance(layer, MHCAttentionGDN2) for layer in layers):
+        if layers and any(isinstance(layer, MHCAttentionGDN2) for layer in layers):
             x, shared = _run_stream_layers(cast("list[MHCAttentionGDN2]", layers), hidden_states, None, self.config.mhc_num_streams, position_ids, seeded_store=False, ffns=ffns)
         else:
             for i, layer in enumerate(cast("list[CompressedSparseAttention2]", layers)):

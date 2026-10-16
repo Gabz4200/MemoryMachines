@@ -89,6 +89,10 @@ class MemoryMachineConfig:
             layers). The decoder stays plain CSA2: GDN-2 reaches it only
             indirectly, through the encoder's global KV (Eq. 1). Default:
             True.
+        ced_encoder_alternating: In the CED encoder, alternate between
+            parallel Attention ∥ GDN-2 (even layers) and parallel
+            Attention ∥ SelfReferentialTitans (odd layers) mixed by mHC.
+            Default: True.
         ced_attention_variant: MultiHead SWA variant for the encoder
             attention branch: ``dense`` (GroupedQueryAttention),
             ``compressed``, ``compressed_sparse`` (default), or
@@ -180,6 +184,12 @@ class MemoryMachineConfig:
             Default: ``4``.
         titan_chunk_size: Titans state-carry chunk width; ``0`` means the
             whole sequence. Default: ``0``.
+        titan_backend: Backend for Titans fast weights: "naive"/"recurrent"
+            (token-by-token recurrence) or "chunk"/"tnt"/"wy_fast" (TNT
+            chunkwise parallel training, arXiv:2511.07343). Default: "naive".
+        titan_use_qk_projection: In TNT chunkwise mode, project retrieval queries
+            onto the running key subspace (arXiv:2511.07343 Sec. 4.1.2).
+            Default: False.
         cms_ffn: Dense FFN kind for every Continuum Memory System level
             (``"swiglu"`` or ``"classic_mlp"``). Default: ``"swiglu"``.
         cms_norm: Pre-norm kind for every CMS level
@@ -238,6 +248,7 @@ class MemoryMachineConfig:
     ced_num_encoder_layers: int = 20
     ced_num_decoder_layers: int = 20
     ced_attention_gdn2_parallel: bool = True
+    ced_encoder_alternating: bool = True
     ced_attention_variant: str = "compressed_sparse"
     ced_encoder_ffn: str = "swiglu"
     ced_decoder_ffn: str = "swiglu"
@@ -275,6 +286,8 @@ class MemoryMachineConfig:
     titan_use_short_conv: bool = True
     titan_conv_kernel_size: int = 4
     titan_chunk_size: int = 0
+    titan_backend: str = "naive"
+    titan_use_qk_projection: bool = False
     cms_ffn: str = "swiglu"
     cms_norm: str = "dyT"
     seed: int = 0
@@ -417,6 +430,8 @@ class MemoryMachineConfig:
             raise ValueError(f"titan_conv_kernel_size ({self.titan_conv_kernel_size}) must be positive")
         if self.titan_chunk_size < 0:
             raise ValueError(f"titan_chunk_size ({self.titan_chunk_size}) must be non-negative (0 = whole sequence)")
+        if self.titan_backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
+            raise ValueError(f"titan_backend ({self.titan_backend!r}) must be one of 'naive', 'recurrent', 'chunk', 'tnt', 'wy_fast'")
         if self.cms_ffn not in ("swiglu", "classic_mlp"):
             raise ValueError(f"cms_ffn ({self.cms_ffn!r}) must be 'swiglu' or 'classic_mlp'")
         if self.cms_norm not in ("rmsnorm", "layernorm", "dyT"):

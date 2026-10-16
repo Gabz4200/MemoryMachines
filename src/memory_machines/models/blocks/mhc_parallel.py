@@ -28,12 +28,13 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .attention import GroupedQueryAttention
+from .fast_weights import SelfReferentialTitanMixer
 from .gdn2 import GatedDeltaNet2Mixer
 from .memory import SinglePassMHC
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention, CompressedSparseAttention2, HeavilyCompressedAttention
 
-__all__ = ["MHCAttentionGDN2", "from_streams", "to_streams"]
+__all__ = ["MHCAttentionGDN2", "MHCAttentionTitan", "from_streams", "to_streams"]
 
 
 # variant -> (config window attribute, builder). Each attention variant is
@@ -211,7 +212,18 @@ class MHCAttentionGDN2(nn.Module):
         self.attention_variant = variant if variant is not None else config.ced_attention_variant
         resolved_window = window_size if window_size is not None else getattr(config, _variant_window_attr(self.attention_variant))
         self.attention = _build_attention(self.attention_variant, config, compression_ratio, mode, top_k, resolved_window)
-        self.gdn2 = GatedDeltaNet2Mixer(
+        self.gdn2: GatedDeltaNet2Mixer | SelfReferentialTitanMixer = self._build_branch(config)
+        self.mhc = SinglePassMHC(config, parallel_branches=True)
+        self.reset_parameters()
+
+    def _build_branch(self, config: MemoryMachineConfig) -> GatedDeltaNet2Mixer | SelfReferentialTitanMixer:
+        r"""_build_branch(config) -> GatedDeltaNet2Mixer
+
+        Build the second parallel branch (default: GDN-2). Subclasses
+        override to swap in a different memory module; the returned object
+        is assigned to :attr:`gdn2` so :meth:`forward_shared` is shared.
+        """
+        return GatedDeltaNet2Mixer(
             config,
             num_v_heads=config.ced_gdn2_num_v_heads or None,
             expand_v=config.ced_gdn2_expand_v,
@@ -224,8 +236,6 @@ class MHCAttentionGDN2(nn.Module):
             beta_guard=config.ced_gdn2_beta_guard,
             use_resting_state=config.ced_gdn2_use_resting_state,
         )
-        self.mhc = SinglePassMHC(config, parallel_branches=True)
-        self.reset_parameters()
 
     @property
     def mode(self) -> str | None:
@@ -324,3 +334,44 @@ class MHCAttentionGDN2(nn.Module):
         """
         out, _, _ = self.forward_shared(streams, shared, prev_a, **kwargs)
         return out
+
+
+class MHCAttentionTitan(MHCAttentionGDN2):
+    r"""MHCAttentionTitan(config, compression_ratio=None, mode="full", top_k=None, variant=None, window_size=None)
+
+    Parallel attention ∥ MultiHead SelfReferentialTitans encoder layer routed by Single-Pass mHC.
+
+    Alternates with :class:`MHCAttentionGDN2` in the CED encoder stack:
+    runs a MultiHead sliding-window attention variant in parallel with a
+    MultiHead :class:`~memory_machines.models.blocks.fast_weights.SelfReferentialTitanMixer`,
+    routed by :class:`~memory_machines.models.blocks.memory.SinglePassMHC`
+    over persistent residual streams. Subclass of :class:`MHCAttentionGDN2` so
+    existing ``isinstance(layer, MHCAttentionGDN2)`` checks still hold; only
+    the second branch is swapped.
+
+    Args:
+        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
+            provides model hyperparameters, attention variant, and Titans configurations.
+        compression_ratio (int, optional): attention block size ``m``. Default: ``None``.
+        mode (str, optional): CSA2 sharing mode (``full``/``reindex``/``reuse``). Default: ``"full"``.
+        top_k (int, optional): entries per query. Default: ``None``.
+        variant (str, optional): attention variant override. Default: ``None``.
+        window_size (int, optional): attention SWA width override. Default: ``None``.
+    """
+
+    def _build_branch(self, config: MemoryMachineConfig) -> GatedDeltaNet2Mixer | SelfReferentialTitanMixer:
+        r"""_build_branch(config) -> SelfReferentialTitanMixer
+
+        Build the SelfReferentialTitans branch (the GDN-2 override).
+        """
+        return SelfReferentialTitanMixer(
+            config,
+            memory_depth=config.titan_memory_depth,
+            fast_expansion=config.titan_fast_expansion,
+            objective=config.titan_objective,
+            use_short_conv=config.titan_use_short_conv,
+            conv_kernel_size=config.titan_conv_kernel_size,
+            chunk_size=config.titan_chunk_size if config.titan_chunk_size else None,
+            backend=config.titan_backend,
+            use_qk_projection=config.titan_use_qk_projection,
+        )
