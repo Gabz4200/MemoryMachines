@@ -16,6 +16,7 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
+from .dyt import DyT
 from .shared import residual_init_scale
 
 
@@ -138,6 +139,40 @@ def build_ffn(config: MemoryMachineConfig, kind: str, intermediate_size: int | N
     return _FFN_REGISTRY[kind](config, intermediate_size=intermediate_size)
 
 
+_NORMALIZATION_REGISTRY: dict[str, Callable[..., nn.Module]] = {"rmsnorm": nn.RMSNorm, "layernorm": nn.LayerNorm, "dyT": DyT}
+
+
+def build_norm(kind: str, hidden_size: int, eps: float | None = None) -> nn.Module:
+    r"""build_norm(kind, hidden_size, eps=None) -> nn.Module
+
+    Construct a normalization layer of the named ``kind``.
+
+    Args:
+        kind (str): registered normalization kind (currently ``"rmsnorm"``,
+            ``"layernorm"``, or ``"dyT"``).
+        hidden_size (int): trailing dimension size for the normalization.
+        eps (float, optional): epsilon for numerical stability; if ``None``,
+            the default for the selected kind is used.
+    Returns:
+        nn.Module: the constructed normalization layer.
+
+    Examples::
+
+        >>> build_norm("rmsnorm", 32).weight.shape
+        torch.Size([32])
+        >>> build_norm("layernorm", 32).weight.shape
+        torch.Size([32])
+        >>> build_norm("dyT", 32).saturation.shape
+        torch.Size([1, 32])
+    """
+    if kind not in _NORMALIZATION_REGISTRY:
+        raise ValueError(f"unknown normalization kind {kind!r}; known kinds: {sorted(_NORMALIZATION_REGISTRY)}")
+    if eps is not None and kind != "dyT":
+        return _NORMALIZATION_REGISTRY[kind](hidden_size, eps=eps)
+    else:
+        return _NORMALIZATION_REGISTRY[kind](hidden_size)
+
+
 class DenseFFN(nn.Module):
     r"""DenseFFN(config, kind="swiglu", intermediate_size=None)
 
@@ -171,10 +206,10 @@ class DenseFFN(nn.Module):
         torch.Size([2, 5, 32])
     """
 
-    def __init__(self, config: MemoryMachineConfig, kind: str = "swiglu", intermediate_size: int | None = None):
+    def __init__(self, config: MemoryMachineConfig, kind: str = "swiglu", norm_kind: str = "dyT", intermediate_size: int | None = None):
         super().__init__()
         self.kind = kind
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = build_norm(norm_kind, config.hidden_size, eps=config.rms_norm_eps)
         self.ffn = build_ffn(config, kind, intermediate_size)
         self.reset_parameters()
 
@@ -185,10 +220,14 @@ class DenseFFN(nn.Module):
         freshly built FFN starts as an identity residual branch (zero-start or
         depth-scaled output projection).
         """
-        nn.init.ones_(self.norm.weight)
-        reset = getattr(self.ffn, "reset_parameters", None)
-        if callable(reset):
-            reset()
+        reset_ffn = getattr(self.ffn, "reset_parameters", None)
+
+        if callable(reset_ffn):
+            reset_ffn()
+
+        reset_norm = getattr(self.norm, "reset_parameters", None)
+        if callable(reset_norm):
+            reset_norm()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""forward(x) -> Tensor
