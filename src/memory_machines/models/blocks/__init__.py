@@ -30,6 +30,7 @@ from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
 from .positioning import CVPEContextBias, FRVMValueGate
+from .rkan import JacobiRKAN, PadeRKAN
 from .shared import (
     CompressedCache,
     CSA2SharedState,
@@ -74,10 +75,12 @@ __all__ = [
     "HeavilyCompressedAttention",
     "HopeAttentionBlock",
     "HopeBlock",
+    "JacobiRKAN",
     "LivConvBlock",
     "LivDoubleGatedBase",
     "LivPerceiver",
     "NativeSparseAttention",
+    "PadeRKAN",
     "SelfReferentialTitanMemory",
     "SelfReferentialTitanMixer",
     "ShortConvolution",
