@@ -87,8 +87,8 @@ def test_chunk_vs_recurrent_grad_agreement():
     q, k, v, g, b, w = _inputs(B=1, T=6, H=1, HV=2, K=4, V=3, seed=13)
     rec = [t.clone().detach().requires_grad_(True) for t in (q, k, v, g, b, w)]
     wy = [t.clone().detach().requires_grad_(True) for t in (q, k, v, g, b, w)]
-    o_rec, _ = G.gated_delta_rule_2_recurrent_forward(*rec)
-    o_wy, _ = G.gated_delta_rule_2_chunk_forward(*wy, chunk_size=2)
+    o_rec, _ = G.gated_delta_rule_2_recurrent_forward(rec[0], rec[1], rec[2], rec[3], rec[4], rec[5])
+    o_wy, _ = G.gated_delta_rule_2_chunk_forward(wy[0], wy[1], wy[2], wy[3], wy[4], wy[5], chunk_size=2)
     gr = torch.autograd.grad(o_rec.sum(), rec)
     gw = torch.autograd.grad(o_wy.sum(), wy)
     for a, c in zip(gr, gw):

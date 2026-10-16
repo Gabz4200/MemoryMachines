@@ -80,7 +80,7 @@ class ShortConvolution(nn.Conv1d):
     def _weight_dw(self) -> torch.Tensor:
         return self.weight.reshape(self.hidden_size, self.kernel_size[0])
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,

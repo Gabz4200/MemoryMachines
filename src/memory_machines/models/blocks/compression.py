@@ -107,7 +107,7 @@ class BlockCompressor(nn.Module):
             >>> comp = BlockCompressor(16, 2, 8, compression_ratio=4)
             >>> kv, ends = comp(torch.randn(2, 6, 16), start_pos=10)
             >>> kv.shape, ends.tolist()
-            (torch.Size([2, 2, 2, 8]), [13, 17])
+            (torch.Size([2, 2, 2, 8]), [13, 15])
         """
         bsz, seqlen, _ = hidden_states.shape
         if seqlen == 0:

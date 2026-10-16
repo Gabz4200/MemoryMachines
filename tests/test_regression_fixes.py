@@ -4,18 +4,18 @@ Each test fails on the pre-fix code and passes after. Deterministic:
 global seed + deterministic algorithms where applicable.
 """
 
+import contextlib
+
 import torch
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-try:
+with contextlib.suppress(AttributeError):  # older torch without the cuda.matmul backend
     torch.backends.cuda.matmul.allow_tf32 = False
-except Exception:
-    pass
 
 
 def test_ops_package_reexports():
-    import memory_machines.ops as ops
+    from memory_machines import ops
 
     for name in ("dispatch_dw_scale", "dispatch_causal_conv1d", "dispatch_causal_conv1d_update", "dw_scale"):
         assert hasattr(ops, name), f"ops.{name} missing from re-exports"
@@ -47,9 +47,8 @@ def test_dw_scale_validation():
 
 
 def test_attention_bidirectional_window():
-    from tests.test_blocks_shapes import tiny_cfg
-
     from memory_machines.models.blocks import GroupedQueryAttention
+    from tests.test_blocks_shapes import tiny_cfg
 
     torch.manual_seed(0)
     import dataclasses
@@ -161,9 +160,8 @@ def test_ced_seeded_default_and_zip_guard():
 
 
 def test_sparse_batched_comp_ends():
-    from tests.test_blocks_shapes import tiny_cfg
-
     from memory_machines.models.blocks import CompressedSparseAttention
+    from tests.test_blocks_shapes import tiny_cfg
 
     torch.manual_seed(0)
     layer = CompressedSparseAttention(tiny_cfg()).eval()
@@ -248,9 +246,9 @@ def test_ssd_table_validation_and_engram_neg_ids():
 
     import pytest
 
+    from memory_machines.models.blocks import EngramMemory
     from memory_machines.models.blocks.memory import _SsdTable
     from memory_machines.utils.config_schema import MemoryMachineConfig
-    from memory_machines.models.blocks import EngramMemory
 
     with tempfile.TemporaryDirectory() as d:
         t = _SsdTable(Path(d) / "t.bin", 6, 3)

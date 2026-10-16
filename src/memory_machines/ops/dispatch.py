@@ -33,7 +33,7 @@ _VALID_BACKENDS = ("naive", "cpu", "gpu", "taichi", "compiled")
 
 def _normalize_backend(backend: str) -> str:
     if not isinstance(backend, str):
-        raise ValueError(f"Unknown backend: {backend!r}. Valid: {list(_VALID_BACKENDS)}")
+        raise TypeError(f"backend must be a str, got {type(backend).__name__}")
     norm = backend.strip().lower()
     if norm not in _VALID_BACKENDS:
         raise ValueError(f"Unknown backend: '{backend}'. Valid: {list(_VALID_BACKENDS)}")

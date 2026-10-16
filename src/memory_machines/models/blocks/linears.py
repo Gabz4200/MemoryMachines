@@ -212,7 +212,7 @@ class ChunkedBottleneckLinear(nn.Module):
             # 1/sqrt(R) (fan-in R) so product variance is 1/G (variance-matched).
             in_std = 1 / math.sqrt(self.num_blocks)
             out_std = 1 / math.sqrt(self.bottleneck_dim)
-            mods = list(self.mixer)
+            mods = [m for m in self.mixer if isinstance(m, nn.Linear)]
             nn.init.trunc_normal_(mods[0].weight, mean=0.0, std=in_std, a=-2 * in_std, b=2 * in_std)
             nn.init.trunc_normal_(mods[1].weight, mean=0.0, std=out_std, a=-2 * out_std, b=2 * out_std)
         if self.bias is not None:

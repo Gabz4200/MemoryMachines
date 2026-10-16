@@ -309,7 +309,7 @@ def _check_shapes(
         bounds = cu_seqlens.tolist()
         if not bounds or bounds[0] != 0:
             raise ValueError(f"cu_seqlens must start at 0, got {bounds[:3] if bounds else bounds}")
-        if any(b < a for a, b in zip(bounds, bounds[1:])):
+        if any(b < a for a, b in itertools.pairwise(bounds)):
             raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
         if int(cu_seqlens[-1].item()) != T:
             raise ValueError(f"cu_seqlens must end at T={T}, got {int(cu_seqlens[-1].item())}")

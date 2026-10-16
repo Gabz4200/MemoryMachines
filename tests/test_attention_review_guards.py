@@ -10,9 +10,9 @@ import pytest
 import torch
 
 from memory_machines.models.blocks.attention import (
+    GroupedQueryAttention,
     _apply_masks_and_softmax,
     _prepare_attention_mask,
-    GroupedQueryAttention,
 )
 from tests.test_blocks_shapes import tiny_cfg
 
@@ -77,21 +77,21 @@ def test_apply_masks_and_softmax_four_way():
     out_a = _apply_masks_and_softmax(attn, q_pos, k_pos, 3, True, True)
     keep_a = torch.tensor([[[[False, False, True, True, True], [False, False, False, True, True], [False, False, False, False, True]]]])
     assert bool(torch.isneginf(out_a[~keep_a]).all())
-    assert bool(((out_a[keep_a] == 0).all()))
+    assert bool((out_a[keep_a] == 0).all())
     # (b) windowed + non-causal: |q-k| < 3 (no future keys here, same keep).
     out_b = _apply_masks_and_softmax(attn, q_pos, k_pos, 3, False, True)
     rel = q_pos.unsqueeze(-1) - k_pos.unsqueeze(1)
     keep_b = (rel.abs() < 3).unsqueeze(1)
     assert torch.equal(keep_b, keep_a)
     assert bool(torch.isneginf(out_b[~keep_b]).all())
-    assert bool(((out_b[keep_b] == 0).all()))
+    assert bool((out_b[keep_b] == 0).all())
     # (c) full + causal: k <= q (all keep here since k<=4<=q).
     out_c = _apply_masks_and_softmax(attn, q_pos, k_pos, 3, True, False)
-    assert bool(((out_c == 0).all()))
+    assert bool((out_c == 0).all())
     assert not bool(torch.isneginf(out_c).any())
     # (d) full + non-causal: unchanged.
     out_d = _apply_masks_and_softmax(attn, q_pos, k_pos, 3, False, False)
-    assert bool(((out_d == 0).all()))
+    assert bool((out_d == 0).all())
     assert not bool(torch.isneginf(out_d).any())
 
 
@@ -246,7 +246,7 @@ def test_prepare_attention_mask_bool_broadcast_dtype_parity():
     assert out_3d.device == logits.device
     assert tuple(out_3d.shape) == (2, 1, 1, 5)
     assert bool(torch.isneginf(out_3d[..., 3:]).all())
-    assert bool(((out_3d[..., :3] == 0).all()))
+    assert bool((out_3d[..., :3] == 0).all())
     mask_4d = torch.zeros(1, 1, 3, 5, dtype=torch.bool)
     mask_4d[..., 0] = True
     out_4d = _prepare_attention_mask(mask_4d, 2, 3, 5, 4, logits)
@@ -254,7 +254,7 @@ def test_prepare_attention_mask_bool_broadcast_dtype_parity():
     assert out_4d.dtype == torch.float16
     assert out_4d.device == logits.device
     assert bool(torch.isneginf(out_4d[..., 0]).all())
-    assert bool(((out_4d[..., 1:] == 0).all()))
+    assert bool((out_4d[..., 1:] == 0).all())
 
 
 def test_window_size_1_noncausal_diagonal_only():

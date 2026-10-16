@@ -338,6 +338,7 @@ def test_module_dense_forward_matches_reference():
     B, T, D, W = 2, 6, 4, 3
     for activation in (None, "silu", "swish"):
         conv = ShortConvolution(hidden_size=D, kernel_size=W, bias=True, activation=activation).double()
+        assert conv.bias is not None
         x = _d64(B, T, D)
         residual = _d64(B, T, D)
         y, final = conv(x, residual=residual)
@@ -479,6 +480,7 @@ def test_module_packed_forward_parity():
     torch.manual_seed(51)
     D, W = 3, 3
     conv = ShortConvolution(hidden_size=D, kernel_size=W, bias=True, activation="silu").double().eval()
+    assert conv.bias is not None
     s1 = _d64(2, D)
     s2 = _d64(5, D)
     packed = torch.cat([s1, s2], dim=0).unsqueeze(0)
@@ -526,6 +528,7 @@ def test_module_kernel_size_1_degenerate():
     torch.manual_seed(54)
     D = 3
     conv = ShortConvolution(hidden_size=D, kernel_size=1, bias=True, activation=None).double()
+    assert conv.bias is not None
     x = _d64(2, 5, D)
     y, _ = conv(x)
     w = conv.weight.reshape(D).detach()

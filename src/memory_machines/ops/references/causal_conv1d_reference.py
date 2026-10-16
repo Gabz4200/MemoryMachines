@@ -19,6 +19,8 @@ Semantics mirror ``fla.modules.causal_conv1d`` / Dao-AILab ``causal-conv1d``:
   matching FLA's Canon ordering (residual added to the activated conv output).
 """
 
+import itertools
+
 import torch
 import torch.nn.functional as F
 
@@ -46,7 +48,7 @@ def _check_cu_seqlens(cu_seqlens: torch.Tensor, total_len: int) -> list[int]:
     bounds = cu_seqlens.tolist()
     if not bounds or bounds[0] != 0:
         raise ValueError(f"cu_seqlens must start at 0, got {bounds[:3] if bounds else bounds}")
-    if any(b < a for a, b in zip(bounds, bounds[1:])):
+    if any(b < a for a, b in itertools.pairwise(bounds)):
         raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
     if bounds[-1] != total_len:
         raise ValueError(f"cu_seqlens must end at L={total_len}, got {bounds[-1]}")

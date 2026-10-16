@@ -73,7 +73,7 @@ def test_chunk_vs_recurrent_agree_with_resting_and_grad():
     o_wy, _ = G.gated_delta_rule_2_chunk_forward(q, k, v, g, b, w, chunk_size=3, resting_state=s0)
     torch.testing.assert_close(o_wy, o_rec, atol=1e-10, rtol=1e-10)
     rec = [t.clone().detach().requires_grad_(True) for t in (q, k, v, g, b, w)] + [s0.clone().detach().requires_grad_(True)]
-    o, _ = G.gated_delta_rule_2_chunk_forward(*rec[:6], chunk_size=2, resting_state=rec[6])
+    o, _ = G.gated_delta_rule_2_chunk_forward(rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], chunk_size=2, resting_state=rec[6])
     grads = torch.autograd.grad(o.sum(), rec)
     for t in grads:
         assert t is not None and torch.isfinite(t).all()
@@ -95,6 +95,7 @@ def test_idle_state_relaxes_to_resting():
     }
     _, s_rec = G.gated_delta_rule_2_recurrent_forward(q, output_final_state=True, resting_state=s0, scale=1.0, **kw)
     _, s_wy = G.gated_delta_rule_2_chunk_forward(q, output_final_state=True, resting_state=s0, scale=1.0, chunk_size=2, **kw)
+    assert s_rec is not None and s_wy is not None
     torch.testing.assert_close(s_rec[0], s0, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(s_wy[0], s0, atol=1e-9, rtol=1e-9)
 

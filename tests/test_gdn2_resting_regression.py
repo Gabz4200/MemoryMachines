@@ -140,16 +140,18 @@ def test_07_resting_packed_matches_segments(backend):
     cu = torch.tensor([0, lens[0], T])
     fwd = G.gated_delta_rule_2_recurrent_forward if backend == "recurrent" else (lambda *a, **kw: G.gated_delta_rule_2_chunk_forward(*a, chunk_size=2, **kw))
     o_pack, s_pack = fwd(q, k, v, g, b, w, cu_seqlens=cu, initial_state=s_init, resting_state=s0, output_final_state=True)
+    assert s_pack is not None
     for i, (s, e) in enumerate([(0, 5), (5, 8)]):
         oi, si = fwd(q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], b[:, s:e], w[:, s:e], initial_state=s_init[i : i + 1], resting_state=s0, output_final_state=True)
         torch.testing.assert_close(o_pack[0, s:e], oi[0], atol=1e-10, rtol=1e-10)
+        assert si is not None
         torch.testing.assert_close(s_pack[i : i + 1], si, atol=1e-10, rtol=1e-10)
 
 
 def test_08_recurrent_grad_to_resting():
     q, k, v, g, b, w, s0 = _mk(T=4, seed=19)
     req = [t.clone().detach().requires_grad_(True) for t in (q, k, v, g, b, w, s0)]
-    o, _ = G.gated_delta_rule_2_recurrent_forward(*req[:6], resting_state=req[6])
+    o, _ = G.gated_delta_rule_2_recurrent_forward(req[0], req[1], req[2], req[3], req[4], req[5], resting_state=req[6])
     grads = torch.autograd.grad(o.sum(), req)
     assert len(grads) == 7
     for t in grads:
@@ -242,9 +244,11 @@ def test_15_mixed_dtype_casts_to_input_dtype():
     # outputs/state back to q.dtype; assert that actual contract.
     q, k, v, g, b, w, s0 = _mk(seed=27)
     o, s = G.gated_delta_rule_2_recurrent_forward(q.float(), k.float(), v.float(), g.float(), b.float(), w.float(), resting_state=s0, output_final_state=True)
+    assert s is not None
     assert o.dtype == torch.float32 and s.dtype == torch.float32
     assert torch.isfinite(o).all()
     o2, s2 = G.gated_delta_rule_2_recurrent_forward(q, k, v, g, b, w, resting_state=s0.float(), output_final_state=True)
+    assert s2 is not None
     assert o2.dtype == torch.float64 and s2.dtype == torch.float64
     assert torch.isfinite(o2).all()
     o3, _ = G.gated_delta_rule_2_chunk_forward(q.float(), k.float(), v.float(), g.float(), b.float(), w.float(), chunk_size=2, resting_state=s0)
@@ -370,6 +374,7 @@ def test_22_t_one_closed_form_with_resting():
     for fn in (G.gated_delta_rule_2_recurrent_forward, lambda *a, **kw: G.gated_delta_rule_2_chunk_forward(*a, chunk_size=1, **kw)):
         o, st = fn(q, k, v, g, b, w, scale=1.0, resting_state=s0, output_final_state=True)
         torch.testing.assert_close(o, expected, atol=1e-12, rtol=1e-12)
+        assert st is not None
         torch.testing.assert_close(st[0, 0], s, atol=1e-12, rtol=1e-12)
 
 
@@ -388,9 +393,11 @@ def test_24_batch_two_with_resting():
     o_ch, s_ch = G.gated_delta_rule_2_chunk_forward(q, k, v, g, b, w, chunk_size=2, **kw)
     torch.testing.assert_close(o_ch, o_rec, atol=1e-10, rtol=1e-10)
     torch.testing.assert_close(s_ch, s_rec, atol=1e-10, rtol=1e-10)
+    assert s_rec is not None
     for i in range(2):
         oi, si = G.gated_delta_rule_2_recurrent_forward(q[i : i + 1], k[i : i + 1], v[i : i + 1], g[i : i + 1], b[i : i + 1], w[i : i + 1], **kw)
         torch.testing.assert_close(oi[0], o_rec[i], atol=1e-12, rtol=1e-12)
+        assert si is not None
         torch.testing.assert_close(si[0], s_rec[i], atol=1e-12, rtol=1e-12)
 
 
@@ -400,4 +407,5 @@ def test_25_large_resting_stays_finite(backend):
     s0 = torch.randn(2, 4, 3, dtype=torch.float64) * 1e3
     g = torch.full_like(g, -5.0)
     o, s = G.gated_delta_rule_2(q, k, v, g, b, w, backend=backend, chunk_size=2, resting_state=s0, output_final_state=True)
+    assert s is not None
     assert torch.isfinite(o).all() and torch.isfinite(s).all()

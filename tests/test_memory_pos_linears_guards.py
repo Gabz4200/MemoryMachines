@@ -6,6 +6,7 @@ import math
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from memory_machines.models.blocks.linears import ChunkedBottleneckLinear
 from memory_machines.models.blocks.memory import EngramMemory, _SsdTable
@@ -14,19 +15,19 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 
 def _small_ram_config(**kw):
-    base = dict(
-        hidden_size=32,
-        mhc_num_streams=2,
-        engram_orders=(2,),
-        engram_hash_heads=2,
-        engram_dim_per_order=4,
-        engram_num_entries=16,
-        vocab_size=32,
-        engram_use_conv=False,
-        engram_layer_positions=(),
-        seed=0,
-        engram_offload="ram",
-    )
+    base = {
+        "hidden_size": 32,
+        "mhc_num_streams": 2,
+        "engram_orders": (2,),
+        "engram_hash_heads": 2,
+        "engram_dim_per_order": 4,
+        "engram_num_entries": 16,
+        "vocab_size": 32,
+        "engram_use_conv": False,
+        "engram_layer_positions": (),
+        "seed": 0,
+        "engram_offload": "ram",
+    }
     base.update(kw)
     return MemoryMachineConfig(**base)
 
@@ -79,8 +80,9 @@ def test_two_stage_init_scales_distinct():
     torch.manual_seed(0)
     layer = ChunkedBottleneckLinear(8, num_blocks=4, output_dim=8, bottleneck_dim=3)
     layer.reset_parameters()
-    mods = list(layer.mixer)
-    first, second = mods[0], mods[1]
+    assert isinstance(layer.mixer, nn.Sequential)
+    first, second = list(layer.mixer)
+    assert isinstance(first, nn.Linear) and isinstance(second, nn.Linear)
     assert tuple(first.weight.shape) == (3, 4)
     assert tuple(second.weight.shape) == (4, 3)
     g_bound = 2 / math.sqrt(4)
@@ -119,7 +121,7 @@ def test_cvpe_nonzero_bf16_matches_fp32(use_log_transform):
     torch.manual_seed(1)
     mod32 = _nonzero_cvpe(head_dim=4, seed=1, use_log_transform=use_log_transform)
     mod32.eval()
-    B, H, Lq, Lk, Dh = 2, 2, 4, 6, 4
+    B, H, Lq, _, Dh = 2, 2, 4, 6, 4
     q32 = torch.randn(B, H, Lq, Dh)
     q_pos = torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]])
     k_pos = torch.tensor([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]])
@@ -186,9 +188,11 @@ def test_duplicate_index_grad_accumulates_3x(tmp_path):
         t.weight.fill_(0.0)
     t.zero_grad()
     t(torch.tensor([2])).sum().backward()
+    assert t.weight.grad is not None
     g1 = t.weight.grad.clone()
     t.zero_grad()
     t(torch.tensor([2, 2, 2])).sum().backward()
+    assert t.weight.grad is not None
     g3 = t.weight.grad.clone()
     torch.testing.assert_close(g3[2], 3 * g1[2], atol=1e-5, rtol=1e-5)
 

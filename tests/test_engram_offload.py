@@ -10,7 +10,6 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from memory_machines.models.blocks.memory import EngramMemory, _SsdTable
@@ -67,6 +66,7 @@ def test_ssd_weight_is_trainable_parameter():
         cfg = _engram_cfg(engram_offload="ssd", engram_offload_dir=d)
         mem = EngramMemory(cfg)
         table = mem.multi_head_embedding
+        assert isinstance(table, _SsdTable)
         assert isinstance(table.weight, torch.nn.Parameter), "weight must be a Parameter"
         assert any(p is table.weight for p in mem.parameters()), "SSD table must appear in module.parameters() so the optimizer updates it"
         # Shared storage: the Parameter must alias the memmap, not copy it.
