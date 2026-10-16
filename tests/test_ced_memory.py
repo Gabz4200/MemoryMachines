@@ -13,9 +13,20 @@ from memory_machines.models.blocks import (
     CompressedSparseAttention2,
     DSparkDrafter,
     EngramMemory,
+    MHCAttentionGDN2,
     SinglePassMHC,
 )
 from tests.test_blocks_shapes import tiny_cfg
+
+
+def _csa(layer):
+    """Reach the CSA2 attention branch of a CED layer.
+
+    CED layers are parallel attention ∥ GDN-2 blocks by default
+    (``ced_attention_gdn2_parallel=True``); the CSA2-specific attributes
+    live on the block's ``attention`` branch.
+    """
+    return layer.attention if isinstance(layer, MHCAttentionGDN2) else layer
 
 
 def _ced_cfg():
@@ -72,12 +83,13 @@ def test_ced_bounded_replay_does_not_leak_future_tokens():
     # and the self-visibility floor is observable.
     with torch.no_grad():
         for layer in list(model.encoder_layers) + list(model.decoder_layers):
-            assert isinstance(layer, CompressedSparseAttention2)
+            csa = _csa(layer)
+            assert isinstance(csa, CompressedSparseAttention2)
             for w in (
-                layer.q_down.weight,
-                layer.q_up_main.weight,
-                layer.compressor.kv_proj.weight,
-                layer.grouped_out.out_proj.weight,
+                csa.q_down.weight,
+                csa.q_up_main.weight,
+                csa.compressor.kv_proj.weight,
+                csa.grouped_out.out_proj.weight,
             ):
                 torch.nn.init.trunc_normal_(w, mean=0.0, std=0.5, a=-1.0, b=1.0)
 
@@ -110,8 +122,9 @@ def test_ced_decode_is_globally_conditioned():
     # is meaningful.
     with torch.no_grad():
         for layer in list(model.encoder_layers) + list(model.decoder_layers):
-            assert isinstance(layer, CompressedSparseAttention2)
-            torch.nn.init.xavier_uniform_(layer.grouped_out.out_proj.weight)
+            csa = _csa(layer)
+            assert isinstance(csa, CompressedSparseAttention2)
+            torch.nn.init.xavier_uniform_(csa.grouped_out.out_proj.weight)
     torch.manual_seed(1)
     H = torch.randn(1, 6, 32)
     E_A = torch.randn(1, 7, 32)
@@ -291,9 +304,10 @@ def test_causal_decoder_global_kv_projected_from_encoder():
     # signal so the global-conditioning comparison is meaningful.
     with torch.no_grad():
         for layer in dec.layers:
-            assert isinstance(layer, CompressedSparseAttention2)
+            csa = _csa(layer)
+            assert isinstance(csa, CompressedSparseAttention2)
             torch.nn.init.trunc_normal_(
-                layer.grouped_out.out_proj.weight,
+                csa.grouped_out.out_proj.weight,
                 mean=0.0,
                 std=0.5,
                 a=-1.0,
@@ -322,12 +336,13 @@ def test_causal_decoder_bounded_replay_no_leakage():
     dec = CausalDecoder(cfg).eval()
     with torch.no_grad():
         for layer in dec.layers:
-            assert isinstance(layer, CompressedSparseAttention2)
+            csa = _csa(layer)
+            assert isinstance(csa, CompressedSparseAttention2)
             for w in (
-                layer.q_down.weight,
-                layer.q_up_main.weight,
-                layer.compressor.kv_proj.weight,
-                layer.grouped_out.out_proj.weight,
+                csa.q_down.weight,
+                csa.q_up_main.weight,
+                csa.compressor.kv_proj.weight,
+                csa.grouped_out.out_proj.weight,
             ):
                 torch.nn.init.trunc_normal_(w, mean=0.0, std=0.5, a=-1.0, b=1.0)
 

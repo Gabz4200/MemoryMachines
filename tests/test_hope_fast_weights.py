@@ -1,5 +1,7 @@
 """HOPE (arXiv:2512.24695 Sec. 8) paper-accuracy tests (RED phase)."""
 
+from typing import Any
+
 import torch
 
 from memory_machines.models.blocks.fast_weights import (
@@ -46,7 +48,8 @@ def test_selfref_adapts_projections():
     mem = SelfReferentialTitanMemory(**_tiny()).eval()
     torch.manual_seed(1)
     x = torch.randn(1, 6, 32)
-    k1 = mem.project_kv(x[:1]) if hasattr(mem, "project_kv") else None
+    project: Any = getattr(mem, "project_kv", None)
+    k1 = project(x[:1]) if project is not None else None
     # Fallback: compare outputs when prefix changes.
     base, _ = mem(x)
     x2 = x.clone()
@@ -56,7 +59,7 @@ def test_selfref_adapts_projections():
     assert (out2[:, 1:] - base[:, 1:]).abs().max().item() > 1e-6
     # And the key projection itself must adapt: keys for same suffix differ.
     if k1 is not None:
-        k2 = mem.project_kv(x2[:1])  # noqa: unused, shape check only
+        k2 = project(x2[:1])  # noqa: unused, shape check only
         assert k1[0].shape == k2[0].shape
 
 

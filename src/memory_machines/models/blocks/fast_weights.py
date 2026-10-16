@@ -45,6 +45,8 @@ Examples::
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -165,7 +167,7 @@ class TitansFastWeightsMemory(nn.Module):
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.reset_parameters()
 
-    def _fast_shapes(self) -> list[tuple[int, ...]]:
+    def _fast_shapes(self) -> list[tuple[int, int]]:
         kd, fd, vd, depth = self.head_dim, self.fast_dim, self.head_dim, self.memory_depth
         if depth == 1:
             return [(kd, vd)]
@@ -558,13 +560,16 @@ class SelfReferentialTitanMemory(nn.Module):
             self.input_conv = ShortConvolution(hidden_size=hidden_size, kernel_size=conv_kernel_size, bias=False)
         else:
             self.register_module("input_conv", None)
-        self.fast_init: nn.ModuleDict = nn.ModuleDict({box: nn.ParameterList([nn.Parameter(torch.empty(*s)) for s in self._fast_shapes()]) for box in HOPE_BOXES})
+        self.fast_init: dict[str, nn.ParameterList] = cast(
+            "dict[str, nn.ParameterList]",
+            nn.ModuleDict({box: nn.ParameterList([nn.Parameter(torch.empty(*s)) for s in self._fast_shapes()]) for box in HOPE_BOXES}),
+        )
         self.gate_proj = nn.Linear(hidden_size, hidden_size)
         self.out_norm = nn.RMSNorm(hidden_size, eps=norm_eps)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.reset_parameters()
 
-    def _fast_shapes(self) -> list[tuple[int, ...]]:
+    def _fast_shapes(self) -> list[tuple[int, int]]:
         kd, fd, vd, depth = self.head_dim, self.fast_dim, self.head_dim, self.memory_depth
         if depth == 1:
             return [(kd, vd)]
@@ -573,10 +578,14 @@ class SelfReferentialTitanMemory(nn.Module):
         shapes.append((fd, vd))
         return shapes
 
+    def _box_weights(self, box: str) -> nn.ParameterList:
+        """Per-box fast-weight parameters (typed view of ``fast_init``)."""
+        return cast("nn.ParameterList", self.fast_init[box])
+
     def reset_parameters(self) -> None:
         """Init fast-weight priors and projections."""
-        for plist in self.fast_init.values():
-            for w in plist:
+        for box in HOPE_BOXES:
+            for w in self._box_weights(box):
                 nn.init.normal_(w, std=self.init_std)
         nn.init.xavier_uniform_(self.q_proj.weight, gain=2**-2.5)
         nn.init.xavier_uniform_(self.gate_proj.weight, gain=2**-2.5)
@@ -613,12 +622,12 @@ class SelfReferentialTitanMemory(nn.Module):
         q = _l2norm(self._heads(self.q_proj(xc)), self.norm_eps)
         bh = h.shape[0] * h.shape[1]
         hf = h.reshape(bh, self.num_heads, self.head_dim)
-        k = _l2norm(_sr_mlp(hf, [w.expand(bh, self.num_heads, *w.shape) for w in self.fast_init["k"]]).view(*h.shape), self.norm_eps)
-        v = _sr_mlp(hf, [w.expand(bh, self.num_heads, *w.shape) for w in self.fast_init["v"]]).view(*h.shape)
+        k = _l2norm(_sr_mlp(hf, [w.expand(bh, self.num_heads, *w.shape) for w in self._box_weights("k")]).view(*h.shape), self.norm_eps)
+        v = _sr_mlp(hf, [w.expand(bh, self.num_heads, *w.shape) for w in self._box_weights("v")]).view(*h.shape)
         return q, k, v, new_conv_state
 
     def _init_state(self, batch: int, device: torch.device, dtype: torch.dtype) -> dict[str, list[torch.Tensor]]:
-        return {box: [w.to(device=device, dtype=dtype).expand(batch, self.num_heads, *w.shape).contiguous() for w in self.fast_init[box]] for box in HOPE_BOXES}
+        return {box: [w.to(device=device, dtype=dtype).expand(batch, self.num_heads, *w.shape).contiguous() for w in self._box_weights(box)] for box in HOPE_BOXES}
 
     def _box_scalars(self, raw: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(raw.mean(dim=-1))
@@ -740,14 +749,22 @@ class SelfReferentialTitanMixer(nn.Module):
 
     Args:
         config: provides ``hidden_size``, ``num_attention_heads``,
-            ``rms_norm_eps``, and ``initializer_range``.
+            ``rms_norm_eps``, ``initializer_range``, and the ``titan_*``
+            knobs used as per-argument defaults.
         memory_depth: fast-MLP layers per box (``1`` = linear matrix memory).
-        fast_expansion: fast hidden width multiplier.
-        objective: ``"l2"`` regression or ``"dot"`` similarity.
-        use_short_conv: local depthwise causal conv on the input.
-        conv_kernel_size: conv width (paper uses 4).
+            Default: ``None`` (``config.titan_memory_depth``).
+        fast_expansion: fast hidden width multiplier. Default: ``None``
+            (``config.titan_fast_expansion``).
+        objective: ``"l2"`` regression or ``"dot"`` similarity. Default:
+            ``None`` (``config.titan_objective``).
+        use_short_conv: local depthwise causal conv on the input. Default:
+            ``None`` (``config.titan_use_short_conv``).
+        conv_kernel_size: conv width (paper uses 4). Default: ``None``
+            (``config.titan_conv_kernel_size``).
         chunk_size: default positions per state-carry chunk (exact; bounds
-            peak activation lifetime). Per-call ``chunk_size`` overrides it.
+            peak activation lifetime). Default: ``None``
+            (``config.titan_chunk_size``; ``0`` = whole sequence). Per-call
+            ``chunk_size`` overrides it.
 
     Examples::
 
@@ -764,14 +781,21 @@ class SelfReferentialTitanMixer(nn.Module):
     def __init__(
         self,
         config: MemoryMachineConfig,
-        memory_depth: int = 2,
-        fast_expansion: float = 1.0,
-        objective: str = "l2",
-        use_short_conv: bool = True,
-        conv_kernel_size: int = 4,
+        memory_depth: int | None = None,
+        fast_expansion: float | None = None,
+        objective: str | None = None,
+        use_short_conv: bool | None = None,
+        conv_kernel_size: int | None = None,
         chunk_size: int | None = None,
     ) -> None:
         super().__init__()
+        memory_depth = config.titan_memory_depth if memory_depth is None else memory_depth
+        fast_expansion = config.titan_fast_expansion if fast_expansion is None else fast_expansion
+        objective = config.titan_objective if objective is None else objective
+        use_short_conv = config.titan_use_short_conv if use_short_conv is None else use_short_conv
+        conv_kernel_size = config.titan_conv_kernel_size if conv_kernel_size is None else conv_kernel_size
+        if chunk_size is None and config.titan_chunk_size:
+            chunk_size = config.titan_chunk_size
         if chunk_size is not None and chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         self.config = config
@@ -798,9 +822,9 @@ class SelfReferentialTitanMixer(nn.Module):
         self.memory.reset_parameters()
 
     @property
-    def fast_init(self) -> nn.ModuleDict:
-        """Fast-weight priors owned by the wrapped memory."""
-        return self.memory.fast_init
+    def fast_init(self) -> dict[str, nn.ParameterList]:
+        """Fast-weight priors owned by the wrapped memory (``box -> ParameterList``)."""
+        return cast("dict[str, nn.ParameterList]", self.memory.fast_init)
 
     def forward(
         self,
@@ -858,7 +882,7 @@ class SelfReferentialTitanMixer(nn.Module):
         total = hidden_states.shape[1]
         if cu_seqlens.dim() != 1 or not bounds or bounds[0] != 0:
             raise ValueError(f"cu_seqlens must be 1D starting at 0, got {bounds[:3] if bounds else bounds}")
-        if any(b < a for a, b in zip(bounds, bounds[1:])):
+        if any(b < a for a, b in itertools.pairwise(bounds)):
             raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
         if int(cu_seqlens[-1].item()) != total:
             raise ValueError(f"cu_seqlens must end at T={total}, got {int(cu_seqlens[-1].item())}")
@@ -956,7 +980,7 @@ class ContinuumMemorySystem(nn.Module):
             raise ValueError(f"step must be non-negative, got {step}")
         return step % self.update_intervals[level] == 0
 
-    def load_pretrained_into_levels(self, modules: list[nn.Module]) -> None:
+    def load_pretrained_into_levels(self, modules: Sequence[nn.Module]) -> None:
         """Ad-hoc level stacking (Sec. 7.3): init levels from pretrained MLPs.
 
         Copies matching ``weight``/``bias`` tensors where shapes agree and

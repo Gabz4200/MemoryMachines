@@ -9,6 +9,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from memory_machines.models.blocks.fast_weights import (
     ContinuumMemorySystem,
@@ -17,6 +18,14 @@ from memory_machines.models.blocks.fast_weights import (
 )
 
 D = 16
+
+
+def _level_linears(seq: nn.Module) -> tuple[nn.Linear, nn.Linear]:
+    """The two ``nn.Linear`` layers of one CMS level (skipping the SiLU)."""
+    assert isinstance(seq, nn.Sequential)
+    linears = [m for m in seq if isinstance(m, nn.Linear)]
+    assert len(linears) == 2
+    return linears[0], linears[1]
 
 
 def _cms_raw(cms, x, order=None):
@@ -55,8 +64,11 @@ def test_cms_is_sequential_not_aggregation():
         branches = []
         for l in range(cms.num_levels):
             n = cms.norms[l]
-            w1, b1 = cms.mlps[l][0].weight.detach().clone(), cms.mlps[l][0].bias.detach().clone()
-            w2, b2 = cms.mlps[l][2].weight.detach().clone(), cms.mlps[l][2].bias.detach().clone()
+            assert isinstance(n, nn.RMSNorm)
+            first, second = _level_linears(cms.mlps[l])
+            assert first.bias is not None and second.bias is not None
+            w1, b1 = first.weight.detach().clone(), first.bias.detach().clone()
+            w2, b2 = second.weight.detach().clone(), second.bias.detach().clone()
             hn = F.rms_norm(x, (D,), n.weight.detach().clone(), eps=n.eps)
             branches.append(F.linear(F.silu(F.linear(hn, w1, b1)), w2, b2))
         agg = x + torch.stack(branches).mean(0)
@@ -136,7 +148,7 @@ def test_cms_contributes_in_attention_variant():
         ref = _attn_only_ref(blk, x)
         assert (blk(x) - ref).abs().amax().item() > 1e-6  # CMS active: differs
         for seq in blk.cms.mlps:
-            for lin in (seq[0], seq[2]):
+            for lin in _level_linears(seq):
                 lin.weight.zero_()
                 if lin.bias is not None:
                     lin.bias.zero_()
@@ -244,7 +256,7 @@ def test_zeroed_cms_is_identity():
     cms = ContinuumMemorySystem(hidden_size=D, num_levels=2).eval()
     with torch.no_grad():
         for seq in cms.mlps:
-            for lin in (seq[0], seq[2]):
+            for lin in _level_linears(seq):
                 lin.weight.zero_()
                 if lin.bias is not None:
                     lin.bias.zero_()

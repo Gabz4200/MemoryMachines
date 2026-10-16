@@ -14,6 +14,7 @@ from memory_machines.models.blocks import (
     CEDGlobalKVProjection,
     CompressedSparseAttention,
     CompressedSparseAttention2,
+    MHCAttentionGDN2,
 )
 from memory_machines.models.blocks.shared import CompressedCache, CSA2SharedState
 from tests.test_blocks_shapes import tiny_cfg
@@ -21,6 +22,11 @@ from tests.test_blocks_shapes import tiny_cfg
 H = 32
 HKV = 2
 DH = 8
+
+
+def _csa_branch(layer):
+    """Reach the CSA2 attention branch of a CED layer (parallel mHC or plain)."""
+    return layer.attention if isinstance(layer, MHCAttentionGDN2) else layer
 
 
 def _csa(**kw) -> CompressedSparseAttention:
@@ -37,14 +43,14 @@ def _csa2(mode="full", **kw) -> CompressedSparseAttention2:
 
 
 def _ced_cfg(**kw):
-    base = dict(
-        swa_bounded_replay=True,
-        window_size=4,
-        ced_num_encoder_layers=1,
-        ced_num_decoder_layers=2,
-        csa_encoder_compression_ratio=2,
-        csa_decoder_compression_ratio=1,
-    )
+    base = {
+        "swa_bounded_replay": True,
+        "window_size": 4,
+        "ced_num_encoder_layers": 1,
+        "ced_num_decoder_layers": 2,
+        "csa_encoder_compression_ratio": 2,
+        "csa_decoder_compression_ratio": 1,
+    }
     base.update(kw)
     return replace(tiny_cfg(), **base)
 
@@ -111,9 +117,8 @@ def _corrupt_call(path: str):
 
 @pytest.mark.parametrize("path", ["csa", "full", "reindex", "reuse"])
 def test_corrupt_cache_raises(path):
-    with pytest.raises(ValueError, match="corrupt"):
-        with torch.no_grad():
-            _corrupt_call(path)()
+    with pytest.raises(ValueError, match="corrupt"), torch.no_grad():
+        _corrupt_call(path)()
 
 
 # 3. comp_end_pos rank/batch validation ---------------------------------------
@@ -130,9 +135,8 @@ def test_csa_comp_end_pos_rank_and_batch():
     for ends, match in bad_cases:
         layer = _csa()
         past = CompressedCache(compressed_kv=kv.clone(), comp_end_pos=ends, total_len=0)
-        with pytest.raises(ValueError, match=match):
-            with torch.no_grad():
-                layer(torch.randn(1, 4, H), past=past)
+        with pytest.raises(ValueError, match=match), torch.no_grad():
+            layer(torch.randn(1, 4, H), past=past)
 
 
 def test_csa2_comp_end_pos_rank_and_batch():
@@ -145,9 +149,8 @@ def test_csa2_comp_end_pos_rank_and_batch():
             compressed_kv=torch.randn(1, 2, HKV, DH),
             comp_end_pos=ends,
         )
-        with pytest.raises(ValueError, match=match):
-            with torch.no_grad():
-                layer.forward_shared(torch.randn(1, 4, H), shared)
+        with pytest.raises(ValueError, match=match), torch.no_grad():
+            layer.forward_shared(torch.randn(1, 4, H), shared)
 
 
 def test_1d_comp_end_pos_broadcast_control():
@@ -201,12 +204,13 @@ def _upscaled_decoder(cfg) -> CausalDecoder:
     dec = CausalDecoder(cfg).eval()
     with torch.no_grad():
         for layer in dec.layers:
-            assert isinstance(layer, CompressedSparseAttention2)
+            csa = _csa_branch(layer)
+            assert isinstance(csa, CompressedSparseAttention2)
             for w in (
-                layer.q_down.weight,
-                layer.q_up_main.weight,
-                layer.compressor.kv_proj.weight,
-                layer.grouped_out.out_proj.weight,
+                csa.q_down.weight,
+                csa.q_up_main.weight,
+                csa.compressor.kv_proj.weight,
+                csa.grouped_out.out_proj.weight,
             ):
                 torch.nn.init.trunc_normal_(w, mean=0.0, std=0.5, a=-1.0, b=1.0)
     return dec
@@ -226,16 +230,14 @@ def test_seeded_store_false_ablation_differs():
 
 def test_seeded_store_true_requires_store():
     layer = _csa2("full")
-    with pytest.raises(ValueError, match="seed the store"):
-        with torch.no_grad():
-            layer.forward_shared(torch.randn(1, 4, H), CSA2SharedState(), seeded_store=True)
+    with pytest.raises(ValueError, match="seed the store"), torch.no_grad():
+        layer.forward_shared(torch.randn(1, 4, H), CSA2SharedState(), seeded_store=True)
     shared = CSA2SharedState(
         compressed_kv=torch.randn(1, 2, HKV, DH),
         comp_end_pos=None,
     )
-    with pytest.raises(ValueError, match="corrupt"):
-        with torch.no_grad():
-            layer.forward_shared(torch.randn(1, 4, H), shared, seeded_store=True)
+    with pytest.raises(ValueError, match="corrupt"), torch.no_grad():
+        layer.forward_shared(torch.randn(1, 4, H), shared, seeded_store=True)
 
 
 # 6. Bounded replay guard ------------------------------------------------------
@@ -447,6 +449,5 @@ def test_encoder_reuse_and_empty_layers():
     assert tuple(out.shape) == (1, 8, H)
     assert shared.compressed_kv is not None
     empty = CausalEncoderDecoderStack(cfg, encoder_layers=[])
-    with pytest.raises(ValueError, match="empty"):
-        with torch.no_grad():
-            empty.encode(torch.randn(1, 8, H))
+    with pytest.raises(ValueError, match="empty"), torch.no_grad():
+        empty.encode(torch.randn(1, 8, H))

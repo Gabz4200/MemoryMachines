@@ -258,7 +258,7 @@ class _EngramShortConv(nn.Module):
 
 
 class SinglePassMHC(nn.Module):
-    r"""SinglePassMHC(config)
+    r"""SinglePassMHC(config, parallel_branches=False)
 
     Single-pass manifold-constrained hyper-connections.
 
@@ -271,6 +271,10 @@ class SinglePassMHC(nn.Module):
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``mhc_num_streams`` (``n``), ``mhc_sinkhorn_iters``,
             ``hidden_size`` (``d``), and ``rms_norm_eps``.
+        parallel_branches (bool): add a second read-out/write-in pair so
+            :meth:`forward_parallel` can route the streams into two parallel
+            branches (attention and GDN-2) sharing one Sinkhorn residual
+            mapping. Default: ``False`` (single-branch mHC).
 
     Single-pass mHC (DeepSeek-V4.1, §2.4.1 Eq. 6) shifts input
     mixing by one block: ``X_{l+1} = B_l X_l + C_l F_l(A_{l-1} X_l)``.
@@ -289,11 +293,12 @@ class SinglePassMHC(nn.Module):
         torch.Size([1, 4, 2, 32])
     """
 
-    def __init__(self, config: MemoryMachineConfig):
+    def __init__(self, config: MemoryMachineConfig, parallel_branches: bool = False):
         super().__init__()
         self.num_streams = config.mhc_num_streams
         self.iters = config.mhc_sinkhorn_iters
         self.init_std: float = config.initializer_range
+        self.parallel_branches = parallel_branches
         n, d = config.mhc_num_streams, config.hidden_size
         self.pre_norm = nn.RMSNorm(n * d, config.rms_norm_eps)
         self.a_dyn = nn.Linear(n * d, n)
@@ -305,6 +310,15 @@ class SinglePassMHC(nn.Module):
         self.alpha_pre = nn.Parameter(torch.tensor(1e-3))
         self.alpha_res = nn.Parameter(torch.tensor(1e-3))
         self.alpha_post = nn.Parameter(torch.tensor(1e-3))
+        # Two-branch routing (attention ∥ GDN-2): a second read-out ``A`` and
+        # write-in ``C``; the Sinkhorn residual ``B`` is shared.
+        if parallel_branches:
+            self.a2_dyn = nn.Linear(n * d, n)
+            self.c2_dyn = nn.Linear(n * d, n)
+            self.a2_static = nn.Parameter(torch.zeros(n))
+            self.c2_static = nn.Parameter(torch.zeros(n))
+            self.alpha_pre2 = nn.Parameter(torch.tensor(1e-3))
+            self.alpha_post2 = nn.Parameter(torch.tensor(1e-3))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -332,6 +346,15 @@ class SinglePassMHC(nn.Module):
         nn.init.constant_(self.alpha_pre, 1e-3)
         nn.init.constant_(self.alpha_res, 1e-3)
         nn.init.constant_(self.alpha_post, 1e-3)
+        if self.parallel_branches:
+            nn.init.trunc_normal_(self.a2_dyn.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            nn.init.zeros_(self.a2_dyn.bias)
+            nn.init.trunc_normal_(self.c2_dyn.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            nn.init.zeros_(self.c2_dyn.bias)
+            nn.init.zeros_(self.a2_static)
+            nn.init.zeros_(self.c2_static)
+            nn.init.constant_(self.alpha_pre2, 1e-3)
+            nn.init.constant_(self.alpha_post2, 1e-3)
 
     def coefficients(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""coefficients(x) -> (Tensor, Tensor, Tensor)
@@ -363,6 +386,48 @@ class SinglePassMHC(nn.Module):
         b = _sinkhorn(self.alpha_res * self.b_dyn(flat).view(bsz, lq, n, n) + self.b_static, self.iters)
         c = (2 * torch.sigmoid(self.alpha_post * self.c_dyn(flat) + self.c_static)).unsqueeze(-1)
         return a, b, c
+
+    def parallel_coefficients(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""parallel_coefficients(x) -> (Tensor, Tensor, Tensor, Tensor, Tensor)
+
+        Two-branch mHC coefficients (attention ∥ GDN-2). Generalizes
+        :meth:`coefficients` to two read-out (``A``) / write-in (``C``)
+        pairs that share one Sinkhorn residual mapping ``B``, so each
+        branch learns its own routed view of the streams:
+
+        .. math::
+            X_{l+1} = B_l X_l + C^{a}_l F_a(A^{a}_{l-1} X_l) + C^{g}_l F_g(A^{g}_{l-1} X_l)
+
+        Requires ``parallel_branches=True``.
+
+        Args:
+            x (Tensor): streams of shape ``(B, L, n, d)``.
+
+        Returns:
+            Tensor: ``a1``/``a2`` input weights ``(B, L, 1, n)`` in ``(0, 1)``,
+            ``b`` Sinkhorn residual matrix ``(B, L, n, n)``, and ``c1``/``c2``
+            output scales ``(B, L, n, 1)`` in ``(0, 2)``.
+
+        Examples::
+
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> mhc = SinglePassMHC(MemoryMachineConfig(hidden_size=16, mhc_num_streams=2), parallel_branches=True)
+            >>> a1, a2, b, c1, c2 = mhc.parallel_coefficients(torch.randn(1, 3, 2, 16))
+            >>> a1.shape, b.shape, c1.shape
+            (torch.Size([1, 3, 1, 2]), torch.Size([1, 3, 2, 2]), torch.Size([1, 3, 2, 1]))
+        """
+        if not self.parallel_branches:
+            raise RuntimeError("parallel_coefficients requires SinglePassMHC(parallel_branches=True)")
+        if x.dim() != 4 or x.shape[2] != self.num_streams:
+            raise ValueError(f"streams must be [B, L, n={self.num_streams}, d], got {tuple(x.shape)}")
+        bsz, lq, n, _ = x.shape
+        flat = self.pre_norm(x.reshape(bsz, lq, -1))
+        a1 = torch.sigmoid(self.alpha_pre * self.a_dyn(flat) + self.a_static).unsqueeze(2)
+        a2 = torch.sigmoid(self.alpha_pre2 * self.a2_dyn(flat) + self.a2_static).unsqueeze(2)
+        b = _sinkhorn(self.alpha_res * self.b_dyn(flat).view(bsz, lq, n, n) + self.b_static, self.iters)
+        c1 = (2 * torch.sigmoid(self.alpha_post * self.c_dyn(flat) + self.c_static)).unsqueeze(-1)
+        c2 = (2 * torch.sigmoid(self.alpha_post2 * self.c2_dyn(flat) + self.c2_static)).unsqueeze(-1)
+        return a1, a2, b, c1, c2
 
     @staticmethod
     def mix_input(
@@ -417,6 +482,51 @@ class SinglePassMHC(nn.Module):
             Tensor: updated streams of shape ``(B, L, n, d)``.
         """
         return torch.matmul(b, streams) + c * branch_out.unsqueeze(2)
+
+    @staticmethod
+    def combine_parallel(
+        streams: torch.Tensor,
+        b: torch.Tensor,
+        c1: torch.Tensor,
+        branch_out1: torch.Tensor,
+        c2: torch.Tensor,
+        branch_out2: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""combine_parallel(streams, b, c1, branch_out1, c2, branch_out2) -> Tensor
+
+        Two-branch write-in stage of the parallel mHC step:
+        ``B X + C^{a} Y^{a} + C^{g} Y^{g}``.
+        """
+        return torch.matmul(b, streams) + c1 * branch_out1.unsqueeze(2) + c2 * branch_out2.unsqueeze(2)
+
+    def forward_parallel(
+        self,
+        streams: torch.Tensor,
+        branch1_fn: Callable[[torch.Tensor], torch.Tensor],
+        branch2_fn: Callable[[torch.Tensor], torch.Tensor],
+        prev_a1: torch.Tensor | None = None,
+        prev_a2: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""forward_parallel(streams, branch1_fn, branch2_fn, prev_a1=None, prev_a2=None) -> (Tensor, Tensor, Tensor)
+
+        One single-pass mHC step around two parallel branches. Each branch
+        reads a *different* routed view of the streams (``A^{a}`` vs
+        ``A^{g}``); single-pass mHC mixes with the previous block's
+        coefficients (falling back to the current ones for the first block).
+
+        Returns the updated streams and this block's ``(a1, a2)`` for the
+        next block.
+        """
+        a1, a2, b, c1, c2 = self.parallel_coefficients(streams)
+        mix1 = prev_a1 if prev_a1 is not None else a1
+        mix2 = prev_a2 if prev_a2 is not None else a2
+        if mix1.shape != a1.shape or mix2.shape != a2.shape:
+            raise ValueError(f"prev_a shapes {tuple(mix1.shape)}/{tuple(mix2.shape)} do not match coefficients {tuple(a1.shape)}/{tuple(a2.shape)}")
+        out1 = branch1_fn(self.mix_input(streams, mix1).squeeze(2))
+        out2 = branch2_fn(self.mix_input(streams, mix2).squeeze(2))
+        if out1.shape != out2.shape:
+            raise ValueError(f"branch outputs must share shape, got {tuple(out1.shape)} and {tuple(out2.shape)}")
+        return self.combine_parallel(streams, b, c1, out1, c2, out2), a1, a2
 
     def forward(
         self,
@@ -533,7 +643,7 @@ class EngramMemory(nn.Module):
             self.conv = _EngramShortConv(
                 hidden_size=self.hidden_size,
                 streams=self.streams,
-                kernel_size=4,
+                kernel_size=config.engram_conv_kernel_size,
                 dilation=max_order,
             )
         # Distinct primes >= entries - 1, shared across layers so

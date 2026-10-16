@@ -594,6 +594,8 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             Default: ``"full"``.
         top_k (int, optional): entries per query. Default: ``None`` (falls
             back to ``config.csa_top_k``).
+        window_size (int, optional): SWA branch width, in compressed tokens.
+            Default: ``None`` (falls back to ``config.window_size_compressed``).
 
     Examples::
 
@@ -613,8 +615,9 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         compression_ratio: int | None = None,
         mode: str = "full",
         top_k: int | None = None,
+        window_size: int | None = None,
     ):
-        super().__init__(config, compression_ratio=compression_ratio, use_indexer=True, use_dense_branch=False, top_k=top_k)
+        super().__init__(config, compression_ratio=compression_ratio, use_indexer=True, use_dense_branch=False, top_k=top_k, window_size=window_size)
         if mode not in ("full", "reindex", "reuse"):
             raise ValueError(f"mode ({mode}) must be full/reindex/reuse")
         self.mode = mode

@@ -1,4 +1,4 @@
-r"""Causal encoder-decoder stack over CSA2 layers.
+r"""Causal encoder-decoder stack over CSA2 / parallel mHC layers.
 
 :class:`CausalEncoderDecoderStack` wires
 :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`
@@ -6,7 +6,22 @@ encoder/decoder layers with per-decoder global KV projections
 (:class:`CEDGlobalKVProjection`) built from the encoder-final hidden
 states. The decoder half is a standalone :class:`CausalDecoder`
 (composable and usable on its own).
+
+When ``config.ced_attention_gdn2_parallel`` is set (default), every
+*encoder* layer becomes a
+:class:`~memory_machines.models.blocks.mhc_parallel.MHCAttentionGDN2` block:
+a MultiHead sliding-window attention variant
+(``config.ced_attention_variant``, default ``compressed_sparse``) runs in
+parallel with a MultiHead GDN-2 mixer, routed by Single-Pass mHC over
+persistent residual streams. The GDN-2 branch mixes the *whole* encoder
+sequence (never a window), so it supplies the global context while the
+attention branch keeps its precision local. The decoder is never a GDN-2
+block — it stays plain CSA2 and inherits the global context through the
+encoder's KV (Eq. 1). Set the flag to ``False`` to recover plain CSA2
+encoder layers.
 """
+
+from typing import cast
 
 import torch
 from torch import nn
@@ -14,8 +29,43 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .compression import BlockCompressor
+from .mhc_parallel import MHCAttentionGDN2, from_streams, to_streams
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention2
+
+
+def _run_stream_layers(
+    layers: list[MHCAttentionGDN2],
+    hidden_states: torch.Tensor,
+    shared: CSA2SharedState | None,
+    num_streams: int,
+    position_ids: torch.Tensor | None = None,
+    seeded_store: bool = False,
+) -> tuple[torch.Tensor, CSA2SharedState | None]:
+    r"""_run_stream_layers(layers, hidden_states, shared, num_streams, position_ids=None, seeded_store=False) -> (Tensor, CSA2SharedState | None)
+
+    Run parallel mHC blocks over persistent residual streams.
+
+    Expands ``hidden_states`` into ``num_streams`` mHC streams
+    (:func:`~memory_machines.models.blocks.mhc_parallel.to_streams`), threads
+    the single-pass routing coefficients ``prev_a`` between adjacent blocks,
+    and collapses the final streams with a mean
+    (:func:`~memory_machines.models.blocks.mhc_parallel.from_streams`).
+    """
+    streams = to_streams(hidden_states, num_streams)
+    if shared is None:
+        shared = CSA2SharedState(total_len=0)
+    prev_a: torch.Tensor | None = None
+    for layer in layers:
+        streams, shared, prev_a = layer.forward_shared(
+            streams,
+            shared,
+            prev_a=prev_a,
+            position_ids=position_ids,
+            use_cache=True,
+            seeded_store=seeded_store,
+        )
+    return from_streams(streams), shared
 
 
 class CEDGlobalKVProjection(nn.Module):
@@ -101,11 +151,18 @@ class CausalEncoderDecoderStack(nn.Module):
     the decoder half is a :class:`CausalDecoder` (CSA2 layers in the
     paper's ``full``/``reindex``/``reuse`` cycle, each seeded with the
     encoder-final global KV, Eq. 1). Decoding supports full-context and
-    bounded-replay (last-window) prefill.
+    bounded-replay (last-window) prefill. By default each *encoder* layer
+    is a parallel attention ∥ GDN-2 block routed by Single-Pass mHC
+    (``config.ced_attention_gdn2_parallel``); the residual streams persist
+    between adjacent encoder layers and the routing coefficients are threaded
+    single-pass. The decoder carries no GDN-2 branch — it consumes the encoder's
+    global KV, so GDN-2 reaches it only indirectly, even under bounded replay.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``ced_num_encoder_layers``, ``ced_num_decoder_layers``,
+            ``ced_attention_gdn2_parallel``, ``ced_attention_variant``,
+            ``ced_gdn2_backend``,
             ``csa_encoder_compression_ratio``,
             ``csa_decoder_compression_ratio``, ``window_size``, and
             ``swa_bounded_replay``.
@@ -135,9 +192,13 @@ class CausalEncoderDecoderStack(nn.Module):
         super().__init__()
         self.config = config
         enc_n = config.ced_num_encoder_layers
-        self.encoder_layers = nn.ModuleList(
-            encoder_layers if encoder_layers is not None else [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
-        )
+        if encoder_layers is not None:
+            enc = list(encoder_layers)
+        elif config.ced_attention_gdn2_parallel:
+            enc = [MHCAttentionGDN2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
+        else:
+            enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
+        self.encoder_layers = nn.ModuleList(enc)
         # The decoder half is a standalone CausalDecoder so the
         # Eq. 1 seeding path lives in exactly one place.
         self.decoder = CausalDecoder(config, layers=decoder_layers)
@@ -209,12 +270,17 @@ class CausalEncoderDecoderStack(nn.Module):
         """
         shared: CSA2SharedState | None = None
         x = hidden_states
-        for layer in self.encoder_layers:
-            if not isinstance(layer, CompressedSparseAttention2):
-                raise TypeError(f"encoder_layers must hold CompressedSparseAttention2, got {type(layer).__name__}")
-            if shared is None:
-                shared = CSA2SharedState(total_len=0)
-            x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
+        layers = list(self.encoder_layers)
+        for layer in layers:
+            if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
+                raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
+        if layers and all(isinstance(layer, MHCAttentionGDN2) for layer in layers):
+            x, shared = _run_stream_layers(cast("list[MHCAttentionGDN2]", layers), hidden_states, None, self.config.mhc_num_streams, position_ids, seeded_store=False)
+        else:
+            for layer in cast("list[CompressedSparseAttention2]", layers):
+                if shared is None:
+                    shared = CSA2SharedState(total_len=0)
+                x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
         if shared is None:
             raise ValueError("encode produced no shared state (encoder_layers is empty)")
         return x, shared
@@ -315,7 +381,7 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> stack = CausalEncoderDecoderStack(MemoryMachineConfig(hidden_size=16,
             ...     num_attention_heads=2, num_key_value_heads=1, ced_num_encoder_layers=1,
             ...     ced_num_decoder_layers=1, csa_top_k=4, csa_num_output_groups=2))
-            >>> stack.prefill(torch.randn(1, 4, 16), torch.randn(1, 6, 16)).shape
+            >>> stack.prefill(torch.randn(1, 4, 16), torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
         return self.decoder.prefill(hidden_states, encoder_final, position_ids)
@@ -335,7 +401,10 @@ class CausalDecoder(nn.Module):
     the paper's CSA2 mode cycle (``full`` / ``reindex`` /
     ``reuse``) and per-layer :class:`CEDGlobalKVProjection`
     (:math:`C_l = H_{L/2} W^{KV}_l`). Supports full-context
-    decoding and SWA Bounded Replay (§2.3.2) prefill.
+    decoding and SWA Bounded Replay (§2.3.2) prefill. The decoder
+    carries no GDN-2 branch: the encoder owns the global GDN-2 mixer
+    (``config.ced_attention_gdn2_parallel``), and the decoder inherits that
+    global context through the encoder's KV, so bounded replay stays valid.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
@@ -355,7 +424,7 @@ class CausalDecoder(nn.Module):
         ...     num_attention_heads=2, num_key_value_heads=1,
         ...     ced_num_decoder_layers=2, csa_top_k=4,
         ...     csa_num_output_groups=2))
-        >>> enc = torch.randn(1, 6, 16)
+        >>> enc = torch.randn(1, 4, 16)
         >>> dec(torch.randn(1, 4, 16), enc).shape
         torch.Size([1, 4, 16])
     """
@@ -377,10 +446,12 @@ class CausalDecoder(nn.Module):
             raise ValueError(f"layers ({len(layers_list)}) must have length dec_n={dec_n} when global_projs is defaulted (zip would silently truncate)")
         if projs_list is not None and layers_list is None and len(projs_list) != dec_n:
             raise ValueError(f"global_projs ({len(projs_list)}) must have length dec_n={dec_n} when layers is defaulted (zip would silently truncate)")
-        self.layers = nn.ModuleList(
-            layers_list
-            if layers_list is not None
-            else [
+        if layers_list is not None:
+            built = layers_list
+        else:
+            # The decoder never carries a GDN-2 branch: the encoder owns the
+            # global GDN-2 mixer, and the decoder uses its global KV (Eq. 1).
+            built = [
                 CompressedSparseAttention2(
                     config,
                     config.csa_decoder_compression_ratio,
@@ -388,7 +459,7 @@ class CausalDecoder(nn.Module):
                 )
                 for i in range(dec_n)
             ]
-        )
+        self.layers = nn.ModuleList(built)
         self.global_projs = nn.ModuleList(projs_list if projs_list is not None else [CEDGlobalKVProjection(config) for _ in range(dec_n)])
         self.window_size = config.window_size
         self.reset_parameters()
@@ -457,24 +528,25 @@ class CausalDecoder(nn.Module):
         """
         if start_pos is None:
             start_pos = encoder_final.shape[1]
-        shared: CSA2SharedState | None = None
-        x = hidden_states
-        for layer, proj in zip(self.layers, self.global_projs):
+        layers = cast("list[CompressedSparseAttention2]", list(self.layers))
+        for layer in layers:
             if not isinstance(layer, CompressedSparseAttention2):
-                raise TypeError(f"layers must hold CompressedSparseAttention2, got {type(layer).__name__}")
-            if shared is None:
-                # Eq. 1: C_l = H_{L/2} W^KV_l — the global
-                # store is projected from the encoder-final
-                # states once, then shared by every decoder
-                # layer (Full/Reindex/Reuse).
-                comp, ends = proj(encoder_final)
-                shared = CSA2SharedState(
-                    compressed_kv=comp,
-                    comp_end_pos=ends,
-                    total_len=start_pos,
-                )
-                # NOTE: indexer_k is (re)computed inside forward_shared;
-                # do not pre-seed it here (dead compute, immediately overwritten).
+                raise TypeError(f"decoder layers must hold CompressedSparseAttention2 (no GDN-2 branch), got {type(layer).__name__}")
+        if not layers:
+            return hidden_states
+        # Eq. 1: C_l = H_{L/2} W^KV_l — the global store is projected
+        # from the encoder-final states once, then shared by every
+        # decoder layer (Full/Reindex/Reuse).
+        # NOTE: indexer_k is (re)computed inside forward_shared;
+        # do not pre-seed it here (dead compute, immediately overwritten).
+        comp, ends = self.global_projs[0](encoder_final)
+        shared: CSA2SharedState | None = CSA2SharedState(
+            compressed_kv=comp,
+            comp_end_pos=ends,
+            total_len=start_pos,
+        )
+        x = hidden_states
+        for layer in layers:
             x, shared = layer.forward_shared(
                 x,
                 shared,
@@ -522,7 +594,7 @@ class CausalDecoder(nn.Module):
             ...     ced_num_decoder_layers=1, csa_top_k=4,
             ...     csa_num_output_groups=2))
             >>> dec.prefill(torch.randn(1, 4, 16),
-            ...     torch.randn(1, 6, 16)).shape
+            ...     torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
         if not self.config.swa_bounded_replay:
@@ -597,7 +669,7 @@ class CausalDecoder(nn.Module):
             ...     num_attention_heads=2, num_key_value_heads=1,
             ...     ced_num_decoder_layers=1, csa_top_k=4,
             ...     csa_num_output_groups=2))
-            >>> dec(torch.randn(1, 4, 16), torch.randn(1, 6, 16)).shape
+            >>> dec(torch.randn(1, 4, 16), torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
         return self.prefill(hidden_states, encoder_final, position_ids)

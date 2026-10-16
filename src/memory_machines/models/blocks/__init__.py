@@ -29,6 +29,7 @@ from .gdn2 import GatedDeltaNet2, GatedDeltaNet2Mixer, add_resting_projection, a
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
+from .mhc_parallel import MHCAttentionGDN2, from_streams, to_streams
 from .positioning import CVPEContextBias, FRVMValueGate
 from .rkan import JacobiRKAN, PadeRKAN
 from .shared import (
@@ -79,6 +80,7 @@ __all__ = [
     "LivConvBlock",
     "LivDoubleGatedBase",
     "LivPerceiver",
+    "MHCAttentionGDN2",
     "NativeSparseAttention",
     "PadeRKAN",
     "SelfReferentialTitanMemory",
@@ -98,6 +100,8 @@ __all__ = [
     "_window_mask",
     "add_resting_projection",
     "apply_beta_guard",
+    "from_streams",
     "gated_delta_rule_2",
     "resting_corrected_write",
+    "to_streams",
 ]

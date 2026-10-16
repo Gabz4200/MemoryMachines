@@ -83,6 +83,44 @@ class MemoryMachineConfig:
         csa_hier_block_size: Positions per pool block (V4.1: 8)
         ced_num_encoder_layers: Bottom-half encoder layers L/2 (V4.1: 20)
         ced_num_decoder_layers: Top-half decoder layers L/2 (V4.1: 20)
+        ced_attention_gdn2_parallel: Build each CED *encoder* layer as
+            parallel attention ∥ MultiHead GDN-2 branches routed by
+            Single-Pass mHC (mHC streams persist between adjacent encoder
+            layers). The decoder stays plain CSA2: GDN-2 reaches it only
+            indirectly, through the encoder's global KV (Eq. 1). Default:
+            True.
+        ced_attention_variant: MultiHead SWA variant for the encoder
+            attention branch: ``dense`` (GroupedQueryAttention),
+            ``compressed``, ``compressed_sparse`` (default), or
+            ``heavily_compressed``. Each maps to its own sliding window
+            (``window_size`` / ``window_size_compressed`` /
+            ``window_size_sparse`` / ``window_size_shared``).
+        ced_gdn2_backend: GDN-2 reference path: ``naive``/``recurrent``
+            (recurrent form, used at inference) or ``chunk``/``wy_fast``
+            (parallel chunkwise form, training speed-up only). Both forms
+            mix the *full* encoder sequence — GDN-2 is never windowed.
+            Default: ``naive``.
+        ced_gdn2_chunk_size: WY chunk width for the parallel chunkwise
+            GDN-2 form. Default: ``64``.
+        ced_gdn2_expand_v: GDN-2 value-dim expansion relative to the key
+            head dim (``head_dim_v = head_dim_k * expand_v``). Default:
+            ``1.0``.
+        ced_gdn2_num_v_heads: GDN-2 value heads for GVA; ``0`` means
+            ``num_attention_heads`` (no expansion). Must be a multiple of
+            ``num_attention_heads`` when set. Default: ``0``.
+        ced_gdn2_use_short_conv: Depthwise short convs on GDN-2 q/k/v.
+            Default: ``True``.
+        ced_gdn2_conv_bias: Bias in the GDN-2 short convs. Default: ``False``.
+        ced_gdn2_use_qk_l2norm: L2-normalize GDN-2 q/k. Default: ``True``.
+        ced_gdn2_allow_neg_eigval: Scale the GDN-2 erase gate to ``[0, 2]``.
+            Default: ``False``.
+        ced_gdn2_beta_guard: Erase-contrast projection (requires
+            ``ced_gdn2_use_qk_l2norm``). Default: ``False``.
+        ced_gdn2_use_resting_state: Learn a GDN-2 resting prior the state
+            relaxes toward instead of zero. Default: ``False``.
+        engram_conv_kernel_size: Kernel width of the Engram short
+            depthwise causal conv (used when ``engram_use_conv``).
+            Default: ``4``.
         mhc_num_streams: Residual stream expansion factor n (V4/V4.1: 4)
         mhc_sinkhorn_iters: Sinkhorn-Knopp iterations (V4: 20)
         engram_orders: N-gram orders (V4.1: 2,3,4)
@@ -102,6 +140,18 @@ class MemoryMachineConfig:
             in {"ssd", "auto"}); created if missing. Default: "engram_tables"
         engram_offload_ram_threshold: Table bytes above which "auto" picks
             SSD offloading. Default: 1 GiB.
+        titan_memory_depth: Self-referential Titans fast-MLP depth per box.
+            Default: ``2``.
+        titan_fast_expansion: Titans fast-weight expansion over the head dim.
+            Default: ``1.0``.
+        titan_objective: Titans inner objective (``"l2"`` or ``"dot"``).
+            Default: ``"l2"``.
+        titan_use_short_conv: Local short conv on the Titans q/k/v.
+            Default: ``True``.
+        titan_conv_kernel_size: Kernel width of that Titans short conv.
+            Default: ``4``.
+        titan_chunk_size: Titans state-carry chunk width; ``0`` means the
+            whole sequence. Default: ``0``.
         dspark_num_drafts: Parallel draft positions (V4.1: 5)
         dspark_window: Drafter window (V4.1: 128)
     """
@@ -155,6 +205,19 @@ class MemoryMachineConfig:
     csa_hier_block_size: int = 8
     ced_num_encoder_layers: int = 20
     ced_num_decoder_layers: int = 20
+    ced_attention_gdn2_parallel: bool = True
+    ced_attention_variant: str = "compressed_sparse"
+    ced_gdn2_backend: str = "naive"
+    ced_gdn2_chunk_size: int = 64
+    ced_gdn2_expand_v: float = 1.0
+    ced_gdn2_num_v_heads: int = 0
+    ced_gdn2_use_short_conv: bool = True
+    ced_gdn2_conv_bias: bool = False
+    ced_gdn2_use_qk_l2norm: bool = True
+    ced_gdn2_allow_neg_eigval: bool = False
+    ced_gdn2_beta_guard: bool = False
+    ced_gdn2_use_resting_state: bool = False
+    engram_conv_kernel_size: int = 4
     mhc_num_streams: int = 4
     mhc_sinkhorn_iters: int = 20
     engram_orders: tuple[int, ...] = (2, 3, 4)
@@ -166,6 +229,12 @@ class MemoryMachineConfig:
     engram_offload: str = "ram"
     engram_offload_dir: str = "engram_tables"
     engram_offload_ram_threshold: int = 1 << 30
+    titan_memory_depth: int = 2
+    titan_fast_expansion: float = 1.0
+    titan_objective: str = "l2"
+    titan_use_short_conv: bool = True
+    titan_conv_kernel_size: int = 4
+    titan_chunk_size: int = 0
     seed: int = 0
     dspark_num_drafts: int = 5
     dspark_window: int = 128
@@ -246,6 +315,18 @@ class MemoryMachineConfig:
             raise ValueError(f"ced_num_encoder_layers ({self.ced_num_encoder_layers}) must be non-negative")
         if self.ced_num_decoder_layers < 0:
             raise ValueError(f"ced_num_decoder_layers ({self.ced_num_decoder_layers}) must be non-negative")
+        if self.ced_gdn2_backend not in ("naive", "recurrent", "chunk", "wy_fast"):
+            raise ValueError(f"ced_gdn2_backend ({self.ced_gdn2_backend!r}) must be one of 'naive', 'recurrent', 'chunk', 'wy_fast'")
+        if self.ced_gdn2_chunk_size <= 0:
+            raise ValueError(f"ced_gdn2_chunk_size ({self.ced_gdn2_chunk_size}) must be positive")
+        if self.ced_gdn2_expand_v <= 0:
+            raise ValueError(f"ced_gdn2_expand_v ({self.ced_gdn2_expand_v}) must be positive")
+        if self.ced_gdn2_num_v_heads < 0:
+            raise ValueError(f"ced_gdn2_num_v_heads ({self.ced_gdn2_num_v_heads}) must be non-negative (0 = num_attention_heads)")
+        if self.ced_gdn2_num_v_heads and self.ced_gdn2_num_v_heads % self.num_attention_heads != 0:
+            raise ValueError(f"ced_gdn2_num_v_heads ({self.ced_gdn2_num_v_heads}) must be a multiple of num_attention_heads ({self.num_attention_heads})")
+        if self.engram_conv_kernel_size <= 0:
+            raise ValueError(f"engram_conv_kernel_size ({self.engram_conv_kernel_size}) must be positive")
         if self.mhc_num_streams <= 0:
             raise ValueError(f"mhc_num_streams ({self.mhc_num_streams}) must be positive")
         if self.mhc_sinkhorn_iters <= 0:
@@ -268,6 +349,16 @@ class MemoryMachineConfig:
             raise ValueError("engram_offload_dir must be non-empty")
         if self.engram_offload_ram_threshold <= 0:
             raise ValueError(f"engram_offload_ram_threshold ({self.engram_offload_ram_threshold}) must be positive")
+        if self.titan_memory_depth < 1:
+            raise ValueError(f"titan_memory_depth ({self.titan_memory_depth}) must be >= 1")
+        if self.titan_fast_expansion <= 0:
+            raise ValueError(f"titan_fast_expansion ({self.titan_fast_expansion}) must be positive")
+        if self.titan_objective not in ("l2", "dot"):
+            raise ValueError(f"titan_objective ({self.titan_objective!r}) must be 'l2' or 'dot'")
+        if self.titan_conv_kernel_size <= 0:
+            raise ValueError(f"titan_conv_kernel_size ({self.titan_conv_kernel_size}) must be positive")
+        if self.titan_chunk_size < 0:
+            raise ValueError(f"titan_chunk_size ({self.titan_chunk_size}) must be non-negative (0 = whole sequence)")
         engram_elements = len(self.engram_orders) * self.engram_hash_heads * self.engram_num_entries * self.engram_dim_per_order
         if engram_elements > 268_435_456:
             raise ValueError(f"Engram tables total {engram_elements:,} elements (> 256M, ~1GB fp32); reduce engram_num_entries/engram_dim_per_order or shard explicitly")
