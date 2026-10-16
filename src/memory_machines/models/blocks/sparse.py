@@ -653,8 +653,9 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         position_ids: torch.Tensor | None = None,
         use_cache: bool = False,
         seeded_store: bool = False,
+        mode: str | None = None,
     ) -> tuple[torch.Tensor, CSA2SharedState]:
-        r"""forward_shared(hidden_states, shared=None, compress_from=None, compress_start_pos=0, position_ids=None, use_cache=False, seeded_store=False) -> (Tensor, CSA2SharedState)
+        r"""forward_shared(hidden_states, shared=None, compress_from=None, compress_start_pos=0, position_ids=None, use_cache=False, seeded_store=False, mode=None) -> (Tensor, CSA2SharedState)
 
         Run one CSA2 layer with cross-layer shared state.
 
@@ -684,6 +685,11 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                 decoder, whose global KV is projected from the
                 encoder-final states rather than derived from decoder
                 hidden states (CSA2, Eq. 1). Default: ``False``.
+            mode (str, optional): per-call override of the layer's
+                ``full``/``reindex``/``reuse`` mode, used by the looped
+                CED decoder to cycle the shared layer's stage without
+                mutating module state. Default: ``None``
+                (falls back to ``self.mode``).
 
         Returns:
             Tensor: fused outputs ``(B, Lq, hidden)`` and the updated shared
@@ -704,12 +710,15 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         bsz, q_len, _ = hidden_states.shape
         if shared is None:
             shared = CSA2SharedState()
+        mode = self.mode if mode is None else mode
+        if mode not in ("full", "reindex", "reuse"):
+            raise ValueError(f"mode ({mode}) must be full/reindex/reuse")
         past_len_raw = shared.total_len or 0
         q_pos, _ = _resolve_positions(hidden_states, q_len, past_len_raw, position_ids)
         if self.indexer is None:
             raise ValueError("forward_shared in full/reindex mode requires an indexer (use_indexer=False)")
         cq, q_main, v_q = self._make_main_queries(hidden_states)
-        if self.mode == "full":
+        if mode == "full":
             if seeded_store:
                 if shared.compressed_kv is None:
                     raise ValueError("seeded_store=True requires shared.compressed_kv (seed the store before the full layer)")
@@ -743,7 +752,7 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             pool = self.indexer.build_pool(scores, self._hier_pool_blocks(), self.config.csa_hier_block_size)
             shared.compressed_kv, shared.comp_end_pos = full_comp, full_ends
             shared.indexer_k, shared.topk_indices, shared.pool_indices = indexer_k, topk, pool
-        elif self.mode == "reindex":
+        elif mode == "reindex":
             if shared.compressed_kv is None or shared.indexer_k is None:
                 raise ValueError("reindex mode requires a Full layer to run first (empty shared state)")
             full_comp, full_ends = shared.compressed_kv, shared.comp_end_pos

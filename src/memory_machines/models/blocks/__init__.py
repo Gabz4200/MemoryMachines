@@ -7,7 +7,7 @@ mixers, auxiliary memory, positioning, and shared cache helpers so existing
 
 from .attention import GroupedQueryAttention
 from .causal_conv1d import ShortConvolution
-from .ced import CausalDecoder, CausalEncoderDecoderStack, CEDGlobalKVProjection
+from .ced import AdaptiveExitGate, CausalDecoder, CausalEncoderDecoderStack, CEDGlobalKVProjection, VocabularyUpProjection
 from .compression import (
     AttentionSink,
     BlockCompressor,
@@ -52,6 +52,7 @@ from .sparse import (
 )
 
 __all__ = [
+    "AdaptiveExitGate",
     "AttentionSink",
     "BlockCompressor",
     "BranchGate",
@@ -93,6 +94,7 @@ __all__ = [
     "SwiGLU",
     "TitansFastWeightsMemory",
     "TitansMAGBlock",
+    "VocabularyUpProjection",
     "_causal_comp_mask",
     "_check_position_bounds",
     "_past_total_len",

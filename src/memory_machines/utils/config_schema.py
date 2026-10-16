@@ -104,6 +104,25 @@ class MemoryMachineConfig:
             means the shared ``intermediate_size``. Default: ``0``.
         ced_decoder_ffn_intermediate_size: Decoder FFN hidden width; ``0``
             means the shared ``intermediate_size``. Default: ``0``.
+        ced_decoder_looping: Build the CED decoder in the Looped Language
+            Model style (arXiv:2510.25741): the repeated
+            ``CSA2 -> DenseFFN`` pattern collapses into one
+            parameter-shared layer plus one shared encoder-KV projection,
+            applied ``ced_decoder_loop_steps`` times. Default: ``False``.
+        ced_decoder_loop_steps: Recurrent depth ``T_max`` of the looped
+            decoder (number of times the shared layer is applied). Default:
+            ``4``.
+        ced_decoder_loop_exit_threshold: Q-exit threshold ``q`` for the
+            decoder's exit gate: the loop stops at the first step whose
+            cumulative exit probability reaches ``q``. ``0.0`` exits
+            immediately, ``1.0`` forces a full loop. Default: ``0.5``.
+        ced_decoder_hidden_size: Asymmetric decoder width. ``0`` (default)
+            keeps the decoder at ``hidden_size`` (symmetric encoder/decoder).
+            When set, the encoder stays at ``hidden_size`` (wide prefill) and
+            the decoder half is built at this narrower width; the decoder
+            global-KV projection doubles as the cross-attention downsample
+            (``W_K``/``W_V``: ``hidden_size`` -> decoder head space).
+            Must be divisible by ``num_attention_heads``.
         ced_gdn2_backend: GDN-2 reference path: ``naive``/``recurrent``
             (recurrent form, used at inference) or ``chunk``/``wy_fast``
             (parallel chunkwise form, training speed-up only). Both forms
@@ -224,6 +243,10 @@ class MemoryMachineConfig:
     ced_decoder_ffn: str = "swiglu"
     ced_encoder_ffn_intermediate_size: int = 0
     ced_decoder_ffn_intermediate_size: int = 0
+    ced_decoder_looping: bool = False
+    ced_decoder_loop_steps: int = 4
+    ced_decoder_loop_exit_threshold: float = 0.5
+    ced_decoder_hidden_size: int = 0
     ced_gdn2_backend: str = "naive"
     ced_gdn2_chunk_size: int = 64
     ced_gdn2_expand_v: float = 1.0
@@ -342,6 +365,14 @@ class MemoryMachineConfig:
             raise ValueError(f"ced_encoder_ffn_intermediate_size ({self.ced_encoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
         if self.ced_decoder_ffn_intermediate_size < 0:
             raise ValueError(f"ced_decoder_ffn_intermediate_size ({self.ced_decoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
+        if self.ced_decoder_loop_steps < 1:
+            raise ValueError(f"ced_decoder_loop_steps ({self.ced_decoder_loop_steps}) must be >= 1")
+        if not 0.0 <= self.ced_decoder_loop_exit_threshold <= 1.0:
+            raise ValueError(f"ced_decoder_loop_exit_threshold ({self.ced_decoder_loop_exit_threshold}) must be in [0, 1]")
+        if self.ced_decoder_hidden_size < 0:
+            raise ValueError(f"ced_decoder_hidden_size ({self.ced_decoder_hidden_size}) must be non-negative (0 = hidden_size)")
+        if self.ced_decoder_hidden_size and self.ced_decoder_hidden_size % self.num_attention_heads != 0:
+            raise ValueError(f"ced_decoder_hidden_size ({self.ced_decoder_hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})")
         if self.ced_gdn2_backend not in ("naive", "recurrent", "chunk", "wy_fast"):
             raise ValueError(f"ced_gdn2_backend ({self.ced_gdn2_backend!r}) must be one of 'naive', 'recurrent', 'chunk', 'wy_fast'")
         if self.ced_gdn2_chunk_size <= 0:
