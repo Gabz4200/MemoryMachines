@@ -257,7 +257,7 @@ def test_ced_stack_and_standalone_decoder_agree_with_blocks():
     torch.manual_seed(0)
     cfg = _ced_cfg()
     stack = CausalEncoderDecoderStack(cfg).eval()
-    dec = CausalDecoder(cfg, layers=list(stack.decoder_layers), global_projs=list(stack.global_projs)).eval()
+    dec = CausalDecoder(cfg, layers=list(stack.decoder_layers), global_projs=list(stack.global_projs), ffns=list(stack.decoder_ffns)).eval()
     L = 8
     torch.manual_seed(1)
     h = torch.randn(1, L, H)

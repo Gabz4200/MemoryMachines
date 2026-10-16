@@ -95,6 +95,15 @@ class MemoryMachineConfig:
             ``heavily_compressed``. Each maps to its own sliding window
             (``window_size`` / ``window_size_compressed`` /
             ``window_size_sparse`` / ``window_size_shared``).
+        ced_encoder_ffn: Dense FFN kind for every CED *encoder* layer
+            (currently ``"swiglu"``). Configured independently of the decoder
+            so the two halves may use different FFNs. Default: ``"swiglu"``.
+        ced_decoder_ffn: Dense FFN kind for every CED *decoder* layer
+            (currently ``"swiglu"``). Default: ``"swiglu"``.
+        ced_encoder_ffn_intermediate_size: Encoder FFN hidden width; ``0``
+            means the shared ``intermediate_size``. Default: ``0``.
+        ced_decoder_ffn_intermediate_size: Decoder FFN hidden width; ``0``
+            means the shared ``intermediate_size``. Default: ``0``.
         ced_gdn2_backend: GDN-2 reference path: ``naive``/``recurrent``
             (recurrent form, used at inference) or ``chunk``/``wy_fast``
             (parallel chunkwise form, training speed-up only). Both forms
@@ -207,6 +216,10 @@ class MemoryMachineConfig:
     ced_num_decoder_layers: int = 20
     ced_attention_gdn2_parallel: bool = True
     ced_attention_variant: str = "compressed_sparse"
+    ced_encoder_ffn: str = "swiglu"
+    ced_decoder_ffn: str = "swiglu"
+    ced_encoder_ffn_intermediate_size: int = 0
+    ced_decoder_ffn_intermediate_size: int = 0
     ced_gdn2_backend: str = "naive"
     ced_gdn2_chunk_size: int = 64
     ced_gdn2_expand_v: float = 1.0
@@ -315,6 +328,14 @@ class MemoryMachineConfig:
             raise ValueError(f"ced_num_encoder_layers ({self.ced_num_encoder_layers}) must be non-negative")
         if self.ced_num_decoder_layers < 0:
             raise ValueError(f"ced_num_decoder_layers ({self.ced_num_decoder_layers}) must be non-negative")
+        if self.ced_encoder_ffn not in ("swiglu",):
+            raise ValueError(f"ced_encoder_ffn ({self.ced_encoder_ffn!r}) must be 'swiglu'")
+        if self.ced_decoder_ffn not in ("swiglu",):
+            raise ValueError(f"ced_decoder_ffn ({self.ced_decoder_ffn!r}) must be 'swiglu'")
+        if self.ced_encoder_ffn_intermediate_size < 0:
+            raise ValueError(f"ced_encoder_ffn_intermediate_size ({self.ced_encoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
+        if self.ced_decoder_ffn_intermediate_size < 0:
+            raise ValueError(f"ced_decoder_ffn_intermediate_size ({self.ced_decoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
         if self.ced_gdn2_backend not in ("naive", "recurrent", "chunk", "wy_fast"):
             raise ValueError(f"ced_gdn2_backend ({self.ced_gdn2_backend!r}) must be one of 'naive', 'recurrent', 'chunk', 'wy_fast'")
         if self.ced_gdn2_chunk_size <= 0:

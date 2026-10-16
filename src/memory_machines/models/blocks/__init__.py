@@ -5,7 +5,7 @@ mixers, auxiliary memory, positioning, and shared cache helpers so existing
 ``memory_machines.models.blocks`` imports keep working.
 """
 
-from .attention import GroupedQueryAttention, SwiGLU
+from .attention import GroupedQueryAttention
 from .causal_conv1d import ShortConvolution
 from .ced import CausalDecoder, CausalEncoderDecoderStack, CEDGlobalKVProjection
 from .compression import (
@@ -25,6 +25,7 @@ from .fast_weights import (
     TitansFastWeightsMemory,
     TitansMAGBlock,
 )
+from .ffn import DenseFFN, SwiGLU, build_ffn
 from .gdn2 import GatedDeltaNet2, GatedDeltaNet2Mixer, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
@@ -65,6 +66,7 @@ __all__ = [
     "CompressedSparseAttention2",
     "ContinuumMemorySystem",
     "DSparkDrafter",
+    "DenseFFN",
     "EngramMemory",
     "FRVMValueGate",
     "FactoredLinear",
@@ -100,6 +102,7 @@ __all__ = [
     "_window_mask",
     "add_resting_projection",
     "apply_beta_guard",
+    "build_ffn",
     "from_streams",
     "gated_delta_rule_2",
     "resting_corrected_write",

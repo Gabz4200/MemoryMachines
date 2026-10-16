@@ -19,6 +19,12 @@ attention branch keeps its precision local. The decoder is never a GDN-2
 block — it stays plain CSA2 and inherits the global context through the
 encoder's KV (Eq. 1). Set the flag to ``False`` to recover plain CSA2
 encoder layers.
+
+Every encoder layer is followed by a dense (non-MoE) feed-forward sub-layer
+(:class:`~memory_machines.models.blocks.ffn.DenseFFN`, kind
+``config.ced_encoder_ffn``, default SwiGLU) with a pre-norm residual, and
+every decoder layer is followed by its own independently configured FFN
+(``config.ced_decoder_ffn``, default SwiGLU).
 """
 
 from typing import cast
@@ -29,6 +35,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .compression import BlockCompressor
+from .ffn import DenseFFN
 from .mhc_parallel import MHCAttentionGDN2, from_streams, to_streams
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention2
@@ -41,8 +48,9 @@ def _run_stream_layers(
     num_streams: int,
     position_ids: torch.Tensor | None = None,
     seeded_store: bool = False,
+    ffns: list[nn.Module] | None = None,
 ) -> tuple[torch.Tensor, CSA2SharedState | None]:
-    r"""_run_stream_layers(layers, hidden_states, shared, num_streams, position_ids=None, seeded_store=False) -> (Tensor, CSA2SharedState | None)
+    r"""_run_stream_layers(layers, hidden_states, shared, num_streams, position_ids=None, seeded_store=False, ffns=None) -> (Tensor, CSA2SharedState | None)
 
     Run parallel mHC blocks over persistent residual streams.
 
@@ -51,12 +59,15 @@ def _run_stream_layers(
     the single-pass routing coefficients ``prev_a`` between adjacent blocks,
     and collapses the final streams with a mean
     (:func:`~memory_machines.models.blocks.mhc_parallel.from_streams`).
+
+    When ``ffns`` is given (one per block), each FFN is applied to the streams
+    right after its block.
     """
     streams = to_streams(hidden_states, num_streams)
     if shared is None:
         shared = CSA2SharedState(total_len=0)
     prev_a: torch.Tensor | None = None
-    for layer in layers:
+    for i, layer in enumerate(layers):
         streams, shared, prev_a = layer.forward_shared(
             streams,
             shared,
@@ -65,6 +76,8 @@ def _run_stream_layers(
             use_cache=True,
             seeded_store=seeded_store,
         )
+        if ffns is not None:
+            streams = ffns[i](streams)
     return from_streams(streams), shared
 
 
@@ -155,13 +168,18 @@ class CausalEncoderDecoderStack(nn.Module):
     is a parallel attention ∥ GDN-2 block routed by Single-Pass mHC
     (``config.ced_attention_gdn2_parallel``); the residual streams persist
     between adjacent encoder layers and the routing coefficients are threaded
-    single-pass. The decoder carries no GDN-2 branch — it consumes the encoder's
-    global KV, so GDN-2 reaches it only indirectly, even under bounded replay.
+    single-pass. Each encoder layer is followed by a dense (non-MoE)
+    feed-forward sub-layer (:class:`DenseFFN`, kind ``config.ced_encoder_ffn``,
+    default SwiGLU); the decoder uses its own independently configured FFN
+    (``config.ced_decoder_ffn``). The decoder carries no GDN-2
+    branch — it consumes the encoder's global KV, so GDN-2 reaches it only
+    indirectly, even under bounded replay.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``ced_num_encoder_layers``, ``ced_num_decoder_layers``,
             ``ced_attention_gdn2_parallel``, ``ced_attention_variant``,
+            ``ced_encoder_ffn``, ``ced_decoder_ffn``,
             ``ced_gdn2_backend``,
             ``csa_encoder_compression_ratio``,
             ``csa_decoder_compression_ratio``, ``window_size``, and
@@ -199,6 +217,9 @@ class CausalEncoderDecoderStack(nn.Module):
         else:
             enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
         self.encoder_layers = nn.ModuleList(enc)
+        # Dense encoder FFNs, one per layer (kind and width from the
+        # encoder-side config, so the two halves stay independent).
+        self.encoder_ffns = nn.ModuleList([DenseFFN(config, config.ced_encoder_ffn, config.ced_encoder_ffn_intermediate_size or None) for _ in range(len(enc))])
         # The decoder half is a standalone CausalDecoder so the
         # Eq. 1 seeding path lives in exactly one place.
         self.decoder = CausalDecoder(config, layers=decoder_layers)
@@ -231,6 +252,18 @@ class CausalEncoderDecoderStack(nn.Module):
         """
         return self.decoder.global_projs
 
+    @property
+    def decoder_ffns(self) -> nn.ModuleList:
+        r"""decoder_ffns() -> nn.ModuleList
+
+        Per-layer dense decoder feed-forward sub-layers (view of
+        :attr:`CausalDecoder.ffns`).
+
+        Returns:
+            nn.ModuleList: the decoder's :class:`DenseFFN` layers.
+        """
+        return self.decoder.ffns
+
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
@@ -239,7 +272,7 @@ class CausalEncoderDecoderStack(nn.Module):
         balanced branch fusion, uniform pooling, and zero-start
         (or depth-scaled) residual outputs.
         """
-        for layer in self.encoder_layers:
+        for layer in (*self.encoder_layers, *self.encoder_ffns):
             reset = getattr(layer, "reset_parameters", None)
             if callable(reset):
                 reset()
@@ -249,6 +282,10 @@ class CausalEncoderDecoderStack(nn.Module):
         r"""encode(hidden_states, position_ids=None) -> (Tensor, CSA2SharedState)
 
         Run the encoder stack and return final states plus shared state.
+
+        Each encoder layer's token mixer is followed by its dense
+        feed-forward sub-layer (:class:`~memory_machines.models.blocks.ffn.DenseFFN`,
+        ``config.ced_encoder_ffn``).
 
         Args:
             hidden_states (Tensor): encoder inputs of shape ``(B, Le, D)``.
@@ -271,16 +308,18 @@ class CausalEncoderDecoderStack(nn.Module):
         shared: CSA2SharedState | None = None
         x = hidden_states
         layers = list(self.encoder_layers)
+        ffns = list(self.encoder_ffns)
         for layer in layers:
             if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
                 raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
         if layers and all(isinstance(layer, MHCAttentionGDN2) for layer in layers):
-            x, shared = _run_stream_layers(cast("list[MHCAttentionGDN2]", layers), hidden_states, None, self.config.mhc_num_streams, position_ids, seeded_store=False)
+            x, shared = _run_stream_layers(cast("list[MHCAttentionGDN2]", layers), hidden_states, None, self.config.mhc_num_streams, position_ids, seeded_store=False, ffns=ffns)
         else:
-            for layer in cast("list[CompressedSparseAttention2]", layers):
+            for i, layer in enumerate(cast("list[CompressedSparseAttention2]", layers)):
                 if shared is None:
                     shared = CSA2SharedState(total_len=0)
                 x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
+                x = ffns[i](x)
         if shared is None:
             raise ValueError("encode produced no shared state (encoder_layers is empty)")
         return x, shared
@@ -405,16 +444,22 @@ class CausalDecoder(nn.Module):
     carries no GDN-2 branch: the encoder owns the global GDN-2 mixer
     (``config.ced_attention_gdn2_parallel``), and the decoder inherits that
     global context through the encoder's KV, so bounded replay stays valid.
+    Each decoder layer is followed by a dense (non-MoE) feed-forward sub-layer
+    (:class:`DenseFFN`, kind ``config.ced_decoder_ffn``, default SwiGLU),
+    configured independently of the encoder's FFN.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
-            provides ``ced_num_decoder_layers``,
+            provides ``ced_num_decoder_layers``, ``ced_decoder_ffn``,
             ``csa_decoder_compression_ratio``, ``window_size``,
             and ``swa_bounded_replay``.
         layers (list of nn.Module, optional): explicit decoder
             layers. Default: ``None`` (build from ``config``).
         global_projs (list of nn.Module, optional): explicit
             per-layer global KV projections. Default: ``None``
+            (build from ``config``).
+        ffns (list of nn.Module, optional): explicit per-layer dense FFNs;
+            must match the number of decoder layers. Default: ``None``
             (build from ``config``).
 
     Examples::
@@ -434,12 +479,14 @@ class CausalDecoder(nn.Module):
         config: MemoryMachineConfig,
         layers: list[nn.Module] | None = None,
         global_projs: list[nn.Module] | None = None,
+        ffns: list[nn.Module] | None = None,
     ):
         super().__init__()
         self.config = config
         dec_n = config.ced_num_decoder_layers
         layers_list = list(layers) if layers is not None else None
         projs_list = list(global_projs) if global_projs is not None else None
+        ffns_list = list(ffns) if ffns is not None else None
         if layers_list is not None and projs_list is not None and len(layers_list) != len(projs_list):
             raise ValueError(f"layers ({len(layers_list)}) and global_projs ({len(projs_list)}) must have equal length; each decoder layer pairs with one global KV projection (Eq. 1)")
         if layers_list is not None and projs_list is None and len(layers_list) != dec_n:
@@ -459,20 +506,25 @@ class CausalDecoder(nn.Module):
                 )
                 for i in range(dec_n)
             ]
+        if ffns_list is not None and len(ffns_list) != len(built):
+            raise ValueError(f"ffns ({len(ffns_list)}) must match the number of decoder layers ({len(built)}); each layer pairs with one dense FFN")
         self.layers = nn.ModuleList(built)
         self.global_projs = nn.ModuleList(projs_list if projs_list is not None else [CEDGlobalKVProjection(config) for _ in range(dec_n)])
+        # Dense decoder FFNs, one per layer (kind and width from the
+        # decoder-side config, independent of the encoder's).
+        self.ffns = nn.ModuleList(ffns_list if ffns_list is not None else [DenseFFN(config, config.ced_decoder_ffn, config.ced_decoder_ffn_intermediate_size or None) for _ in range(len(built))])
         self.window_size = config.window_size
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Re-applies every decoder layer and global-projection init
+        Re-applies every decoder layer, global-projection, and dense FFN init
         so a freshly built (or re-initialized) decoder starts from
         balanced branch fusion, uniform pooling, and zero-start
         (or depth-scaled) residual outputs.
         """
-        for module in (*self.layers, *self.global_projs):
+        for module in (*self.layers, *self.global_projs, *self.ffns):
             reset = getattr(module, "reset_parameters", None)
             if callable(reset):
                 reset()
@@ -495,7 +547,10 @@ class CausalDecoder(nn.Module):
         (:class:`CEDGlobalKVProjection`, Eq. 1); it is *not*
         derived from the decoder hidden states. The first layer
         builds the shared store; subsequent ``reindex``/``reuse``
-        layers consume it, so the projection runs once.
+        layers consume it, so the projection runs once. Each layer is
+        followed by its dense feed-forward sub-layer
+        (:class:`~memory_machines.models.blocks.ffn.DenseFFN`,
+        ``config.ced_decoder_ffn``).
 
         Args:
             hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
@@ -546,7 +601,7 @@ class CausalDecoder(nn.Module):
             total_len=start_pos,
         )
         x = hidden_states
-        for layer in layers:
+        for i, layer in enumerate(layers):
             x, shared = layer.forward_shared(
                 x,
                 shared,
@@ -554,6 +609,7 @@ class CausalDecoder(nn.Module):
                 use_cache=True,
                 seeded_store=seeded_store,
             )
+            x = self.ffns[i](x)
         return x
 
     def prefill(

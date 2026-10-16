@@ -279,6 +279,7 @@ def test_causal_decoder_matches_stack_decoder():
         cfg,
         layers=list(stack.decoder_layers),
         global_projs=list(stack.global_projs),
+        ffns=list(stack.decoder_ffns),
     ).eval()
 
     L = 10

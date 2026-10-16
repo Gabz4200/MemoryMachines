@@ -1,11 +1,12 @@
-r"""Dense attention: GQA with built-in sliding window, SwiGLU.
+r"""Dense attention: GQA with built-in sliding window.
 
 :class:`GroupedQueryAttention` is the grouped-query baseline with
 optional CVPE QK bias, FRVM OV gating, and a built-in sliding window:
 ``window_size > 0`` bounds causal attention to the last ``window_size``
 keys and keeps only that window in the returned KV cache, while
 ``window_size <= 0`` runs full attention with an untruncated cache.
-:class:`SwiGLU` is the gated feed-forward block.
+The dense feed-forward block lives in
+:mod:`memory_machines.models.blocks.ffn`.
 """
 
 import math
@@ -781,86 +782,3 @@ class GroupedQueryAttention(nn.Module):
         else:
             positions = positions[-self.window_size :]
         return key_states[:, :, -self.window_size :, :], value_states[:, :, -self.window_size :, :], positions
-
-
-class SwiGLU(nn.Module):
-    r"""SwiGLU(config)
-
-    SwiGLU gated feed-forward block.
-
-    .. math::
-        \mathrm{SwiGLU}(x) = W_{down}(\mathrm{SiLU}(W_{gate}x) \odot W_{up}x)
-
-    Args:
-        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
-            provides ``hidden_size`` and ``intermediate_size``.
-
-    Examples::
-
-        >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-        >>> mlp = SwiGLU(MemoryMachineConfig(hidden_size=32, intermediate_size=64))
-        >>> mlp(torch.randn(2, 5, 32)).shape
-        torch.Size([2, 5, 32])
-    """
-
-    def __init__(self, config: MemoryMachineConfig):
-        super().__init__()
-        if config.intermediate_size % 2 != 0:
-            raise ValueError(f"SwiGLU needs even intermediate_size, got {config.intermediate_size}")
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.initializer_range: float = config.initializer_range
-        self.num_layers: int = config.num_layers
-        self.residual_init_scale: bool = config.residual_init_scale
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        SwiGLU.reset_parameters(self)
-
-    def reset_parameters(self) -> None:
-        r"""reset_parameters() -> None
-
-        Gate/up projections use truncated normal
-        ``N(0, initializer_range^2)`` (DeepSeek-style,
-        ``initializer_range = 0.006``). The down projection
-        is either zero-initialized (identity residual start,
-        Fixup/ReZero) or depth-scaled to
-        ``initializer_range / sqrt(2N)`` (Megatron-LM/Qwen
-        residual scaling) per ``config.residual_init_scale``.
-        The SiLU-gated product has roughly half the variance
-        of a plain linear path, so a variance-matched input
-        init plus a small/zero-start output keeps early-step
-        activations bounded.
-        """
-        std = self.initializer_range
-        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
-        nn.init.trunc_normal_(self.gate_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.up_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        if scale is None:
-            nn.init.zeros_(self.down_proj.weight)
-        else:
-            nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        r"""forward(x) -> Tensor
-
-        Apply the gated feed-forward transformation.
-
-        Args:
-            x (Tensor): input of shape ``(B, L, hidden)``.
-
-        Returns:
-            Tensor: output with the same shape ``(B, L, hidden)``.
-
-        Examples::
-
-            >>> import torch
-            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-            >>> SwiGLU(MemoryMachineConfig(hidden_size=16, intermediate_size=32))(torch.randn(1, 4, 16)).shape
-            torch.Size([1, 4, 16])
-        """
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        swish_gate = F.silu(gate)
-        return self.down_proj(swish_gate * up)
