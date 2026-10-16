@@ -84,3 +84,29 @@ def test_config_rejects_bad_titan_fields():
         MemoryMachineConfig(titan_objective="bogus")
     with pytest.raises(ValueError, match="titan_chunk_size"):
         MemoryMachineConfig(titan_chunk_size=-1)
+
+
+def test_cms_ffn_and_norm_are_config_controlled():
+    from torch import nn
+
+    from memory_machines.models.blocks.dyt import DyT
+    from memory_machines.models.blocks.fast_weights import ContinuumMemorySystem, HopeAttentionBlock, HopeBlock
+    from memory_machines.models.blocks.ffn import ClassicMLP, SwiGLU
+
+    default = ContinuumMemorySystem(MemoryMachineConfig(hidden_size=16))
+    assert all(isinstance(level.ffn, SwiGLU) and isinstance(level.norm, DyT) for level in default.levels)
+
+    cfg = MemoryMachineConfig(hidden_size=16, cms_ffn="classic_mlp", cms_norm="rmsnorm")
+    cms = ContinuumMemorySystem(cfg)
+    assert all(level.kind == "classic_mlp" and isinstance(level.ffn, ClassicMLP) and isinstance(level.norm, nn.RMSNorm) for level in cms.levels)
+
+    tiny = MemoryMachineConfig(hidden_size=16, num_attention_heads=2, num_key_value_heads=2, csa_num_output_groups=2)
+    assert HopeBlock(tiny).cms.hidden_size == 16
+    assert HopeAttentionBlock(tiny, num_heads=2).cms.hidden_size == 16
+
+
+def test_config_rejects_bad_cms_fields():
+    with pytest.raises(ValueError, match="cms_ffn"):
+        MemoryMachineConfig(cms_ffn="bogus")
+    with pytest.raises(ValueError, match="cms_norm"):
+        MemoryMachineConfig(cms_norm="bogus")

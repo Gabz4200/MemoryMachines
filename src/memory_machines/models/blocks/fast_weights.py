@@ -55,6 +55,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .causal_conv1d import ShortConvolution
+from .ffn import DenseFFN
 
 __all__ = [
     "ContinuumMemorySystem",
@@ -580,7 +581,7 @@ class SelfReferentialTitanMemory(nn.Module):
 
     def _box_weights(self, box: str) -> nn.ParameterList:
         """Per-box fast-weight parameters (typed view of ``fast_init``)."""
-        return cast("nn.ParameterList", self.fast_init[box])
+        return self.fast_init[box]
 
     def reset_parameters(self) -> None:
         """Init fast-weight priors and projections."""
@@ -824,7 +825,7 @@ class SelfReferentialTitanMixer(nn.Module):
     @property
     def fast_init(self) -> dict[str, nn.ParameterList]:
         """Fast-weight priors owned by the wrapped memory (``box -> ParameterList``)."""
-        return cast("dict[str, nn.ParameterList]", self.memory.fast_init)
+        return self.memory.fast_init
 
     def forward(
         self,
@@ -935,32 +936,41 @@ class SelfReferentialTitanMixer(nn.Module):
 
 
 class ContinuumMemorySystem(nn.Module):
-    r"""ContinuumMemorySystem(...) — chain of MLP levels (Sec. 7.1, Eq. 70-71).
+    r"""ContinuumMemorySystem(config, ...) — chain of dense FFN levels (Sec. 7.1, Eq. 70-71).
 
-    ``y = MLP_fk(...MLP_f1(x))`` where level ``l`` owns update interval
-    ``C^(l)`` via :meth:`should_update`. Levels are static parameters in a
-    forward pass (outer-loop / scheduled updates own them); the schedule
-    metadata is what makes the chain a continuum rather than one MLP.
+    ``y = FFN_fk(...FFN_f1(x))`` where level ``l`` owns update interval
+    ``C^(l)`` via :meth:`should_update`. Each level is a
+    :class:`~memory_machines.models.blocks.ffn.DenseFFN` (pre-norm residual
+    ``x + FFN(norm(x))``), so the FFN kind and the pre-norm are selected by
+    :attr:`~memory_machines.utils.config_schema.MemoryMachineConfig.cms_ffn`
+    (default ``"swiglu"``) and
+    :attr:`~memory_machines.utils.config_schema.MemoryMachineConfig.cms_norm`
+    (default ``"dyT"``). Levels are static parameters in a forward pass
+    (outer-loop / scheduled updates own them); the schedule metadata is what
+    makes the chain a continuum rather than one FFN.
 
     Args:
-        hidden_size: model width ``D``.
+        config: provides ``hidden_size``, ``rms_norm_eps``, and the ``cms_ffn``
+            / ``cms_norm`` knobs.
         num_levels: chain length ``k``.
         update_intervals: per-level ``C^(l)`` (default powers of two).
-        expansion: FFN hidden multiplier.
-        norm_eps: RMSNorm epsilon.
+        expansion: FFN hidden multiplier (level width
+            ``round(hidden_size * expansion)``).
     """
 
     def __init__(
         self,
-        hidden_size: int,
+        config: MemoryMachineConfig,
         num_levels: int = 2,
         update_intervals: tuple[int, ...] | None = None,
         expansion: float = 4.0,
-        norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        hidden_size = config.hidden_size
         if hidden_size <= 0 or num_levels < 1:
             raise ValueError("hidden_size must be positive and num_levels >= 1")
+        if expansion <= 0:
+            raise ValueError(f"expansion must be positive, got {expansion}")
         if update_intervals is None:
             update_intervals = tuple(2**i for i in range(num_levels))
         if len(update_intervals) != num_levels or any(c < 1 for c in update_intervals):
@@ -968,9 +978,8 @@ class ContinuumMemorySystem(nn.Module):
         self.hidden_size = hidden_size
         self.num_levels = num_levels
         self.update_intervals = tuple(update_intervals)
-        hidden = max(1, round(hidden_size * expansion))
-        self.norms = nn.ModuleList([nn.RMSNorm(hidden_size, eps=norm_eps) for _ in range(num_levels)])
-        self.mlps = nn.ModuleList([nn.Sequential(nn.Linear(hidden_size, hidden), nn.SiLU(), nn.Linear(hidden, hidden_size)) for _ in range(num_levels)])
+        intermediate = max(1, round(hidden_size * expansion))
+        self.levels = nn.ModuleList([DenseFFN(config, config.cms_ffn, config.cms_norm, intermediate_size=intermediate) for _ in range(num_levels)])
 
     def should_update(self, level: int, step: int) -> bool:
         """should_update(level, step) -> bool — Eq. 71 schedule gate."""
@@ -981,59 +990,72 @@ class ContinuumMemorySystem(nn.Module):
         return step % self.update_intervals[level] == 0
 
     def load_pretrained_into_levels(self, modules: Sequence[nn.Module]) -> None:
-        """Ad-hoc level stacking (Sec. 7.3): init levels from pretrained MLPs.
+        """Ad-hoc level stacking (Sec. 7.3): init levels from pretrained FFNs.
 
-        Copies matching ``weight``/``bias`` tensors where shapes agree and
-        leaves the rest at their random init.
+        Copies ``weight``/``bias`` tensors into each level's inner FFN where
+        the name and shape agree (a source ``DenseFFN`` contributes through its
+        ``ffn.`` prefix) and leaves the rest at their init.
         """
         if len(modules) != self.num_levels:
             raise ValueError(f"expected {self.num_levels} modules, got {len(modules)}")
-        for dst_seq, src in zip(self.mlps, modules):
+        for level, src in zip(cast("list[DenseFFN]", self.levels), modules):
             src_params = {n: p for n, p in src.named_parameters()}
-            for n, p in dst_seq.named_parameters():
-                if n in src_params and src_params[n].shape == p.shape:
-                    p.data.copy_(src_params[n].data)
+            for name, param in level.ffn.named_parameters():
+                donor = src_params.get(name)
+                if donor is None:
+                    donor = src_params.get(f"ffn.{name}")
+                if donor is not None and donor.shape == param.shape:
+                    param.data.copy_(donor.data)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """forward(x) -> Tensor — Eq. 70 chain with per-level residuals."""
         if x.dim() != 3 or x.shape[-1] != self.hidden_size:
             raise ValueError(f"x must be [B, T, D={self.hidden_size}], got {tuple(x.shape)}")
         h = x
-        for norm, mlp in zip(self.norms, self.mlps):
-            h = h + mlp(norm(h))
+        for level in self.levels:
+            h = level(h)
         return h
 
 
 class HopeBlock(nn.Module):
-    r"""HopeBlock(...) — self-modifying Titans followed by CMS (Sec. 8.3, Eq. 94-97).
+    r"""HopeBlock(config, ...) — self-modifying Titans followed by CMS (Sec. 8.3, Eq. 94-97).
 
-    ``o = SelfRefTitan(x)`` then ``y = MLP_fk(...MLP_f1(o))``. Queries and
+    ``o = SelfRefTitan(x)`` then ``y = FFN_fk(...FFN_f1(o))``. Queries and
     keys are L2-normalized and the input carries a local convolution of
-    width 4, matching the paper's experimental setup.
+    width 4, matching the paper's experimental setup. The CMS chain is
+    configured through ``config.cms_ffn`` / ``config.cms_norm``.
 
     Args:
-        hidden_size: model width ``D``.
-        num_heads: self-referential heads.
+        config: provides ``hidden_size``, ``num_attention_heads``,
+            ``rms_norm_eps``, and the ``cms_*`` knobs.
+        num_heads: self-referential heads; ``None`` uses
+            ``config.num_attention_heads``.
         memory_depth: fast-MLP depth per box.
         num_levels: CMS chain length.
         update_intervals: CMS per-level intervals (default powers of two).
         use_short_conv: local conv window on the Titan input.
-        norm_eps: epsilon for norms.
     """
 
     def __init__(
         self,
-        hidden_size: int,
-        num_heads: int = 8,
+        config: MemoryMachineConfig,
+        num_heads: int | None = None,
         memory_depth: int = 2,
         num_levels: int = 2,
         update_intervals: tuple[int, ...] | None = None,
         use_short_conv: bool = True,
-        norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        self.titan = SelfReferentialTitanMemory(hidden_size=hidden_size, num_heads=num_heads, memory_depth=memory_depth, use_short_conv=use_short_conv, conv_kernel_size=4, norm_eps=norm_eps)
-        self.cms = ContinuumMemorySystem(hidden_size=hidden_size, num_levels=num_levels, update_intervals=update_intervals, norm_eps=norm_eps)
+        num_heads = config.num_attention_heads if num_heads is None else num_heads
+        self.titan = SelfReferentialTitanMemory(
+            hidden_size=config.hidden_size,
+            num_heads=num_heads,
+            memory_depth=memory_depth,
+            use_short_conv=use_short_conv,
+            conv_kernel_size=4,
+            norm_eps=config.rms_norm_eps,
+        )
+        self.cms = ContinuumMemorySystem(config=config, num_levels=num_levels, update_intervals=update_intervals)
 
     def forward(
         self,
@@ -1052,29 +1074,32 @@ class HopeBlock(nn.Module):
 
 
 class HopeAttentionBlock(nn.Module):
-    r"""HopeAttentionBlock(...) — Hope variant with softmax attention (Sec. 8.3).
+    r"""HopeAttentionBlock(config, ...) — Hope variant with softmax attention (Sec. 8.3).
 
     Replaces the self-modifying Titans with causal global attention, keeping
     the Continuum Memory System chain. Used in the paper as the
-    ``Hope-Attention`` baseline.
+    ``Hope-Attention`` baseline. The CMS chain is configured through
+    ``config.cms_ffn`` / ``config.cms_norm``.
 
     Args:
-        hidden_size: model width ``D``.
-        num_heads: attention heads.
+        config: provides ``hidden_size``, ``num_attention_heads``,
+            ``rms_norm_eps``, and the ``cms_*`` knobs.
+        num_heads: attention heads; ``None`` uses
+            ``config.num_attention_heads``.
         num_levels: CMS chain length.
         update_intervals: CMS per-level intervals.
-        norm_eps: epsilon for norms.
     """
 
     def __init__(
         self,
-        hidden_size: int,
-        num_heads: int = 8,
+        config: MemoryMachineConfig,
+        num_heads: int | None = None,
         num_levels: int = 2,
         update_intervals: tuple[int, ...] | None = None,
-        norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        hidden_size = config.hidden_size
+        num_heads = config.num_attention_heads if num_heads is None else num_heads
         if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads != 0:
             raise ValueError("hidden_size must be positive and divisible by num_heads")
         self.hidden_size = hidden_size
@@ -1084,8 +1109,8 @@ class HopeAttentionBlock(nn.Module):
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.attn_norm = nn.RMSNorm(hidden_size, eps=norm_eps)
-        self.cms = ContinuumMemorySystem(hidden_size=hidden_size, num_levels=num_levels, update_intervals=update_intervals, norm_eps=norm_eps)
+        self.attn_norm = nn.RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.cms = ContinuumMemorySystem(config=config, num_levels=num_levels, update_intervals=update_intervals)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """forward(x) -> Tensor — causal attention then CMS chain."""

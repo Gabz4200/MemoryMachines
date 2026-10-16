@@ -10,6 +10,7 @@ from memory_machines.models.blocks.fast_weights import (
     HopeBlock,
     SelfReferentialTitanMemory,
 )
+from tests.test_blocks_shapes import tiny_cfg
 
 
 def _tiny(**kw):
@@ -126,7 +127,7 @@ def test_selfref_linear_dot_update_matches_eq92():
 
 def test_cms_chain_shapes_and_frequencies():
     torch.manual_seed(0)
-    cms = ContinuumMemorySystem(hidden_size=32, num_levels=3, update_intervals=(1, 4, 8))
+    cms = ContinuumMemorySystem(tiny_cfg(), num_levels=3, update_intervals=(1, 4, 8))
     x = torch.randn(1, 6, 32)
     y = cms(x)
     assert tuple(y.shape) == (1, 6, 32)
@@ -138,7 +139,7 @@ def test_cms_chain_shapes_and_frequencies():
 
 def test_hope_block_shapes():
     torch.manual_seed(0)
-    hope = HopeBlock(**_tiny(num_levels=2)).eval()
+    hope = HopeBlock(tiny_cfg(), num_heads=4, num_levels=2).eval()
     x = torch.randn(1, 6, 32)
     out, state = hope(x, output_final_state=True)
     assert tuple(out.shape) == (1, 6, 32)
@@ -147,7 +148,7 @@ def test_hope_block_shapes():
 
 def test_hope_block_causality():
     torch.manual_seed(0)
-    hope = HopeBlock(**_tiny(num_levels=2)).eval()
+    hope = HopeBlock(tiny_cfg(), num_heads=4, num_levels=2).eval()
     torch.manual_seed(1)
     x = torch.randn(1, 8, 32)
     base, _ = hope(x)
@@ -160,7 +161,7 @@ def test_hope_block_causality():
 
 def test_hope_attention_variant_shapes():
     torch.manual_seed(0)
-    blk = HopeAttentionBlock(**_tiny(num_levels=2)).eval()
+    blk = HopeAttentionBlock(tiny_cfg(), num_heads=4, num_levels=2).eval()
     x = torch.randn(1, 6, 32)
     out = blk(x)
     assert tuple(out.shape) == (1, 6, 32)

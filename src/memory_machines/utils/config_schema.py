@@ -161,6 +161,10 @@ class MemoryMachineConfig:
             Default: ``4``.
         titan_chunk_size: Titans state-carry chunk width; ``0`` means the
             whole sequence. Default: ``0``.
+        cms_ffn: Dense FFN kind for every Continuum Memory System level
+            (``"swiglu"`` or ``"classic_mlp"``). Default: ``"swiglu"``.
+        cms_norm: Pre-norm kind for every CMS level
+            (``"rmsnorm"``, ``"layernorm"``, or ``"dyT"``). Default: ``"dyT"``.
         dspark_num_drafts: Parallel draft positions (V4.1: 5)
         dspark_window: Drafter window (V4.1: 128)
     """
@@ -248,6 +252,8 @@ class MemoryMachineConfig:
     titan_use_short_conv: bool = True
     titan_conv_kernel_size: int = 4
     titan_chunk_size: int = 0
+    cms_ffn: str = "swiglu"
+    cms_norm: str = "dyT"
     seed: int = 0
     dspark_num_drafts: int = 5
     dspark_window: int = 128
@@ -380,6 +386,10 @@ class MemoryMachineConfig:
             raise ValueError(f"titan_conv_kernel_size ({self.titan_conv_kernel_size}) must be positive")
         if self.titan_chunk_size < 0:
             raise ValueError(f"titan_chunk_size ({self.titan_chunk_size}) must be non-negative (0 = whole sequence)")
+        if self.cms_ffn not in ("swiglu", "classic_mlp"):
+            raise ValueError(f"cms_ffn ({self.cms_ffn!r}) must be 'swiglu' or 'classic_mlp'")
+        if self.cms_norm not in ("rmsnorm", "layernorm", "dyT"):
+            raise ValueError(f"cms_norm ({self.cms_norm!r}) must be one of 'rmsnorm', 'layernorm', 'dyT'")
         engram_elements = len(self.engram_orders) * self.engram_hash_heads * self.engram_num_entries * self.engram_dim_per_order
         if engram_elements > 268_435_456:
             raise ValueError(f"Engram tables total {engram_elements:,} elements (> 256M, ~1GB fp32); reduce engram_num_entries/engram_dim_per_order or shard explicitly")
