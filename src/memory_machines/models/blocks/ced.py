@@ -219,7 +219,7 @@ class CausalEncoderDecoderStack(nn.Module):
         self.encoder_layers = nn.ModuleList(enc)
         # Dense encoder FFNs, one per layer (kind and width from the
         # encoder-side config, so the two halves stay independent).
-        self.encoder_ffns = nn.ModuleList([DenseFFN(config, config.ced_encoder_ffn, config.ced_encoder_ffn_intermediate_size or None) for _ in range(len(enc))])
+        self.encoder_ffns = nn.ModuleList([DenseFFN(config, config.ced_encoder_ffn, intermediate_size=config.ced_encoder_ffn_intermediate_size or None) for _ in range(len(enc))])
         # The decoder half is a standalone CausalDecoder so the
         # Eq. 1 seeding path lives in exactly one place.
         self.decoder = CausalDecoder(config, layers=decoder_layers)
@@ -512,7 +512,9 @@ class CausalDecoder(nn.Module):
         self.global_projs = nn.ModuleList(projs_list if projs_list is not None else [CEDGlobalKVProjection(config) for _ in range(dec_n)])
         # Dense decoder FFNs, one per layer (kind and width from the
         # decoder-side config, independent of the encoder's).
-        self.ffns = nn.ModuleList(ffns_list if ffns_list is not None else [DenseFFN(config, config.ced_decoder_ffn, config.ced_decoder_ffn_intermediate_size or None) for _ in range(len(built))])
+        self.ffns = nn.ModuleList(
+            ffns_list if ffns_list is not None else [DenseFFN(config, config.ced_decoder_ffn, intermediate_size=config.ced_decoder_ffn_intermediate_size or None) for _ in range(len(built))]
+        )
         self.window_size = config.window_size
         self.reset_parameters()
 
