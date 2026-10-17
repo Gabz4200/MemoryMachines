@@ -17,8 +17,15 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
-from .positioning import CVPEContextBias, FRVMValueGate
-from .shared import _check_position_bounds, _resolve_positions, _window_mask, residual_init_scale
+from .positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
+from .shared import (
+    _check_position_bounds,
+    _coerce_coords,
+    _multi_axis_distance,
+    _resolve_positions,
+    _window_mask,
+    residual_init_scale,
+)
 
 
 def _causal_key_mask(q_pos: torch.Tensor, k_pos: torch.Tensor) -> torch.Tensor:
@@ -263,16 +270,30 @@ class GroupedQueryAttention(nn.Module):
         self.cvpe_enabled = config.cvpe_enabled
         self.frvm_enabled = config.frvm_enabled
         self.frvm_chunk_size = config.frvm_chunk_size
+        self.spatial_dims = config.cvpe_max_dims
+        _axis = tuple(config.cvpe_axis_max) if config.cvpe_axis_max else (config.max_position_embeddings,) * config.cvpe_max_dims
+        self.axis_max = _axis
         self.cvpe_bias = (
             CVPEContextBias(
                 self.head_dim,
                 mlp_hidden=config.cvpe_mlp_hidden,
                 use_log_transform=config.cvpe_use_log_transform,
+                spatial_dims=config.cvpe_max_dims,
+                axis_max=_axis,
             )
             if self.cvpe_enabled
             else None
         )
-        self.frvm_gate = FRVMValueGate(self.head_dim, self.num_heads) if self.frvm_enabled else None
+        self.frvm_gate = (
+            FRVMValueGate(self.head_dim, self.num_heads, cross_heads=config.frvm_cross_heads)
+            if self.frvm_enabled
+            else None
+        )
+        self.frvm_spatial_ov = (
+            FRVMSpatialOV(config.cvpe_max_dims, self.head_dim)
+            if (self.frvm_enabled and config.frvm_use_spatial)
+            else None
+        )
 
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         GroupedQueryAttention.reset_parameters(self)
@@ -399,6 +420,43 @@ class GroupedQueryAttention(nn.Module):
             logits = logits + self.cvpe_bias(query_states, q_pos, k_pos).to(logits.dtype)
         return logits
 
+    def _pe_inputs(
+        self,
+        query_states: torch.Tensor,
+        value_query_exp: torch.Tensor,
+        value_full_exp: torch.Tensor,
+        q_pos: torch.Tensor,
+        k_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Precompute PE tensors for the universal functional op.
+
+        Learnable parts stay in the modules; the functional only reduces::
+
+            cvpe_attn_bias = CVPE.precompute_bias(Q, q_pos, k_pos)
+            phi_vq, phi_vk = FRVM.project_qk(Vq, Vk)
+            spatial_grid  = N-dim offsets (q_pos_q - q_pos_k)
+        """
+        cvpe_attn_bias = None
+        if self.cvpe_bias is not None:
+            cvpe_attn_bias = self.cvpe_bias.precompute_bias(query_states, q_pos, k_pos)
+        phi_vq = phi_vk = None
+        if self.frvm_gate is not None:
+            phi_vq, phi_vk = self.frvm_gate.project_qk(value_query_exp, value_full_exp)
+        spatial_grid = ov_spatial_weight = None
+        if self.frvm_spatial_ov is not None and self.frvm_gate is not None:
+            q3 = q_pos.float() if q_pos.dim() == 3 else q_pos.float().unsqueeze(-1)
+            k3 = k_pos.float() if k_pos.dim() == 3 else k_pos.float().unsqueeze(-1)
+            n = q3.shape[-1]
+            if n < self.spatial_dims:
+                q3 = F.pad(q3, (0, self.spatial_dims - n))
+                k3 = F.pad(k3, (0, self.spatial_dims - n))
+            else:
+                q3 = q3[..., : self.spatial_dims]
+                k3 = k3[..., : self.spatial_dims]
+            spatial_grid = _multi_axis_distance(q3, k3, self.axis_max, self.cvpe_bias.use_log_transform if self.cvpe_bias is not None else True)
+            ov_spatial_weight = self.frvm_spatial_ov.weight
+        return cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight
+
     def _weights_to_heads(
         self,
         weights: torch.Tensor,
@@ -493,6 +551,9 @@ class GroupedQueryAttention(nn.Module):
         past_len_override: int | None = None,
         past_positions: torch.Tensor | None = None,
         is_causal: bool = True,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_position_ids: torch.Tensor | None = None,
+        bidirectional: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -535,6 +596,16 @@ class GroupedQueryAttention(nn.Module):
                 truncated ``past_key_value``. Default: ``None``.
             is_causal (bool, optional): whether to apply the causal mask.
                 Default: ``True``.
+            encoder_hidden_states (Tensor, optional): cross-attention KV
+                source of shape ``(B, S, hidden)``. When given, keys/values
+                come from this stream (``L != S`` allowed) with their own
+                coordinates ``encoder_position_ids``. Default: ``None``.
+            encoder_position_ids (Tensor, optional): KV-stream coordinates,
+                ``(B, S)`` or ``(B, S, N)``. Default: ``None``.
+            bidirectional (bool, optional): full all-to-all visibility,
+                exclusive with ``is_causal`` (explicit flag for
+                encoder/cross-attn; ``is_causal=False`` alone is already
+                bidirectional). Default: ``False``.
 
         Returns:
             Tensor: hidden outputs ``(B, Lq, hidden)``, attention weights
@@ -556,8 +627,54 @@ class GroupedQueryAttention(nn.Module):
         """
         if not is_causal and (use_cache or past_key_value is not None):
             raise ValueError("GroupedQueryAttention with is_causal=False cannot use KV caching (truncated cache is only valid for causal attention)")
+        if bidirectional and is_causal:
+            # Explicit direction flag wins over the forward() default:
+            # bidirectional implies non-causal. Direct functional calls
+            # still raise on the combo; the class resolves it.
+            is_causal = False
+        if encoder_hidden_states is not None and (use_cache or past_key_value is not None):
+            raise ValueError("cross-attention (encoder_hidden_states) cannot use KV caching")
         bsz, q_len, _ = hidden_states.size()
         device = hidden_states.device
+
+        if encoder_hidden_states is not None:
+            # Cross-attention: decoupled LxS streams, own KV coordinates.
+            q_ndim = position_ids.dim() == 3 if position_ids is not None else False
+            kv_ndim = encoder_position_ids.dim() == 3 if encoder_position_ids is not None else False
+            if q_ndim or kv_ndim or self.spatial_dims > 1:
+                q_pos = _coerce_coords(position_ids, q_len, 0, bsz, device, torch.float32, self.spatial_dims)
+                kv_len = encoder_hidden_states.shape[1]
+                k_pos = _coerce_coords(encoder_position_ids, kv_len, 0, bsz, device, torch.float32, self.spatial_dims)
+            else:
+                if position_ids is not None:
+                    if position_ids.dim() == 2:
+                        q_pos = position_ids[:, -q_len:].to(device)
+                    else:
+                        q_pos = position_ids[-q_len:].to(device).unsqueeze(0).expand(bsz, -1)
+                else:
+                    q_pos = torch.arange(q_len, device=device).unsqueeze(0).expand(bsz, -1)
+                kv_len = encoder_hidden_states.shape[1]
+                if encoder_position_ids is not None:
+                    if encoder_position_ids.dim() == 2:
+                        k_pos = encoder_position_ids[:, -kv_len:].to(device)
+                    else:
+                        k_pos = encoder_position_ids[-kv_len:].to(device).unsqueeze(0).expand(bsz, -1)
+                else:
+                    k_pos = torch.arange(kv_len, device=device).unsqueeze(0).expand(bsz, -1)
+            _check_position_bounds(q_pos, k_pos, self.max_position_embeddings, position_ids)
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = self.k_proj(encoder_hidden_states).view(bsz, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_current = self.v_proj(encoder_hidden_states).view(bsz, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_full = value_current
+            # Query-stream reference values come from the query stream.
+            v_q_heads = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            key_exp, value_full_exp, _ = self._expand_kv(key_states, value_full, value_current)
+            vq_exp = v_q_heads.repeat_interleave(self.num_key_value_groups, dim=1)
+            return self._reduce_with_pe(
+                query_states, key_exp, value_full_exp, vq_exp, q_pos, k_pos,
+                attention_mask, bsz, q_len, output_attentions, is_causal, bidirectional,
+                windowed=False,
+            )
 
         query_states, key_states, value_current = self._project_qkv(hidden_states)
 
@@ -665,6 +782,73 @@ class GroupedQueryAttention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
+    def _reduce_with_pe(
+        self,
+        query_states: torch.Tensor,
+        key_exp: torch.Tensor,
+        value_full_exp: torch.Tensor,
+        value_query_exp: torch.Tensor,
+        q_pos: torch.Tensor,
+        k_pos: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        bsz: int,
+        q_len: int,
+        output_attentions: bool,
+        is_causal: bool,
+        bidirectional: bool,
+        windowed: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, None]:
+        """Reduce via the universal functional op (cross-attn / N-dim entry).
+
+        Applies the same window + causal + user-mask + softmax + sanitize +
+        dropout + FRVM/OV pipeline as :meth:`attend`, with ``windowed``
+        controlling the SWA bound (cross-attention passes ``False``).
+        """
+        from memory_machines.ops.references.attention_reference import (
+            reference_frvm_gated_reduction,
+            reference_qk_circuit,
+        )
+
+        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(
+            query_states, value_query_exp, value_full_exp, q_pos, k_pos
+        )
+        attn = reference_qk_circuit(
+            query_states, key_exp, cvpe_attn_bias,
+            torch.zeros(query_states.shape[2], key_exp.shape[2], dtype=query_states.dtype, device=query_states.device),
+            None,
+        )
+        q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
+        k1 = k_pos[..., 0] if k_pos.dim() == 3 else k_pos
+        if bidirectional and is_causal:
+            raise ValueError("bidirectional=True is incompatible with is_causal=True (pass one or neither)")
+        if windowed and self.window_size > 0 and is_causal:
+            win = _window_mask(q1, k1, self.window_size).unsqueeze(1)
+            attn = attn.masked_fill(~win, float("-inf"))
+        elif windowed and self.window_size > 0:
+            rel = q1.unsqueeze(-1) - k1.unsqueeze(1)
+            attn = attn.masked_fill((rel.abs() >= self.window_size).unsqueeze(1), float("-inf"))
+        elif is_causal:
+            if attention_mask is not None:
+                raise ValueError("is_causal=True requires attn_mask=None (pass one or the other)")
+            attn = attn.masked_fill(~_causal_key_mask(q1, k1), float("-inf"))
+        additive_mask = _prepare_attention_mask(attention_mask, bsz, q_len, key_exp.shape[2], self.num_heads, attn)
+        if additive_mask is not None:
+            attn = attn + additive_mask
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn = _sanitize_attention_weights(attn)
+        attn_dropped = self.attention_dropout(attn)
+        if self.frvm_gate is not None:
+            per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * value_full_exp.shape[-1]
+            eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
+            heads = reference_frvm_gated_reduction(
+                attn_dropped, value_full_exp, phi_vq, phi_vk,
+                spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=eff,
+            )
+        else:
+            heads = attn_dropped @ value_full_exp
+        out = self._project_heads(heads, bsz, q_len)
+        return out, (attn if output_attentions else None), None
+
     def attend(
         self,
         query_states: torch.Tensor,
@@ -676,8 +860,9 @@ class GroupedQueryAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         windowed: bool = True,
         is_causal: bool = True,
+        bidirectional: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""attend(query_states, key_states, value_full, value_query, q_pos, k_pos_full, attention_mask=None, windowed=True, is_causal=True) -> (Tensor, Tensor)
+        r"""attend(query_states, key_states, value_full, value_query, q_pos, k_pos_full, attention_mask=None, windowed=True, is_causal=True, bidirectional=False) -> (Tensor, Tensor)
 
         Batched head-parallel attention core over explicit QKV states.
 
@@ -687,8 +872,8 @@ class GroupedQueryAttention(nn.Module):
             value_full (Tensor): full values ``(B, Hkv, Lk, Dh)``.
             value_query (Tensor): per-query reference values
                 ``(B, Hkv, Lq, Dh)``.
-            q_pos (Tensor): query positions ``(B, Lq)``.
-            k_pos_full (Tensor): key positions ``(B, Lk)``.
+            q_pos (Tensor): query positions ``(B, Lq)`` (or ``(B, Lq, N)``).
+            k_pos_full (Tensor): key positions ``(B, Lk)`` (or ``(B, Lk, N)``).
             attention_mask (Tensor, optional): additive/bool mask.
                 Default: ``None``.
             windowed (bool, optional): whether to apply the window bound.
@@ -699,6 +884,9 @@ class GroupedQueryAttention(nn.Module):
                 ``is_causal=True`` is pure causal. Default: ``True``.
             is_causal (bool, optional): whether to mask futures.
                 Default: ``True``.
+            bidirectional (bool, optional): full all-to-all visibility,
+                exclusive with ``is_causal`` (explicit encoder/cross-attn
+                flag). Default: ``False``.
 
         Returns:
             Tensor: per-head outputs ``(B, H, Lq, Dh)`` and weights
@@ -718,26 +906,52 @@ class GroupedQueryAttention(nn.Module):
             (torch.Size([1, 2, 3, 8]), torch.Size([1, 2, 3, 5]))
         """
         key_exp, val_exp, vq_exp = self._expand_kv(key_states, value_full, value_query)
-        attn = self._score_qk(query_states, key_exp, q_pos, k_pos_full)
+        from memory_machines.ops.references.attention_reference import (
+            reference_frvm_gated_reduction,
+            reference_qk_circuit,
+        )
+
+        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(
+            query_states, vq_exp, val_exp, q_pos, k_pos_full
+        )
+        # QK circuit identical to _score_qk (no mask yet), via the reference op.
+        attn = reference_qk_circuit(
+            query_states, key_exp, cvpe_attn_bias,
+            torch.zeros(query_states.shape[2], key_exp.shape[2], dtype=query_states.dtype, device=query_states.device),
+            None,
+        )
         # windowed, is_causal=False is bidirectional within the
         # window: |q - k| < window_size in BOTH directions (the
         # caller explicitly asked for non-causal attention, so the
         # bound is symmetric). All other cells are causal-bounded.
+        if bidirectional and is_causal:
+            raise ValueError("bidirectional=True is incompatible with is_causal=True (pass one or neither)")
+        q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
+        k1 = k_pos_full[..., 0] if k_pos_full.dim() == 3 else k_pos_full
         if windowed and self.window_size > 0 and is_causal:
-            win = _window_mask(q_pos, k_pos_full, self.window_size).unsqueeze(1)
+            win = _window_mask(q1, k1, self.window_size).unsqueeze(1)
             attn = attn.masked_fill(~win, float("-inf"))
         elif windowed and self.window_size > 0:
-            rel = q_pos.unsqueeze(-1) - k_pos_full.unsqueeze(1)
+            rel = q1.unsqueeze(-1) - k1.unsqueeze(1)
             attn = attn.masked_fill((rel.abs() >= self.window_size).unsqueeze(1), float("-inf"))
         elif is_causal:
-            attn = attn.masked_fill(~_causal_key_mask(q_pos, k_pos_full), float("-inf"))
+            attn = attn.masked_fill(~_causal_key_mask(q1, k1), float("-inf"))
         additive_mask = _prepare_attention_mask(attention_mask, query_states.shape[0], query_states.shape[2], key_exp.shape[2], self.num_heads, attn)
         if additive_mask is not None:
             attn = attn + additive_mask
         attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn = _sanitize_attention_weights(attn)
-        attn = self.attention_dropout(attn)
-        return self._weights_to_heads(attn, val_exp, vq_exp), attn
+        attn_dropped = self.attention_dropout(attn)
+        if self.frvm_gate is not None:
+            per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * val_exp.shape[-1]
+            eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
+            heads = reference_frvm_gated_reduction(
+                attn_dropped, val_exp, phi_vq, phi_vk,
+                spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=eff,
+            )
+        else:
+            heads = attn_dropped @ val_exp
+        return heads, attn
 
     def truncate_for_replay(
         self,

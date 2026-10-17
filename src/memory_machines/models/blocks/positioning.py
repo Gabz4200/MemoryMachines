@@ -13,19 +13,21 @@ from torch import nn
 
 
 class CVPEContextBias(nn.Module):
-    r"""CVPEContextBias(head_dim, mlp_hidden=32, use_log_transform=True)
+    r"""CVPEContextBias(head_dim, mlp_hidden=32, use_log_transform=True, spatial_dims=1, axis_max=None)
 
     Content-versus-position-dependent (CVPE) bias added to attention logits.
 
-    For query head ``q`` and relative offset :math:`r = q - k \ge 0`, the bias is
+    1D legacy path (``q_pos``/``k_pos`` are ``(B, L)``): for query head ``q``
+    and relative offset :math:`r = q - k \ge 0`, the bias is
 
     .. math::
         b_{q,k} = \gamma(q)\, f(\tilde{r}) + \beta(q), \quad
         \tilde{r} = \frac{r}{q}
 
-    where :math:`\gamma, \beta` are per-query linear projections and
-    :math:`f` is a small MLP over the normalized offset, optionally warped by
-    :math:`\log_{10}(1 + 9\tilde{r})`.
+    N-dim path (``q_pos``/``k_pos`` are ``(B, L, N)``): the bounded distance
+    grid ``[0, 1]^N`` from ``_multi_axis_distance`` feeds an N-wide MLP
+    (``R^N -> R^1``) with fixed width ``spatial_dims`` (zero-padded unused
+    axes), so one weight set serves every modality (text=(t,0,0), video=(t,h,w)).
 
     .. note::
         This module only adds the bias; the caller must still mask future
@@ -36,6 +38,11 @@ class CVPEContextBias(nn.Module):
         mlp_hidden (int, optional): hidden width of the offset MLP. Default: ``32``.
         use_log_transform (bool, optional): whether to log-warp the normalized
             offset before the MLP. Default: ``True``.
+        spatial_dims (int, optional): fixed N-dim input width ``N_max``.
+            Default: ``1`` (pure 1D, backward compatible).
+        axis_max (tuple, optional): per-axis normalization caps; empty means
+            ``max_position_embeddings``-style default ``32768`` per axis.
+            Default: ``None``.
 
     Examples::
 
@@ -53,10 +60,21 @@ class CVPEContextBias(nn.Module):
         head_dim: int,
         mlp_hidden: int = 32,
         use_log_transform: bool = True,
+        spatial_dims: int = 1,
+        axis_max: tuple[int, ...] | list[int] | torch.Tensor | None = None,
     ):
         super().__init__()
         self.head_dim = head_dim
         self.use_log_transform = use_log_transform
+        if spatial_dims <= 0:
+            raise ValueError(f"spatial_dims ({spatial_dims}) must be positive")
+        self.spatial_dims = spatial_dims
+        if axis_max is None:
+            self.axis_max: tuple[int, ...] | list[int] | torch.Tensor = (32768,) * spatial_dims
+        else:
+            if len(tuple(axis_max)) != spatial_dims:
+                raise ValueError(f"axis_max must hold {spatial_dims} entries (one per axis), got {tuple(axis_max)}")
+            self.axis_max = axis_max
 
         self.gamma_proj = nn.Linear(head_dim, 1)
         self.beta_proj = nn.Linear(head_dim, 1)
@@ -64,6 +82,9 @@ class CVPEContextBias(nn.Module):
         self.mlp_in = nn.Linear(1, mlp_hidden)
         self.mlp_act = nn.ReLU()
         self.offset_out = nn.Linear(mlp_hidden, 1)
+        # N-dim path: fixed-width MLP R^N -> R^1 (zero-padded unused axes).
+        self.mlp_in_nd = nn.Linear(spatial_dims, mlp_hidden)
+        self.offset_out_nd = nn.Linear(mlp_hidden, 1)
 
         self.reset_parameters()
 
@@ -89,6 +110,13 @@ class CVPEContextBias(nn.Module):
         nn.init.zeros_(self.beta_proj.bias)
         nn.init.zeros_(self.offset_out.weight)
         nn.init.zeros_(self.offset_out.bias)
+        # N-dim branch zero-starts identically (neutral attention at step 0).
+        fan_nd = self.mlp_in_nd.in_features
+        mlp_std_nd = 1 / math.sqrt(fan_nd)
+        nn.init.trunc_normal_(self.mlp_in_nd.weight, mean=0.0, std=mlp_std_nd, a=-2 * mlp_std_nd, b=2 * mlp_std_nd)
+        nn.init.zeros_(self.mlp_in_nd.bias)
+        nn.init.zeros_(self.offset_out_nd.weight)
+        nn.init.zeros_(self.offset_out_nd.bias)
 
     def forward(
         self,
@@ -102,10 +130,10 @@ class CVPEContextBias(nn.Module):
 
         Args:
             query_states (Tensor): queries of shape ``(B, H, Lq, Dh)``.
-            q_pos (Tensor): query absolute positions of shape ``(B, Lq)`` or
-                broadcastable ``(Lq,)``.
-            k_pos (Tensor): key absolute positions of shape ``(B, Lk)`` or
-                broadcastable ``(Lk,)``.
+            q_pos (Tensor): query absolute positions — legacy ``(B, Lq)`` /
+                ``(Lq,)`` 1D, or N-dim ``(B, Lq, N)`` coordinates.
+            k_pos (Tensor): key absolute positions — legacy ``(B, Lk)`` /
+                ``(Lk,)`` 1D, or N-dim ``(B, Lk, N)`` coordinates.
 
         Returns:
             Tensor: bias of shape ``(B, H, Lq, Lk)`` in the query dtype.
@@ -118,6 +146,43 @@ class CVPEContextBias(nn.Module):
             torch.Size([1, 2, 3, 5])
         """
         bsz, _, lq, _ = query_states.shape
+
+        if q_pos.dim() == 3 or k_pos.dim() == 3:
+            # N-dim path: separate query/key coordinate streams (self-attn
+            # collapses to symmetric distances; cross-attn is asymmetric LxS).
+            from .shared import _multi_axis_distance
+
+            q3 = q_pos.to(dtype=torch.float32)
+            k3 = k_pos.to(dtype=torch.float32)
+            if q3.dim() == 2:
+                q3 = q3.unsqueeze(-1)
+            if k3.dim() == 2:
+                k3 = k3.unsqueeze(-1)
+            if q3.dim() != 3 or q3.shape[0] != bsz or q3.shape[1] != lq:
+                raise ValueError(f"q_pos shape {tuple(q_pos.shape)} does not match (batch, Lq, N) = ({bsz}, {lq}, N)")
+            if k3.dim() != 3 or k3.shape[0] != bsz:
+                raise ValueError(f"k_pos shape {tuple(k_pos.shape)} does not match (batch, Lk, N) with batch ({bsz})")
+            nq, nk = q3.shape[-1], k3.shape[-1]
+            if nq != nk:
+                raise ValueError(f"q_pos dims ({nq}) != k_pos dims ({nk}); both streams must share N coordinate axes")
+            n = nq
+            if n < self.spatial_dims:
+                q3 = F.pad(q3, (0, self.spatial_dims - n))
+                k3 = F.pad(k3, (0, self.spatial_dims - n))
+            elif n > self.spatial_dims:
+                q3 = q3[..., : self.spatial_dims]
+                k3 = k3[..., : self.spatial_dims]
+            dist = _multi_axis_distance(
+                q3, k3,
+                self.axis_max if len(tuple(self.axis_max)) == self.spatial_dims else (32768,) * self.spatial_dims,
+                self.use_log_transform,
+            )  # (B, Lq, Lk, N)
+            mlp_dtype = self.mlp_in_nd.weight.dtype
+            f = self.offset_out_nd(self.mlp_act(self.mlp_in_nd(dist.to(mlp_dtype)))).squeeze(-1)
+            f = f.float().unsqueeze(1).to(query_states.dtype)
+            gamma = self.gamma_proj(query_states).squeeze(-1).unsqueeze(-1)
+            beta = self.beta_proj(query_states).squeeze(-1).unsqueeze(-1)
+            return gamma * f + beta
 
         q_pos_2d = q_pos.unsqueeze(0).expand(bsz, -1) if q_pos.dim() == 1 else q_pos
         k_pos_2d = k_pos.unsqueeze(0).expand(bsz, -1) if k_pos.dim() == 1 else k_pos
@@ -146,6 +211,46 @@ class CVPEContextBias(nn.Module):
         beta = self.beta_proj(query_states).squeeze(-1).unsqueeze(-1)
 
         return gamma * f + beta
+
+    def precompute_bias(
+        self,
+        query_states: torch.Tensor,
+        q_pos: torch.Tensor,
+        k_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Precompute the ``(B, H, Lq, Lk)`` CVPE bias for the functional op.
+
+        Thin alias of :meth:`forward` — the learnable QK-circuit part stays
+        in the module; the functional only adds the returned tensor.
+        """
+        return self.forward(query_states, q_pos, k_pos)
+
+
+class FRVMSpatialOV(nn.Module):
+    """N-dim spatial framing for the OV circuit: ``MLP_OV(R^N -> R^Dh)``.
+
+    Zero-initialized so the spatial term starts disabled (vanilla F-RVM).
+    The raw ``weight`` is exposed for the functional op, which evaluates
+    ``F.linear(spatial_grid, weight)`` inside memory-bounded query chunks.
+    """
+
+    def __init__(self, spatial_dims: int, head_dim: int):
+        super().__init__()
+        if spatial_dims <= 0:
+            raise ValueError(f"spatial_dims ({spatial_dims}) must be positive")
+        self.proj = nn.Linear(spatial_dims, head_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.proj.weight
+
+    def forward(self, spatial_grid: torch.Tensor) -> torch.Tensor:
+        return self.proj(spatial_grid)
 
 
 class FRVMValueGate(nn.Module):
@@ -185,13 +290,21 @@ class FRVMValueGate(nn.Module):
 
     _MAX_CHUNK_ELEMENTS = 32 * 1024 * 1024
 
-    def __init__(self, head_dim: int, num_heads: int):
+    def __init__(self, head_dim: int, num_heads: int, cross_heads: bool = False):
         super().__init__()
         if num_heads <= 0:
             raise ValueError(f"num_heads ({num_heads}) must be positive")
         self.head_dim = head_dim
         self.num_heads = num_heads
+        self.cross_heads = cross_heads
         self.phi_weight = nn.Parameter(torch.empty(num_heads, head_dim, head_dim))
+        # Cross-attention path: separate modality-specific heads Phi_q/Phi_k.
+        # Self-attention shares one phi (backward compatible).
+        self.phi_q_weight: nn.Parameter | None = None
+        self.phi_k_weight: nn.Parameter | None = None
+        if cross_heads:
+            self.phi_q_weight = nn.Parameter(torch.empty(num_heads, head_dim, head_dim))
+            self.phi_k_weight = nn.Parameter(torch.empty(num_heads, head_dim, head_dim))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -206,6 +319,10 @@ class FRVMValueGate(nn.Module):
         full random magnitude before any value geometry was learned.
         """
         nn.init.zeros_(self.phi_weight)
+        if self.phi_q_weight is not None:
+            nn.init.zeros_(self.phi_q_weight)
+        if self.phi_k_weight is not None:
+            nn.init.zeros_(self.phi_k_weight)
 
     def _phi(self, x: torch.Tensor) -> torch.Tensor:
         r"""_phi(x) -> Tensor
@@ -249,6 +366,28 @@ class FRVMValueGate(nn.Module):
             torch.Size([1, 2, 3, 4])
         """
         return self._phi(v_i - v_j)
+
+    def _phi_q(self, x: torch.Tensor) -> torch.Tensor:
+        """Query-stream projection (cross-attn Phi_q, else shared phi)."""
+        if self.phi_q_weight is not None:
+            if x.dim() != 4 or x.shape[1] != self.num_heads or x.shape[-1] != self.head_dim:
+                raise ValueError(f"expected (B, H={self.num_heads}, L, Dh={self.head_dim}), got {tuple(x.shape)}")
+            return torch.einsum("bhld,hed->bhle", x, self.phi_q_weight)
+        return self._phi(x)
+
+    def _phi_k(self, x: torch.Tensor) -> torch.Tensor:
+        """Key-stream projection (cross-attn Phi_k, else shared phi)."""
+        if self.phi_k_weight is not None:
+            if x.dim() != 4 or x.shape[1] != self.num_heads or x.shape[-1] != self.head_dim:
+                raise ValueError(f"expected (B, H={self.num_heads}, L, Dh={self.head_dim}), got {tuple(x.shape)}")
+            return torch.einsum("bhld,hed->bhle", x, self.phi_k_weight)
+        return self._phi(x)
+
+    def project_qk(
+        self, v_query: torch.Tensor, v_full: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Precompute ``(phi_vq, phi_vk)`` for the functional op."""
+        return self._phi_q(v_query), self._phi_k(v_full)
 
     def gated_reduction(
         self,
@@ -299,17 +438,11 @@ class FRVMValueGate(nn.Module):
         per_query_elements = bsz * num_heads * lk * v_full.shape[-1]
         effective_chunk_size = min(chunk_size, max(1, self._MAX_CHUNK_ELEMENTS // max(1, per_query_elements)))
 
-        outs: list[torch.Tensor] = []
+        from memory_machines.ops.references.attention_reference import reference_frvm_gated_reduction
 
-        for start in range(0, lq, effective_chunk_size):
-            end = min(start + effective_chunk_size, lq)
-            w = attn_weights[:, :, start:end, :]
-            pvq = phi_vq[:, :, start:end, :].unsqueeze(3)
-            pvk = phi_vk.unsqueeze(2)
-            vj = v_full.unsqueeze(2)
-
-            delta = pvq - pvk
-            gated = vj * F.silu(vj + delta)
-            outs.append((w.unsqueeze(-1) * gated).sum(dim=3))
-
-        return torch.cat(outs, dim=2)
+        if self.phi_q_weight is not None or self.phi_k_weight is not None:
+            phi_vq = self._phi_q(v_query)
+            phi_vk = self._phi_k(v_full)
+        return reference_frvm_gated_reduction(
+            attn_weights, v_full, phi_vq, phi_vk, chunk_size=effective_chunk_size
+        )

@@ -30,8 +30,26 @@ class MemoryMachineConfig:
         cvpe_mlp_hidden: Hidden width of the CVPE QK functional-bias MLP
         cvpe_use_log_transform: Log-warp the normalized offset before the MLP
         cvpe_enabled: Whether to add the CVPE dynamic QK bias
+        cvpe_max_dims: Fixed input width of the CVPE/FRVM MLPs (N_max).
+            Pure text uses 1, images 2, video 3, embodied/robotics 6.
+            Unused axes are zero-padded by the dataloader, so a single
+            set of model weights handles every modality.
+        cvpe_axis_max: Per-axis normalization caps C_max (tuple of
+            length cvpe_max_dims). Empty -> max_position_embeddings for
+            every axis.
         frvm_enabled: Whether to apply F-RVM antisymmetric value gating
         frvm_chunk_size: Query chunk size for the F-RVM gated reduction
+        frvm_ov_mlp_hidden: Hidden width of the F-RVM spatial OV MLP
+            (MLP_OV: R^N -> R^Dh)
+        frvm_use_log_transform: Log-warp the normalized offset before the
+            F-RVM spatial OV MLP (mirrors cvpe_use_log_transform)
+        frvm_use_spatial: Whether to add the F-RVM spatial OV term
+        frvm_cross_heads: When True (cross-attention), the F-RVM value
+            path uses separate modality-specific projection heads
+            (Phi_q for the query stream, Phi_k for the key-value stream)
+            so V_q and V_k are aligned before the antisymmetric
+            difference. In self-attention the two heads collapse to a
+            single shared projection.
         attention_dropout: Dropout rate for attention
         hidden_dropout: Dropout rate for hidden layers
         initializer_range: Standard deviation for weight
@@ -207,12 +225,17 @@ class MemoryMachineConfig:
     conv_kernel_size: int = 3
     max_position_embeddings: int = 32768
     rms_norm_eps: float = 1e-6
-    tie_word_embeddings: bool = True
     cvpe_mlp_hidden: int = 32
     cvpe_use_log_transform: bool = True
     cvpe_enabled: bool = True
+    cvpe_max_dims: int = 1
+    cvpe_axis_max: tuple[int, ...] = ()
     frvm_enabled: bool = True
     frvm_chunk_size: int = 128
+    frvm_ov_mlp_hidden: int = 32
+    frvm_use_log_transform: bool = True
+    frvm_use_spatial: bool = True
+    frvm_cross_heads: bool = False
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
     initializer_range: float = 0.006
@@ -320,10 +343,19 @@ class MemoryMachineConfig:
             raise ValueError(f"hidden_dropout ({self.hidden_dropout}) must be in [0, 1]")
         if self.initializer_range <= 0:
             raise ValueError(f"initializer_range ({self.initializer_range}) must be positive")
+        if self.cvpe_max_dims <= 0:
+            raise ValueError(f"cvpe_max_dims ({self.cvpe_max_dims}) must be positive")
         if self.cvpe_mlp_hidden <= 0:
             raise ValueError(f"cvpe_mlp_hidden ({self.cvpe_mlp_hidden}) must be positive")
         if self.frvm_chunk_size <= 0:
             raise ValueError(f"frvm_chunk_size ({self.frvm_chunk_size}) must be positive")
+        if self.frvm_ov_mlp_hidden <= 0:
+            raise ValueError(f"frvm_ov_mlp_hidden ({self.frvm_ov_mlp_hidden}) must be positive")
+        if self.cvpe_axis_max:
+            if len(self.cvpe_axis_max) != self.cvpe_max_dims:
+                raise ValueError(f"cvpe_axis_max must hold {self.cvpe_max_dims} entries (one per axis), got {tuple(self.cvpe_axis_max)}")
+            if any(c <= 0 for c in self.cvpe_axis_max):
+                raise ValueError(f"cvpe_axis_max entries must be positive, got {tuple(self.cvpe_axis_max)}")
         if self.conv_kernel_size <= 0:
             raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be positive")
         if self.conv_kernel_size % 2 == 0:

@@ -218,9 +218,11 @@ class CompressedSparseAttention(GroupedQueryAttention):
             q_heads (Tensor): queries of shape ``(B, H, Lq, Dh)``.
             kv (Tensor): shared keys/values of shape ``(B, Hkv, Lk, Dh)``.
             v_query (Tensor): per-query reference values ``(B, H, Lq, Dh)``.
-            q_pos (Tensor): query positions ``(B, Lq)``.
-            k_pos (Tensor): key positions ``(B, Lk)``.
+            q_pos (Tensor): query positions ``(B, Lq)`` (or ``(B, Lq, N)`` N-dim).
+            k_pos (Tensor): key positions ``(B, Lk)`` (or ``(B, Lk, N)`` N-dim).
             causal (bool, optional): whether to mask future entries. Default: ``True``.
+            bidirectional (bool, optional): full visibility, exclusive with
+                ``causal``. Default: ``False``.
 
         Returns:
             Tensor: per-head outputs of shape ``(B, H, Lq, Dh)``.
@@ -245,11 +247,23 @@ class CompressedSparseAttention(GroupedQueryAttention):
             kv = kv_norm(kv)
         # NOTE: repeat_interleave materializes H copies (general GQA only).
         kv_exp = kv.repeat_interleave(self.num_key_value_groups, dim=1)
-        logits = torch.matmul(q_heads, kv_exp.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if self.cvpe_bias is not None:
-            logits = logits + self.cvpe_bias(q_heads, q_pos, k_pos).to(logits.dtype)
+        from memory_machines.ops.references.attention_reference import (
+            reference_frvm_gated_reduction,
+            reference_qk_circuit,
+        )
+
+        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(
+            q_heads, v_query, kv_exp, q_pos, k_pos
+        )
+        logits = reference_qk_circuit(
+            q_heads, kv_exp, cvpe_attn_bias,
+            torch.zeros(q_heads.shape[2], kv_exp.shape[2], dtype=q_heads.dtype, device=q_heads.device),
+            None,
+        )
+        q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
+        k1 = k_pos[..., 0] if k_pos.dim() == 3 else k_pos
         if causal:
-            causal_mask = k_pos.unsqueeze(1) <= q_pos.unsqueeze(-1)
+            causal_mask = k1.unsqueeze(1) <= q1.unsqueeze(-1)
             logits = logits.masked_fill(~causal_mask.unsqueeze(1), float("-inf"))
             row_ok = causal_mask.any(dim=-1).view(logits.shape[0], 1, logits.shape[2], 1)
         else:
@@ -262,7 +276,12 @@ class CompressedSparseAttention(GroupedQueryAttention):
                 weights = torch.where(row_ok, weights, torch.zeros_like(weights))
         weights = self.attention_dropout(weights)
         if self.frvm_gate is not None:
-            return self.frvm_gate.gated_reduction(weights, kv_exp, v_query, chunk_size=self.frvm_chunk_size)
+            per_q = weights.shape[0] * weights.shape[1] * weights.shape[3] * kv_exp.shape[-1]
+            eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
+            return reference_frvm_gated_reduction(
+                weights, kv_exp, phi_vq, phi_vk,
+                spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=eff,
+            )
         return torch.matmul(weights, kv_exp)
 
     @staticmethod

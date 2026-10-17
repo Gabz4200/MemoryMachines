@@ -1,42 +1,27 @@
-r"""Shared caches, masks, position helpers, and Sinkhorn normalization.
-
-This module holds the small stateless helpers shared by the dense
-(:class:`~memory_machines.models.blocks.attention.GroupedQueryAttention`),
-windowed, and sparse attention layers: incremental-decode caches, causal and
-sliding-window masks, absolute-position resolution, and the Sinkhorn operator
-used by :class:`~memory_machines.models.blocks.memory.SinglePassMHC`.
-"""
+r"""Shared caches, masks, position helpers, and Sinkhorn normalization."""
 
 import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
 
 def residual_init_scale(std: float, num_layers: int, enabled: bool = True) -> float | None:
     r"""residual_init_scale(std, num_layers, enabled=True) -> float | None
 
-    Depth-scaled standard deviation for residual output projections
-    (Megatron-LM/Qwen): ``std / sqrt(2 * N)``.
+    Depth-scaled residual initialization scale ``std / sqrt(2 * num_layers)``
+    when ``enabled`` is True, otherwise no scaling (returns ``None``).
 
     Args:
-        std (float): base init standard deviation
-            (``config.initializer_range``).
-        num_layers (int): total transformer layers ``N``.
-        enabled (bool): when ``False``, return ``None`` so the caller
-            zero-initializes the residual output (Fixup/ReZero
-            identity-residual start). Default: ``True``.
+        std (float): base initialization standard deviation.
+        num_layers (int): number of layers ``N``.
+        enabled (bool, optional): whether to apply scaling.
+            Default: ``True``.
 
     Returns:
-        float | None: the depth-scaled std, or ``None`` when
-        ``enabled`` is ``False``.
-
-    Examples::
-
-        >>> residual_init_scale(0.006, 40)
-        0.0006708203932499369
-        >>> residual_init_scale(0.006, 40, enabled=False) is None
-        True
+        float | None: scaling factor or ``None`` to disable scaling.
     """
     if not enabled:
         return None
@@ -47,32 +32,9 @@ def residual_init_scale(std: float, num_layers: int, enabled: bool = True) -> fl
 class CompressedCache:
     r"""CompressedCache(compressed_kv=None, comp_end_pos=None, swa_k=None, swa_v=None, swa_pos=None, total_len=None)
 
-    Incremental-decode cache for
-    :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention`.
-
-    Holds the grow-only global compressed KV store alongside the transient
-    sliding-window (SWA) KV slice, so sparse and local branches can resume
-    across forward passes.
-
-    Attributes:
-        compressed_kv (torch.Tensor, optional): global compressed keys/values of
-            shape ``(B, Lc, Hkv, Dh)``. Default: ``None``.
-        comp_end_pos (torch.Tensor, optional): inclusive end position of each
-            compressed entry, shape ``(Lc,)`` or ``(B, Lc)``. Default: ``None``.
-        swa_k (torch.Tensor, optional): cached SWA keys of shape
-            ``(B, Hkv, Ws, Dh)``. Default: ``None``.
-        swa_v (torch.Tensor, optional): cached SWA values with the same shape
-            as ``swa_k``. Default: ``None``.
-        swa_pos (torch.Tensor, optional): absolute positions of the cached SWA
-            slice, shape ``(B, Ws)``. Default: ``None``.
-        total_len (int, optional): total consumed sequence length, used as the
-            next ``start_pos``. Default: ``None``.
-
-    Examples::
-
-        >>> cache = CompressedCache(total_len=0)
-        >>> cache.total_len
-        0
+    Cache for :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention`
+    containing the compressed keys and values, along with metadata
+    needed for updating the cache on the next step.
     """
 
     compressed_kv: torch.Tensor | None = None
@@ -87,33 +49,8 @@ class CompressedCache:
 class CSA2SharedState:
     r"""CSA2SharedState(compressed_kv=None, comp_end_pos=None, indexer_k=None, topk_indices=None, pool_indices=None, total_len=None)
 
-    Cross-layer shared state for
-    :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`.
-
-    A ``full`` layer populates the compressed store, indexer keys, and
-    candidate pools; ``reindex``/``reuse`` layers consume them without
-    recompressing. SWA KV is deliberately absent: every CSA2 layer
-    keeps its own sliding-window cache (CSA2, Fig. 4).
-
-    Attributes:
-        compressed_kv (torch.Tensor, optional): shared compressed KV store of
-            shape ``(B, Lc, Hkv, Dh)``. Default: ``None``.
-        comp_end_pos (torch.Tensor, optional): end position per compressed
-            entry, shape ``(Lc,)`` or ``(B, Lc)``. Default: ``None``.
-        indexer_k (torch.Tensor, optional): projected indexer keys of shape
-            ``(B, Lc, Di)``. Default: ``None``.
-        topk_indices (torch.Tensor, optional): selected entry ids per query,
-            shape ``(B, Lq, K)``. Default: ``None``.
-        pool_indices (torch.Tensor, optional): hierarchical candidate pool per
-            query, shape ``(B, Lq, P)``. Default: ``None``.
-        total_len (int, optional): total consumed sequence length, set by
-            the calling stack (not advanced per layer). Default: ``None``.
-
-    Examples::
-
-        >>> state = CSA2SharedState()
-        >>> state.compressed_kv is None
-        True
+    Shared state for :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`
+    to enable cross-layer key/value reuse.
     """
 
     compressed_kv: torch.Tensor | None = None
@@ -300,6 +237,11 @@ def _resolve_positions(
     bsz = hidden_states.shape[0]
     device = hidden_states.device
     if position_ids is not None:
+        if position_ids.dim() == 3:
+            if position_ids.shape[0] != bsz:
+                raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
+            q_pos = position_ids[:, -q_len:, :].to(device)
+            return q_pos, q_pos
         if position_ids.dim() == 2:
             if position_ids.shape[0] != bsz:
                 raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
@@ -312,6 +254,143 @@ def _resolve_positions(
     q_pos = torch.arange(past_len, past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
     k_pos = torch.arange(past_len + q_len, device=device).unsqueeze(0).expand(bsz, -1)
     return q_pos, k_pos
+
+
+def _coerce_coords(
+    position_ids: torch.Tensor | None,
+    q_len: int,
+    past_len: int,
+    bsz: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    spatial_dims: int,
+) -> torch.Tensor:
+    r"""_coerce_coords(position_ids, q_len, past_len, bsz, device, dtype, spatial_dims) -> Tensor
+
+    Coerce position IDs into an ``(B, L, N)`` coordinate tensor with zero-padding for unused axes.
+
+    Explicit ``position_ids`` (``(B, L, N)``, ``(B, L)``, or ``(L,)``) are used as-is;
+    missing dimensions are zero-padded on the right. When ``None``, positions count up from
+    ``past_len``.
+
+    Args:
+        position_ids (Tensor, optional): explicit coordinates, shape ``(B, L, N)``, ``(B, L)``,
+            or ``(L,)``.
+        q_len (int): current query length.
+        past_len (int): number of already-consumed tokens.
+        bsz (int): batch size.
+        device (torch.device): device for output tensor.
+        dtype (torch.dtype): dtype for output tensor.
+        spatial_dims (int): number of coordinate dimensions.
+
+    Returns:
+        Tensor: coordinates of shape ``(B, q_len, spatial_dims)``.
+
+    Examples::
+
+        >>> import torch
+        >>> # Implicit counting (text)
+        >>> _coerce_coords(None, 3, 0, 1, torch.device('cpu'), torch.float32, 3)
+        tensor([[[0., 0., 0.],
+                 [1., 0., 0.],
+                 [2., 0., 0.]]])
+        >>> # Explicit 1D positions
+        >>> _coerce_coords(torch.tensor([[0, 1, 2]]), 3, 0, 1, torch.device('cpu'), torch.float32, 3)
+        tensor([[[0., 0., 0.],
+                 [1., 0., 0.],
+                 [2., 0., 0.]]])
+        >>> # Explicit 2D positions (images)
+        >>> _coerce_coords(torch.tensor([[[0, 0], [0, 1], [1, 0]]]), 3, 0, 1, torch.device('cpu'), torch.float32, 3)
+        tensor([[[0., 0., 0.],
+                 [0., 1., 0.],
+                 [1., 0., 0.]]])
+    """
+    if position_ids is not None:
+        if position_ids.dim() == 3:
+            if position_ids.shape[0] != bsz:
+                raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
+            pos = position_ids[:, -q_len:, :].to(device=device, dtype=dtype)
+        elif position_ids.dim() == 2:
+            if position_ids.shape[0] != bsz:
+                raise ValueError(f"position_ids batch size ({position_ids.shape[0]}) does not match input batch size ({bsz})")
+            pos = position_ids[:, -q_len:].to(device=device, dtype=dtype)
+        else:
+            pos = position_ids[-q_len:].to(device=device, dtype=dtype).unsqueeze(0).expand(bsz, -1)
+    else:
+        pos = torch.arange(past_len, past_len + q_len, device=device, dtype=dtype).unsqueeze(0).expand(bsz, -1)
+    if pos.dim() == 2:
+        pos = pos.unsqueeze(-1)
+    n = pos.shape[-1]
+    if n < spatial_dims:
+        pos = torch.nn.functional.pad(pos, (0, spatial_dims - n))
+    elif n > spatial_dims:
+        pos = pos[..., :spatial_dims]
+    return pos
+
+
+def _multi_axis_distance(
+    q_pos: torch.Tensor,
+    k_pos: torch.Tensor,
+    axis_max: tuple[int, ...] | list[int] | torch.Tensor,
+    use_log_transform: bool = True,
+    eps: float = 1e-9,
+) -> torch.Tensor:
+    r"""_multi_axis_distance(q_pos, k_pos, axis_max, use_log_transform=True, eps=1e-9) -> Tensor
+
+    Compute bounded N-dimensional distance vectors in :math:`[0, 1]^N`.
+
+    Args:
+        q_pos (Tensor): query coordinates of shape ``(B, Lq, N)``.
+        k_pos (Tensor): key coordinates of shape ``(B, Lk, N)``.
+        axis_max (tuple[int, ...] | list[int] | torch.Tensor): maximum coordinate
+            value per axis (length ``N``).
+        use_log_transform (bool, optional): whether to log-warp each axis.
+            Default: ``True``.
+        eps (float, optional): small constant for numerical stability.
+            Default: ``1e-9``.
+
+    Returns:
+        Tensor: bounded distance of shape ``(B, Lq, Lk, N)`` where each
+            dimension is independently normalized to :math:`[0, 1]`.
+
+    Examples::
+
+        >>> import torch
+        >>> q = torch.tensor([[[0.], [1.]]])  # (B=1, Lq=2, N=1)
+        >>> k = torch.tensor([[[0.], [1.], [2.]]])  # (B=1, Lk=3, N=1)
+        >>> _multi_axis_distance(q, k, (32768,), True)
+        tensor([[[[0.0000]],
+                 [[0.0300]],
+                 [[0.0582]]],
+                [[[0.0582]],
+                 [[0.0300]],
+                 [[0.0000]]]])
+        >>> # 2D example
+        >>> q = torch.tensor([[[0, 0], [0, 1]]])  # (1, 2, 2)
+        >>> k = torch.tensor([[[0, 0], [0, 1], [1, 0]]])  # (1, 3, 2)
+        >>> _multi_axis_distance(q, k, (10, 10), False)
+        tensor([[[[0.0000, 0.0000]],
+                 [[0.0000, 0.1000]],
+                 [[0.1000, 0.0000]]],
+                [[[0.1000, 0.1000]],
+                 [[0.1000, 0.0000]],
+                 [[0.0000, 0.1000]]]])
+    """
+    if isinstance(axis_max, torch.Tensor):
+        am = axis_max.to(device=q_pos.device, dtype=q_pos.dtype)
+    else:
+        am = torch.as_tensor(axis_max, dtype=q_pos.dtype, device=q_pos.device)
+    am = am.view(1, 1, 1, -1)  # (1, 1, 1, N)
+    delta = (q_pos.unsqueeze(2) - k_pos.unsqueeze(1)).abs()  # (B, Lq, Lk, N)
+    if use_log_transform:
+        # Use log1p(delta) / log1p(axis_max + eps)
+        num = torch.log1p(delta)
+        den = torch.log1p(am + eps)
+    else:
+        num = delta
+        den = am + eps
+    norm = num / den
+    return torch.clamp(norm, 0.0, 1.0)
 
 
 def _check_position_bounds(

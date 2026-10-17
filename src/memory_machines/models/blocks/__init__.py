@@ -31,7 +31,7 @@ from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
 from .mhc_parallel import MHCAttentionGDN2, MHCAttentionTitan, from_streams, to_streams
-from .positioning import CVPEContextBias, FRVMValueGate
+from .positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
 from .rkan import JacobiRKAN, PadeRKAN
 from .shared import (
     CompressedCache,
@@ -59,6 +59,7 @@ __all__ = [
     "CEDGlobalKVProjection",
     "CSA2SharedState",
     "CVPEContextBias",
+    "FRVMSpatialOV",
     "CausalDecoder",
     "CausalEncoderDecoderStack",
     "ChunkedBottleneckLinear",
