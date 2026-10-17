@@ -12,10 +12,12 @@ Covers:
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from memory_machines.models.blocks import MHCAttentionTitan
 from memory_machines.models.blocks.ced import CausalEncoderDecoderStack
-from memory_machines.models.blocks.mhc_parallel import MHCAttentionGDN2, MHCAttentionTitan
+from memory_machines.models.blocks.mhc_parallel import MHCAttentionGDN2
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 _BASE_KWARGS = {
@@ -62,16 +64,23 @@ def test_encode_alternating_runs() -> None:
     assert shared.compressed_kv.shape[1] == 4  # compression_ratio=2
 
 
-def test_encode_alternating_titan_recurrent_backend() -> None:
-    cfg = MemoryMachineConfig(**_base_kwargs(), titan_backend="recurrent")
-    stack = CausalEncoderDecoderStack(cfg)
-    x = torch.randn(1, 8, 32)
-    out, _ = stack.encode(x)
-    assert out.shape == x.shape
-
-
-def test_encode_alternating_titan_chunk_backend() -> None:
-    cfg = MemoryMachineConfig(**_base_kwargs(), titan_backend="chunk", titan_chunk_size=4)
+@pytest.mark.parametrize(
+    "backend,chunk_size",
+    [
+        ("naive", None),
+        ("recurrent", None),
+        ("chunk", 4),
+        ("tnt", 4),
+        ("wy_fast", 4),
+    ],
+    ids=["naive", "recurrent", "chunk", "tnt", "wy_fast"],
+)
+def test_encode_alternating_titan_backend(backend: str, chunk_size: int | None) -> None:
+    """Every Titan backend runs end-to-end through the alternating encoder stack."""
+    kw: dict = {"titan_backend": backend}
+    if chunk_size is not None:
+        kw["titan_chunk_size"] = chunk_size
+    cfg = MemoryMachineConfig(**_base_kwargs(), **kw)
     stack = CausalEncoderDecoderStack(cfg)
     x = torch.randn(1, 8, 32)
     out, _ = stack.encode(x)
@@ -79,11 +88,19 @@ def test_encode_alternating_titan_chunk_backend() -> None:
 
 
 def test_encode_alternating_titan_qk_projection() -> None:
-    cfg = MemoryMachineConfig(**_base_kwargs(), titan_backend="chunk", titan_use_qk_projection=True)
+    cfg = MemoryMachineConfig(**_base_kwargs(), titan_backend="chunk", titan_chunk_size=4, titan_use_qk_projection=True)
     stack = CausalEncoderDecoderStack(cfg)
     x = torch.randn(1, 8, 32)
     out, _ = stack.encode(x)
     assert out.shape == x.shape
+
+
+def test_titan_is_exported_from_blocks_package() -> None:
+    """MHCAttentionTitan is part of the public memory_machines.models.blocks API."""
+    from memory_machines.models import blocks
+
+    assert blocks.MHCAttentionTitan is MHCAttentionTitan
+    assert "MHCAttentionTitan" in blocks.__all__
 
 
 def test_full_stack_alternating_decode() -> None:

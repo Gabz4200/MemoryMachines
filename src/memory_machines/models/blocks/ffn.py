@@ -240,7 +240,7 @@ def build_norm(kind: str, hidden_size: int, eps: float | None = None) -> nn.Modu
 
 
 class DenseFFN(nn.Module):
-    r"""DenseFFN(config, kind="swiglu", norm_kind="dyT", intermediate_size=None)
+    r"""DenseFFN(config, kind="swiglu", norm_kind="dyT", intermediate_size=None, update_interval=1)
 
     Dense (non-MoE) feed-forward sub-layer with a pre-norm residual, applied
     after each CED *encoder* and *decoder* layer.
@@ -254,6 +254,13 @@ class DenseFFN(nn.Module):
     weight-shared FFN is sufficient because the block is pointwise across
     positions and — on the mHC path — shared across the residual streams.
 
+    Each instance owns an update interval ``C = update_interval`` (the
+    "time cycle" of the HOPE / Continuum Memory System idea): the FFN is
+    only applied when :meth:`should_update` gates it on at the current step,
+    otherwise the block passes through unchanged. ``update_interval = 1``
+    (the default) recovers the always-on residual of the original CED
+    wiring, so existing exact-output behaviour is preserved.
+
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``hidden_size``, ``intermediate_size``, and
@@ -265,6 +272,9 @@ class DenseFFN(nn.Module):
         intermediate_size (int, optional): explicit FFN hidden width;
             ``None`` falls back to ``config.intermediate_size``. Default:
             ``None``.
+        update_interval (int, optional): FFN update cycle ``C``; the FFN is
+            applied only on steps where :meth:`should_update` returns ``True``.
+            Default: ``1`` (every step).
 
     Examples::
 
@@ -274,12 +284,32 @@ class DenseFFN(nn.Module):
         torch.Size([2, 5, 32])
     """
 
-    def __init__(self, config: MemoryMachineConfig, kind: str = "swiglu", norm_kind: str = "dyT", intermediate_size: int | None = None):
+    def __init__(self, config: MemoryMachineConfig, kind: str = "swiglu", norm_kind: str = "dyT", intermediate_size: int | None = None, update_interval: int = 1):
         super().__init__()
+        if update_interval < 1:
+            raise ValueError(f"update_interval must be >= 1, got {update_interval}")
         self.kind = kind
+        self.update_interval = update_interval
         self.norm = build_norm(norm_kind, config.hidden_size, eps=config.rms_norm_eps)
         self.ffn = build_ffn(config, kind, intermediate_size)
         self.reset_parameters()
+
+    def should_update(self, step: int) -> bool:
+        """should_update(step) -> bool — schedule gate for this FFN's cycle.
+
+        The FFN is applied only on steps where this returns ``True``; on the
+        other steps the block is an identity residual (``update_interval=1``
+        returns ``True`` every step, recovering the original CED wiring).
+
+        Args:
+            step (int): zero-based step counter of the enclosing stream.
+
+        Returns:
+            bool: ``step % update_interval == 0``.
+        """
+        if step < 0:
+            raise ValueError(f"step must be non-negative, got {step}")
+        return step % self.update_interval == 0
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
@@ -295,15 +325,22 @@ class DenseFFN(nn.Module):
             if callable(reset):
                 reset()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        r"""forward(x) -> Tensor
+    def forward(self, x: torch.Tensor, step: int | None = None) -> torch.Tensor:
+        r"""forward(x, step=None) -> Tensor
 
-        Apply the pre-norm dense FFN residual.
+        Apply the pre-norm dense FFN residual, gated by this block's update
+        cycle. ``step`` is the per-forward-call counter of the enclosing
+        stream: every block reads the same counter, but each block's own
+        ``update_interval`` decides on which steps it actually applies its
+        FFN. On a gated-off step the block is an identity residual.
 
         Args:
             x (Tensor): input ``(..., hidden)``; positions and, on the mHC
                 path, residual streams are both accepted (the norm and the
                 projections act on the trailing hidden axis).
+            step (int, optional): forward-call step counter. ``None`` (or
+                ``0``) always applies the FFN, recovering the original
+                always-on CED wiring. Default: ``None``.
 
         Returns:
             Tensor: output with the same shape as ``x``.
@@ -315,4 +352,6 @@ class DenseFFN(nn.Module):
             >>> ffn(torch.randn(1, 4, 16)).shape
             torch.Size([1, 4, 16])
         """
-        return x + self.ffn(self.norm(x))
+        if step is None or self.should_update(step):
+            return x + self.ffn(self.norm(x))
+        return x

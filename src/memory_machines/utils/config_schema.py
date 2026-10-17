@@ -254,6 +254,8 @@ class MemoryMachineConfig:
     ced_decoder_ffn: str = "swiglu"
     ced_encoder_ffn_intermediate_size: int = 0
     ced_decoder_ffn_intermediate_size: int = 0
+    ced_encoder_ffn_update_intervals: tuple[int, ...] = ()
+    ced_decoder_ffn_update_intervals: tuple[int, ...] = ()
     ced_decoder_looping: bool = False
     ced_decoder_loop_steps: int = 4
     ced_decoder_loop_exit_threshold: float = 0.5
@@ -378,6 +380,18 @@ class MemoryMachineConfig:
             raise ValueError(f"ced_encoder_ffn_intermediate_size ({self.ced_encoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
         if self.ced_decoder_ffn_intermediate_size < 0:
             raise ValueError(f"ced_decoder_ffn_intermediate_size ({self.ced_decoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
+        if self.ced_encoder_ffn_update_intervals and len(self.ced_encoder_ffn_update_intervals) != self.ced_num_encoder_layers:
+            raise ValueError(f"ced_encoder_ffn_update_intervals must hold {self.ced_num_encoder_layers} entries (one per encoder layer), got {tuple(self.ced_encoder_ffn_update_intervals)}")
+        if any(c < 1 for c in self.ced_encoder_ffn_update_intervals):
+            raise ValueError(f"ced_encoder_ffn_update_intervals must hold positive ints, got {tuple(self.ced_encoder_ffn_update_intervals)}")
+        dec_n = 1 if self.ced_decoder_looping else self.ced_num_decoder_layers
+        if self.ced_decoder_ffn_update_intervals and len(self.ced_decoder_ffn_update_intervals) != dec_n:
+            raise ValueError(
+                f"ced_decoder_ffn_update_intervals must hold {dec_n} entries (one per decoder layer; the looped decoder "
+                "shares one CSA2 -> DenseFFN layer), got {tuple(self.ced_decoder_ffn_update_intervals)}"
+            )
+        if any(c < 1 for c in self.ced_decoder_ffn_update_intervals):
+            raise ValueError(f"ced_decoder_ffn_update_intervals must hold positive ints, got {tuple(self.ced_decoder_ffn_update_intervals)}")
         if self.ced_decoder_loop_steps < 1:
             raise ValueError(f"ced_decoder_loop_steps ({self.ced_decoder_loop_steps}) must be >= 1")
         if not 0.0 <= self.ced_decoder_loop_exit_threshold <= 1.0:

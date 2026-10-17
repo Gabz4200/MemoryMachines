@@ -83,3 +83,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --doctest-modules"
 doctest_optionflags = "NORMALIZE_WHITESPACE ELLIPSIS"
+# SparseIndexer.topk clamps k to the number of compressed entries when the
+# sequence is shorter than top_k (tiny doctest configs). The clamp is correct
+# and pinned by tests; the warning is noise, so silence it here.
+filterwarnings = [
+    "ignore:SparseIndexer.topk:UserWarning",
+]

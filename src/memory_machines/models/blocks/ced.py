@@ -122,7 +122,10 @@ def _run_stream_layers(
     (:func:`~memory_machines.models.blocks.mhc_parallel.from_streams`).
 
     When ``ffns`` is given (one per block), each FFN is applied to the streams
-    right after its block.
+    right after its block. The block index is the per-forward step counter
+    shared by every block (each block's own ``update_interval`` decides on
+    which steps it actually applies its FFN — the HOPE / Continuum Memory
+    time-cycle idea).
     """
     streams = to_streams(hidden_states, num_streams)
     if shared is None:
@@ -138,7 +141,7 @@ def _run_stream_layers(
             seeded_store=seeded_store,
         )
         if ffns is not None:
-            streams = ffns[i](streams)
+            streams = ffns[i](streams, step=i)
     return from_streams(streams), shared
 
 
@@ -306,8 +309,25 @@ class CausalEncoderDecoderStack(nn.Module):
             enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
         self.encoder_layers = nn.ModuleList(enc)
         # Dense encoder FFNs, one per layer (kind and width from the
-        # encoder-side config, so the two halves stay independent).
-        self.encoder_ffns = nn.ModuleList([DenseFFN(config, config.ced_encoder_ffn, intermediate_size=config.ced_encoder_ffn_intermediate_size or None) for _ in range(len(enc))])
+        # encoder-side config, so the two halves stay independent). Each FFN
+        # owns its own update interval ``C^(l)`` (the HOPE / Continuum Memory
+        # time-cycle idea): the FFN is applied only on steps where its own
+        # ``should_update`` gates it on, so the encoder's dense FFNs can run
+        # at different frequencies while the mixers stay untouched.
+        enc_intervals = config.ced_encoder_ffn_update_intervals or (1,) * len(enc)
+        if len(enc_intervals) != len(enc):
+            raise ValueError(f"ced_encoder_ffn_update_intervals length ({len(enc_intervals)}) must equal number of encoder layers ({len(enc)})")
+        self.encoder_ffns = nn.ModuleList(
+            [
+                DenseFFN(
+                    config,
+                    config.ced_encoder_ffn,
+                    intermediate_size=config.ced_encoder_ffn_intermediate_size or None,
+                    update_interval=enc_intervals[i],
+                )
+                for i in range(len(enc))
+            ]
+        )
         # The decoder half is a standalone CausalDecoder so the
         # Eq. 1 seeding path lives in exactly one place.
         self.decoder = CausalDecoder(config, layers=decoder_layers)
@@ -407,7 +427,10 @@ class CausalEncoderDecoderStack(nn.Module):
                 if shared is None:
                     shared = CSA2SharedState(total_len=0)
                 x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
-                x = ffns[i](x)
+                # The block index is the per-forward step counter shared by
+                # every encoder FFN; each block's own update_interval decides
+                # on which steps it actually applies its FFN (HOPE time-cycle).
+                x = ffns[i](x, step=i)
         if shared is None:
             raise ValueError("encode produced no shared state (encoder_layers is empty)")
         return x, shared
@@ -804,9 +827,24 @@ class CausalDecoder(nn.Module):
             projs_list if projs_list is not None else [CEDGlobalKVProjection(config, source_size=config.hidden_size, decoder_hidden_size=self.decoder_hidden_size) for _ in range(dec_n)]
         )
         # Dense decoder FFNs, one per layer (kind and width from the
-        # decoder-side config, independent of the encoder's).
+        # decoder-side config, independent of the encoder's). Each FFN owns its
+        # own update interval ``C^(l)`` (the HOPE / Continuum Memory
+        # time-cycle idea), configured independently of the encoder's.
+        dec_intervals = config.ced_decoder_ffn_update_intervals or (1,) * len(built)
+        if len(dec_intervals) != len(built):
+            raise ValueError(f"ced_decoder_ffn_update_intervals length ({len(dec_intervals)}) must equal number of decoder layers ({len(built)})")
         self.ffns = nn.ModuleList(
-            ffns_list if ffns_list is not None else [DenseFFN(dec_cfg, dec_cfg.ced_decoder_ffn, intermediate_size=dec_cfg.ced_decoder_ffn_intermediate_size or None) for _ in range(len(built))]
+            ffns_list
+            if ffns_list is not None
+            else [
+                DenseFFN(
+                    dec_cfg,
+                    dec_cfg.ced_decoder_ffn,
+                    intermediate_size=dec_cfg.ced_decoder_ffn_intermediate_size or None,
+                    update_interval=dec_intervals[i],
+                )
+                for i in range(len(built))
+            ]
         )
         self.window_size = config.window_size
         self.loop_steps = config.ced_decoder_loop_steps
@@ -925,7 +963,10 @@ class CausalDecoder(nn.Module):
                 use_cache=True,
                 seeded_store=seeded_store,
             )
-            x = self.ffns[i](x)
+            # The layer index is the per-forward step counter shared by every
+            # decoder FFN; each block's own update_interval decides on which
+            # steps it actually applies its FFN (HOPE time-cycle).
+            x = self.ffns[i](x, step=i)
         return x
 
     @staticmethod
@@ -993,7 +1034,13 @@ class CausalDecoder(nn.Module):
                 seeded_store=seeded_store,
                 mode=self._loop_mode(step),
             )
-            x = self.ffns[0](x)
+            # The loop is a black box for the update schedule: the repeated
+            # CSA2 -> DenseFFN pattern counts as a single forward-call step,
+            # so the shared FFN is applied on every loop iteration (its
+            # update_interval governs across forward calls, not across
+            # loop iterations). This keeps the parameter-shared decoder an
+            # exact repetition of one shared layer.
+            x = self.ffns[0](x, step=0)
             lam = self.gate(x)
             if step == self.loop_steps - 1:
                 newly_done = ~done
