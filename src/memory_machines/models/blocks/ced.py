@@ -102,6 +102,64 @@ def decoder_config(config: MemoryMachineConfig) -> MemoryMachineConfig:
     return config if width == config.hidden_size else replace(config, hidden_size=width)
 
 
+def _build_encoder(
+    config: MemoryMachineConfig,
+    encoder_layers: list[nn.Module] | None = None,
+) -> tuple[nn.ModuleList, nn.ModuleList]:
+    r"""_build_encoder(config, encoder_layers=None) -> (ModuleList, ModuleList)
+
+    Build the CED encoder token-mixer layers and their dense FFNs.
+
+    Mirrors the encoder half of :class:`CausalEncoderDecoderStack` so a
+    model that owns the encoder (e.g. :class:`~memory_machines.models.backbone.CheapLLM`)
+    can construct it identically without duplicating the branch logic.
+
+    Args:
+        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
+            provides ``ced_num_encoder_layers``,
+            ``ced_attention_gdn2_parallel``, ``ced_attention_variant``,
+            ``ced_encoder_alternating``, ``ced_encoder_ffn``,
+            ``ced_encoder_ffn_intermediate_size``,
+            ``ced_encoder_ffn_update_intervals``, and
+            ``csa_encoder_compression_ratio``.
+        encoder_layers (list of nn.Module, optional): explicit encoder layers.
+            Default: ``None`` (build from ``config``).
+
+    Returns:
+        tuple[ModuleList, ModuleList]: the encoder token-mixer layers and the
+        per-layer dense feed-forward sub-layers.
+    """
+    enc_n = config.ced_num_encoder_layers
+    if encoder_layers is not None:
+        enc = list(encoder_layers)
+    elif config.ced_attention_gdn2_parallel:
+        enc: list[nn.Module] = []
+        for i in range(enc_n):
+            mode = "full" if i == 0 else "reuse"
+            if config.ced_encoder_alternating and i % 2 == 1:
+                enc.append(MHCAttentionTitan(config, config.csa_encoder_compression_ratio, mode))
+            else:
+                enc.append(MHCAttentionGDN2(config, config.csa_encoder_compression_ratio, mode))
+    else:
+        enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
+    enc_intervals = config.ced_encoder_ffn_update_intervals or (1,) * len(enc)
+    if len(enc_intervals) != len(enc):
+        raise ValueError(f"ced_encoder_ffn_update_intervals length ({len(enc_intervals)}) must equal number of encoder layers ({len(enc)})")
+    encoder_layers_ml = nn.ModuleList(enc)
+    encoder_ffns_ml = nn.ModuleList(
+        [
+            DenseFFN(
+                config,
+                config.ced_encoder_ffn,
+                intermediate_size=config.ced_encoder_ffn_intermediate_size or None,
+                update_interval=enc_intervals[i],
+            )
+            for i in range(len(enc))
+        ]
+    )
+    return encoder_layers_ml, encoder_ffns_ml
+
+
 def _run_stream_layers(
     layers: list[MHCAttentionGDN2],
     hidden_states: torch.Tensor,
@@ -294,40 +352,9 @@ class CausalEncoderDecoderStack(nn.Module):
     ):
         super().__init__()
         self.config = config
-        enc_n = config.ced_num_encoder_layers
-        if encoder_layers is not None:
-            enc = list(encoder_layers)
-        elif config.ced_attention_gdn2_parallel:
-            enc: list[nn.Module] = []
-            for i in range(enc_n):
-                mode = "full" if i == 0 else "reuse"
-                if config.ced_encoder_alternating and i % 2 == 1:
-                    enc.append(MHCAttentionTitan(config, config.csa_encoder_compression_ratio, mode))
-                else:
-                    enc.append(MHCAttentionGDN2(config, config.csa_encoder_compression_ratio, mode))
-        else:
-            enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
-        self.encoder_layers = nn.ModuleList(enc)
-        # Dense encoder FFNs, one per layer (kind and width from the
-        # encoder-side config, so the two halves stay independent). Each FFN
-        # owns its own update interval ``C^(l)`` (the HOPE / Continuum Memory
-        # time-cycle idea): the FFN is applied only on steps where its own
-        # ``should_update`` gates it on, so the encoder's dense FFNs can run
-        # at different frequencies while the mixers stay untouched.
-        enc_intervals = config.ced_encoder_ffn_update_intervals or (1,) * len(enc)
-        if len(enc_intervals) != len(enc):
-            raise ValueError(f"ced_encoder_ffn_update_intervals length ({len(enc_intervals)}) must equal number of encoder layers ({len(enc)})")
-        self.encoder_ffns = nn.ModuleList(
-            [
-                DenseFFN(
-                    config,
-                    config.ced_encoder_ffn,
-                    intermediate_size=config.ced_encoder_ffn_intermediate_size or None,
-                    update_interval=enc_intervals[i],
-                )
-                for i in range(len(enc))
-            ]
-        )
+        # The encoder half (token mixers + dense FFNs) is built by the shared
+        # helper so the construction logic stays in one place.
+        self.encoder_layers, self.encoder_ffns = _build_encoder(config, encoder_layers)
         # The decoder half is a standalone CausalDecoder so the
         # Eq. 1 seeding path lives in exactly one place.
         self.decoder = CausalDecoder(config, layers=decoder_layers)
