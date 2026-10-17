@@ -10,7 +10,6 @@ sparse + sliding-window branches. :class:`NativeSparseAttention`,
 sharing pattern.
 """
 
-import math
 import warnings
 
 import torch

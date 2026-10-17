@@ -225,6 +225,7 @@ class MemoryMachineConfig:
     conv_kernel_size: int = 3
     max_position_embeddings: int = 32768
     rms_norm_eps: float = 1e-6
+    tie_word_embeddings: bool = True
     cvpe_mlp_hidden: int = 32
     cvpe_use_log_transform: bool = True
     cvpe_enabled: bool = True

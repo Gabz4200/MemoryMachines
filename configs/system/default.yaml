@@ -1,0 +1,4 @@
+_target_: memory_machines.modules.lightning_module.LitResearchSystem
+learning_rate: 1.0e-4
+weight_decay: 0.01
+ignore_index: -100

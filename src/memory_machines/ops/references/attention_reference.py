@@ -18,7 +18,9 @@ cross-attention falls out of the shapes (``L == S`` shared streams vs
 controlled by ``is_causal`` / ``bidirectional`` (mutually exclusive).
 """
 from __future__ import annotations
+
 import math
+
 import torch
 import torch.nn.functional as F
 
@@ -134,13 +136,12 @@ def universal_pe_scaled_dot_product_attention(query, key, value, cvpe_attn_bias=
         if rep > 1:
             key = key.repeat_interleave(rep, -3)
             value = value.repeat_interleave(rep, -3)
-            if phi_vk is not None:
-                if phi_vk.size(-3) != nq:
-                    phi_vk = phi_vk.repeat_interleave(rep, -3)
+            if phi_vk is not None and phi_vk.size(-3) != nq:
+                phi_vk = phi_vk.repeat_interleave(rep, -3)
     logits = reference_qk_circuit(query, key, cvpe_attn_bias, attn_bias, scale)
     weights = torch.softmax(logits, dim=-1)
     weights = torch.dropout(weights, dropout_p, train=True)
     return reference_frvm_gated_reduction(weights, value, phi_vq, phi_vk, spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=frvm_chunk_size)
 
 
-__all__ = ["build_sdpa_bias", "reference_qk_circuit", "reference_frvm_gated_reduction", "universal_pe_scaled_dot_product_attention"]
+__all__ = ["build_sdpa_bias", "reference_frvm_gated_reduction", "reference_qk_circuit", "universal_pe_scaled_dot_product_attention"]

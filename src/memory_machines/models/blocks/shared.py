@@ -4,8 +4,6 @@ import math
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
-from torch import nn
 
 
 def residual_init_scale(std: float, num_layers: int, enabled: bool = True) -> float | None:
@@ -359,22 +357,24 @@ def _multi_axis_distance(
         >>> q = torch.tensor([[[0.], [1.]]])  # (B=1, Lq=2, N=1)
         >>> k = torch.tensor([[[0.], [1.], [2.]]])  # (B=1, Lk=3, N=1)
         >>> _multi_axis_distance(q, k, (32768,), True)
-        tensor([[[[0.0000]],
-                 [[0.0300]],
-                 [[0.0582]]],
-                [[[0.0582]],
-                 [[0.0300]],
-                 [[0.0000]]]])
+        tensor([[[[0.0000],
+                  [0.0667],
+                  [0.1057]],
+        <BLANKLINE>
+                 [[0.0667],
+                  [0.0000],
+                  [0.0667]]]])
         >>> # 2D example
         >>> q = torch.tensor([[[0, 0], [0, 1]]])  # (1, 2, 2)
         >>> k = torch.tensor([[[0, 0], [0, 1], [1, 0]]])  # (1, 3, 2)
         >>> _multi_axis_distance(q, k, (10, 10), False)
-        tensor([[[[0.0000, 0.0000]],
-                 [[0.0000, 0.1000]],
-                 [[0.1000, 0.0000]]],
-                [[[0.1000, 0.1000]],
-                 [[0.1000, 0.0000]],
-                 [[0.0000, 0.1000]]]])
+        tensor([[[[0.0000, 0.0000],
+                  [0.0000, 0.1000],
+                  [0.1000, 0.0000]],
+        <BLANKLINE>
+                 [[0.0000, 0.1000],
+                  [0.0000, 0.0000],
+                  [0.1000, 0.1000]]]])
     """
     if isinstance(axis_max, torch.Tensor):
         am = axis_max.to(device=q_pos.device, dtype=q_pos.dtype)

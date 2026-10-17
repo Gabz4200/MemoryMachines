@@ -1,9 +1,14 @@
 """HF model adapter: translates HF kwargs <-> typed ModelInput/ModelOutput.
 
 The core backbone stays a pure nn.Module; all HF coupling lives here.
+``ExampleBackbone`` returns vocabulary logits from its own ``head``; this
+adapter reuses that head as the model's ``lm_head`` (one head, no double
+projection) and exposes the backbone embedding so HF resizing/tying works.
 """
 
 from __future__ import annotations
+
+from typing import cast
 
 import torch
 from torch import nn
@@ -22,23 +27,40 @@ class CustomModelForCausalLM(PreTrainedModel):
 
     def __init__(self, config: CustomResearchConfig):
         super().__init__(config)
-        # Instantiate the pure PyTorch model using config kwargs. The typed_*
-        # accessors exist because PretrainedConfig inherits nn.Module, which
-        # widens plain attribute access to Module | Tensor.
+        # The backbone owns the single embedding + LM head. ``lm_head`` is a
+        # property aliasing ``backbone.head`` so the head tensor is registered
+        # once (an alias attribute would register it twice and break safetensors
+        # save_pretrained with a shared-tensor error).
+        # The typed_* accessors exist because PretrainedConfig inherits
+        # nn.Module, which widens plain attribute access to Module | Tensor.
         self.backbone = ExampleBackbone(
             embed_dim=config.typed_embed_dim,
             num_layers=config.typed_num_layers,
+            vocab_size=config.typed_vocab_size,
             backend=config.typed_backend,
         )
         self.vocab_size = config.typed_vocab_size
-        self.lm_head = nn.Linear(config.typed_embed_dim, self.vocab_size, bias=False)
         self.post_init()
 
+    @property
+    def lm_head(self) -> nn.Linear:
+        return self.backbone.head
+
+    @lm_head.setter
+    def lm_head(self, value: nn.Linear) -> None:
+        self.backbone.head = value
+
     def get_input_embeddings(self) -> nn.Module:
-        return self.backbone.input_proj
+        return self.backbone.get_input_embeddings()
 
     def set_input_embeddings(self, value: nn.Module):
-        self.backbone.embed = value
+        self.backbone.set_input_embeddings(value)
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module):
+        self.lm_head = cast(nn.Linear, new_embeddings)
 
     def forward(
         self,
@@ -55,17 +77,20 @@ class CustomModelForCausalLM(PreTrainedModel):
         # 1. Translate HF input -> typed ModelInput.
         clean_input = ModelInput(input_ids=input_ids, attention_mask=attention_mask, state=past_key_values)
 
-        # 2. Execute pure PyTorch math.
+        # 2. Execute pure PyTorch math (backbone returns vocab logits).
         clean_output: ModelOutput = self.backbone(clean_input)
-        logits = self.lm_head(clean_output.logits)
+        logits = clean_output.logits
 
         # 3. Loss if labels provided (HF standard).
         loss = None
         if labels is not None:
+            # Local int: reading self.vocab_size widens to Module | Tensor because
+            # PretrainedConfig inherits nn.Module.
+            vocab_size = int(self.vocab_size)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
+            loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
             if clean_output.aux_loss is not None:
                 loss = loss + clean_output.aux_loss
 
@@ -76,6 +101,6 @@ class CustomModelForCausalLM(PreTrainedModel):
 
         return CausalLMOutputWithPast(
             loss=loss,
-            logits=logits,
+            logits=cast("torch.FloatTensor", logits),
             past_key_values=clean_output.new_state,
         )

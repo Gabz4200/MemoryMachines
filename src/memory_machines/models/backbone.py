@@ -16,7 +16,6 @@ from torch import nn
 
 from memory_machines.models.blocks import (
     CompressedSparseAttention2,
-    DenseFFN,
     GroupedQueryAttention,
     MHCAttentionGDN2,
     SwiGLU,
@@ -30,7 +29,6 @@ from memory_machines.models.blocks.ced import (
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
 from memory_machines.models.registry import register_model
-from memory_machines.ops.dispatch import dispatch_dw_scale
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 
@@ -49,7 +47,11 @@ class _GQAWrapper(nn.Module):
 @register_model("default")
 @register_model("example")
 class ExampleBackbone(nn.Module):
-    """Minimal flat composition: GQA + SwiGLU blocks, a norm, a head."""
+    """Minimal flat composition: embedding + GQA/SwiGLU blocks, a norm, a head.
+
+    Returns hidden states (no vocabulary head) so the HF adapter in
+    ``integrations.transformers`` owns the single LM head.
+    """
 
     def __init__(
         self,
@@ -83,23 +85,27 @@ class ExampleBackbone(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(embed_dim)
-        self.input_proj = nn.Linear(vocab_size, embed_dim, bias=False)
+        self.embed = nn.Embedding(vocab_size, embed_dim)
         self.head = nn.Linear(embed_dim, vocab_size, bias=False)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        # HF passes a generic nn.Module; the attribute is an nn.Embedding.
+        self.embed = cast(nn.Embedding, value)
 
     def forward(self, inputs: ModelInput) -> ModelOutput:
         x = inputs.inputs_embeds
         if x is None:
             if inputs.input_ids is None:
                 raise ValueError("ModelInput requires input_ids or inputs_embeds")
-            x = torch.nn.functional.one_hot(inputs.input_ids, self.vocab_size).to(torch.float32)
-            x = self.input_proj(x)
+            x = self.embed(inputs.input_ids)
         for block in self.blocks:
             # Cast keeps the type checker honest on ModuleDict indexing.
             pair = cast(nn.ModuleDict, block)
             x = pair["ff"](pair["attn"](x))
         x = self.norm(x)
-        if x.dtype == torch.float32:
-            x = dispatch_dw_scale(x, x, backend=self.backend)
         return ModelOutput(logits=self.head(x), new_state=None)
 
 

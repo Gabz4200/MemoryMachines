@@ -119,9 +119,9 @@ uv run --no-sync pytest tests/test_ced_loop.py -q   # focused
 The suite is 748 tests covering block shapes, CSA2 modes, GDN-2 reference
 parity, Engram offload, CED memory/looping, and config-schema coverage (every
 `config.X` a block reads is a field — no dead fields). Doctests in
-`src/memory_machines/models/blocks` and `src/memory_machines/utils` run via
-`--doctest-modules`; `src/memory_machines/data/datamodule.py` fails to collect
-for unrelated reasons and is excluded.
+`src/memory_machines/models/blocks` and `src/memory_machines/utils` run as part
+of the default `pytest` invocation via `--doctest-modules` (they are listed in
+`testpaths`).
 
 ## License
 

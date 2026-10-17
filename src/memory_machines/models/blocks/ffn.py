@@ -60,7 +60,7 @@ class SwiGLU(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        SwiGLU.reset_parameters(self)
+        self.reset_parameters()
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
@@ -144,7 +144,7 @@ class ClassicMLP(nn.Module):
 
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        ClassicMLP.reset_parameters(self)
+        self.reset_parameters()
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None

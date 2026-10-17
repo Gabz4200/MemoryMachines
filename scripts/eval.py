@@ -11,7 +11,10 @@ from memory_machines.modules.lightning_module import LitResearchSystem
 def main(cfg: DictConfig):
     datamodule = instantiate(cfg.data)
     datamodule.setup(stage="test")
-    system = LitResearchSystem.load_from_checkpoint(cfg.checkpoint)
+    # The model is injected via DI and is not serialized in the checkpoint, so
+    # rebuild it from the same config and hand it to load_from_checkpoint.
+    model = instantiate(cfg.model)
+    system = LitResearchSystem.load_from_checkpoint(cfg.checkpoint, model=model)
     trainer = instantiate(cfg.trainer)
     trainer.test(system, datamodule=datamodule)
 

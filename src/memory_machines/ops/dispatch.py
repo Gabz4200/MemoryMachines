@@ -16,16 +16,15 @@ that cannot run is an actionable error, not a silent downgrade.
 import torch
 
 from memory_machines.ops.causal_conv1d import causal_conv1d_naive
-from memory_machines.ops.dw_scale import dw_scale as _compiled_op
 from memory_machines.ops.interfaces import ElementwiseOp
 from memory_machines.ops.references.causal_conv1d_reference import (
     reference_causal_conv1d_update,
 )
 from memory_machines.ops.references.dw_scale_reference import reference_dw_scale
 
-# Wire the ElementwiseOp protocol: both the reference and compiled dw_scale
-# entry points satisfy it (checked statically, not at runtime).
-_compiled_dw_scale_op: ElementwiseOp = _compiled_op
+# Static protocol wiring (checked by the type checker, not at runtime). The
+# compiled facade is imported lazily inside ``dispatch_dw_scale`` so merely
+# importing this dispatcher never registers its torch.library ops.
 _reference_dw_scale_op: ElementwiseOp = reference_dw_scale
 
 _VALID_BACKENDS = ("naive", "cpu", "gpu", "taichi", "compiled")
@@ -44,7 +43,11 @@ def dispatch_dw_scale(x: torch.Tensor, weight: torch.Tensor, backend: str = "nai
     backend = _normalize_backend(backend)
     if backend == "naive":
         return reference_dw_scale(x, weight)
-    return _compiled_op(x, weight)
+    # Lazy import: importing the facade registers torch.library ops, so defer
+    # it until a compiled backend is actually requested.
+    from memory_machines.ops.dw_scale import dw_scale as compiled_op
+
+    return compiled_op(x, weight)
 
 
 def dispatch_causal_conv1d(

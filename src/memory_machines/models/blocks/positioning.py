@@ -422,7 +422,7 @@ class FRVMValueGate(nn.Module):
             >>> gate.gated_reduction(w, torch.randn(2, 2, 6, 4), torch.randn(2, 2, 4, 4)).shape
             torch.Size([2, 2, 4, 4])
         """
-        bsz, num_heads, lq, lk = attn_weights.shape
+        bsz, num_heads, _lq, lk = attn_weights.shape
         if attn_weights.shape[-1] != v_full.shape[-2]:
             raise ValueError(f"attn_weights Lk ({attn_weights.shape[-1]}) does not match v_full Lk ({v_full.shape[-2]})")
         if attn_weights.shape[-2] != v_query.shape[-2]:

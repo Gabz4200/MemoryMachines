@@ -79,7 +79,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "src/memory_machines/models/blocks", "src/memory_machines/utils"]
 python_files = ["test_*.py"]
 addopts = "-v --doctest-modules"
 doctest_optionflags = "NORMALIZE_WHITESPACE ELLIPSIS"

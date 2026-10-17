@@ -1,21 +1,16 @@
 """Side-effect callbacks only. No plotting, saving, or telemetry in training_step."""
 
-from typing import Any
-
 import pytorch_lightning as pl
-from pytorch_lightning.utilities.types import STEP_OUTPUT
 
 
 class MetricLoggerCallback(pl.Callback):
-    def on_validation_batch_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs: STEP_OUTPUT,
-        batch: Any,
-        batch_idx: int,
-        dataloader_idx: int = 0,
-    ) -> None:
-        if batch_idx == 0 and trainer.logger:
-            # Generate sample inference and log cleanly via trainer.logger.
-            pass
+    """Lightweight validation hook.
+
+    Kept as a no-op seam so side-effect logging can be added without touching
+    the model or ``training_step``. It intentionally registers no per-batch
+    hook, so it adds no per-step overhead until implemented.
+    """
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # Placeholder: hook up sample generation / custom logging here.
+        return

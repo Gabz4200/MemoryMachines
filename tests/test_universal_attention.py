@@ -10,7 +10,6 @@ route to this op internally.
 import math
 
 import torch
-import torch.nn.functional as F
 
 from memory_machines.ops.references.attention_reference import (
     universal_pe_scaled_dot_product_attention as uattn,
@@ -148,7 +147,6 @@ def test_gqa_class_cross_attention_end_to_end():
 def test_ndim_zero_padding_toggle_matches_1d():
     # 1D -> 3D toggle: zero-padded spatial axes must reproduce the 1D bias
     # (same weights serve every modality).
-    import dataclasses
 
     from memory_machines.models.blocks.positioning import CVPEContextBias
 

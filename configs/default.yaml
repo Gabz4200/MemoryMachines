@@ -1,5 +1,7 @@
 defaults:
   - model: default
+  - system: default
+  - data: default
   - callbacks: default
   - trainer: default
 

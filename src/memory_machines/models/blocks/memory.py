@@ -101,6 +101,13 @@ class _DiskGather(torch.autograd.Function):
         return grad, None
 
 
+# Dense-gradient element cap for SSD-backed tables. ``_DiskGather.backward``
+# allocates a full-size dense gradient (AdamW needs dense grads), so a table
+# beyond this would OOM on the backward pass. Matches the config-level Engram
+# cap (256M elements ~ 1 GiB fp32).
+_MAX_DENSE_GRAD_ELEMENTS = 268_435_456
+
+
 class _SsdTable(nn.Module):
     r"""_SsdTable(path, num_embeddings, embedding_dim)
 
@@ -136,6 +143,17 @@ class _SsdTable(nn.Module):
     def __init__(self, path, num_embeddings: int, embedding_dim: int):
         super().__init__()
         import numpy as np
+
+        # The backward pass allocates a dense (num_embeddings, embedding_dim)
+        # gradient (AdamW needs dense grads). Fail fast at construction if the
+        # table is too large for that, matching the config-level Engram cap.
+        numel = num_embeddings * embedding_dim
+        if numel > _MAX_DENSE_GRAD_ELEMENTS:
+            raise ValueError(
+                f"_SsdTable({num_embeddings} x {embedding_dim} = {numel:,} elements) exceeds the "
+                f"{_MAX_DENSE_GRAD_ELEMENTS:,}-element dense-gradient cap; the backward pass would "
+                "allocate a matching dense gradient and OOM. Use a smaller table or a RAM embedding."
+            )
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
