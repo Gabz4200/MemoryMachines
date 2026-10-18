@@ -32,6 +32,19 @@ from memory_machines.models.registry import register_model
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 
+def _validate_encoder_layers(layers: nn.ModuleList) -> None:
+    """Assert every encoder token-mixer is a CSA2 or parallel-mHC layer.
+
+    CheapLLM accepts ``encoder_layers`` from callers; a wrong-typed entry
+    must fail at construction, not deep inside ``encode``. This mirrors the
+    runtime check in :meth:`CausalEncoderDecoderStack.encode` so the two
+    paths share one contract.
+    """
+    for layer in layers:
+        if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
+            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
+
+
 class _GQAWrapper(nn.Module):
     """GroupedQueryAttention returning hidden states only (drops weights/cache)."""
 
@@ -49,8 +62,15 @@ class _GQAWrapper(nn.Module):
 class ExampleBackbone(nn.Module):
     """Minimal flat composition: embedding + GQA/SwiGLU blocks, a norm, a head.
 
-    Returns hidden states (no vocabulary head) so the HF adapter in
-    ``integrations.transformers`` owns the single LM head.
+    Owns a single embedding and a single LM head and returns vocabulary
+    logits (``ModelOutput(logits=...)``); the HF adapter in
+    ``integrations/transformers`` reuses ``self.head`` as ``lm_head`` so the
+    head tensor is registered exactly once.
+
+    Padding is *not* supported: ``ModelInput.attention_mask`` is accepted for
+    API parity but ignored, so padded tokens attend to each other. Pass a
+    properly-shaped bool/additive mask to :class:`GroupedQueryAttention`
+    directly when padding matters.
     """
 
     def __init__(
@@ -62,9 +82,19 @@ class ExampleBackbone(nn.Module):
         backend: str = "naive",
     ):
         super().__init__()
+        if embed_dim <= 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be positive")
+        if num_layers <= 0:
+            raise ValueError(f"num_layers ({num_layers}) must be positive")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads ({num_heads}) must be positive")
+        if vocab_size <= 0:
+            raise ValueError(f"vocab_size ({vocab_size}) must be positive")
         self.embed_dim = embed_dim
         self.num_layers = num_layers
         self.vocab_size = vocab_size
+        # ``backend`` is accepted for API symmetry with the CED stack but is
+        # not consumed: this flat GQA/SwiGLU backbone has no backend switch.
         self.backend = backend
         cfg = MemoryMachineConfig(
             hidden_size=embed_dim,
@@ -162,10 +192,22 @@ class CheapLLM(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = vocab_size if vocab_size is not None else config.vocab_size
-        # Encoder: owned by this model (token mixers + dense FFNs).
+        if self.vocab_size <= 0:
+            raise ValueError(f"vocab_size ({self.vocab_size}) must be positive")
+        if config.hidden_size <= 0:
+            raise ValueError(f"hidden_size ({config.hidden_size}) must be positive")
+        # Encoder: owned by this model (token mixers + dense FFNs). Validate
+        # the caller-supplied layers once at construction so a wrong-typed
+        # entry surfaces here, not inside ``encode``.
         self.encoder_layers, self.encoder_ffns = _build_encoder(config, encoder_layers)
+        _validate_encoder_layers(self.encoder_layers)
         # Decoder: the CausalDecoder half (Eq. 1 global-KV seeding).
-        self.decoder = CausalDecoder(config, layers=decoder_layers, global_projs=global_projs, ffns=decoder_ffns)
+        self.decoder = CausalDecoder(
+            config,
+            layers=decoder_layers,
+            global_projs=global_projs,
+            ffns=decoder_ffns,
+        )
         # Widen (possibly narrow) decoder states back to hidden_size for the head.
         self.up = VocabularyUpProjection(config)
         self.embed = nn.Embedding(self.vocab_size, config.hidden_size)
@@ -181,6 +223,11 @@ class CheapLLM(nn.Module):
         up-projection init. The embedding uses PyTorch's default init; the
         head is re-initialized only when it is not weight-tied to the embedding.
         """
+        # Every registered component here (CSA2, MHC, DenseFFN, CEDGlobalKVProjection,
+        # CausalDecoder, VocabularyUpProjection) defines ``reset_parameters``;
+        # the ``getattr`` guard is defensive only and should never skip a
+        # module in practice. A missing ``reset_parameters`` is a contract
+        # violation, not a reason to stay silent.
         for layer in (*self.encoder_layers, *self.encoder_ffns):
             reset = getattr(layer, "reset_parameters", None)
             if callable(reset):
@@ -190,6 +237,28 @@ class CheapLLM(nn.Module):
         if not self.config.tie_word_embeddings:
             std = self.config.initializer_range
             nn.init.trunc_normal_(self.head.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        # HF passes a generic nn.Module; the attribute is an nn.Embedding.
+        self.embed = cast(nn.Embedding, value)
+
+    @property
+    def decoder_layers(self) -> nn.ModuleList:
+        """Backward-compatible view of :attr:`decoder`."""
+        return self.decoder.layers
+
+    @property
+    def global_projs(self) -> nn.ModuleList:
+        """Per-layer decoder global KV projections (view of :attr:`decoder`)."""
+        return self.decoder.global_projs
+
+    @property
+    def decoder_ffns(self) -> nn.ModuleList:
+        """Per-layer dense decoder feed-forward sub-layers (view of :attr:`decoder`)."""
+        return self.decoder.ffns
 
     def encode(self, hidden_states: torch.Tensor, position_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, CSA2SharedState]:
         """encode(hidden_states, position_ids=None) -> (Tensor, CSA2SharedState)
@@ -258,7 +327,8 @@ class CheapLLM(nn.Module):
 
         Standard causal LM forward: embed the input, encode it, decode it
         full-context, widen through the vocabulary up-projection, and apply
-        the LM head.
+        the LM head. ``inputs.attention_mask`` is accepted for API parity
+        (the CED decoder is causal and ignores padding) but not consumed.
         """
         x = inputs.inputs_embeds
         if x is None:
