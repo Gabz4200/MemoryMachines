@@ -17,6 +17,7 @@ cross-attention falls out of the shapes (``L == S`` shared streams vs
 ``L != S`` distinct streams) - no flag needed. Causal vs bidirectional is
 controlled by ``is_causal`` / ``bidirectional`` (mutually exclusive).
 """
+
 from __future__ import annotations
 
 import math
@@ -100,7 +101,23 @@ def reference_frvm_gated_reduction(attn_weight, value, phi_vq=None, phi_vk=None,
     return torch.cat(outs, dim=-2)
 
 
-def universal_pe_scaled_dot_product_attention(query, key, value, cvpe_attn_bias=None, phi_vq=None, phi_vk=None, spatial_grid=None, ov_spatial_weight=None, attn_mask=None, dropout_p=0.0, is_causal=False, bidirectional=False, scale=None, enable_gqa=False, frvm_chunk_size=128):
+def universal_pe_scaled_dot_product_attention(
+    query,
+    key,
+    value,
+    cvpe_attn_bias=None,
+    phi_vq=None,
+    phi_vk=None,
+    spatial_grid=None,
+    ov_spatial_weight=None,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    bidirectional=False,
+    scale=None,
+    enable_gqa=False,
+    frvm_chunk_size=128,
+):
     """Universal PE SDPA: vanilla SDPA + optional CVPE QK bias + F-RVM OV gate.
 
     Args:
@@ -139,7 +156,7 @@ def universal_pe_scaled_dot_product_attention(query, key, value, cvpe_attn_bias=
             if phi_vk is not None and phi_vk.size(-3) != nq:
                 phi_vk = phi_vk.repeat_interleave(rep, -3)
     logits = reference_qk_circuit(query, key, cvpe_attn_bias, attn_bias, scale)
-    weights = torch.softmax(logits, dim=-1)
+    weights = torch.softmax(logits, dim=-1, dtype=torch.float32).to(query.dtype)
     weights = torch.dropout(weights, dropout_p, train=True)
     return reference_frvm_gated_reduction(weights, value, phi_vq, phi_vk, spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=frvm_chunk_size)
 
