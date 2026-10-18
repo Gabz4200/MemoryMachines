@@ -68,6 +68,35 @@ class MemoryMachineConfig:
         output_attentions: Whether to output attention weights by default
         output_hidden_states: Whether to output hidden states by default
         num_perceiver_query: Learned latent queries per head (LivPerceiver)
+        perceiver_num_iterations: Number of cross-attend + latent self-attend
+            rounds in the LivPerceiver core (the Perceiver's iterative
+            distillation, Jaegle et al., 2021). ``1`` reproduces a single
+            compress -> self-attend -> broadcast round. Default: ``1``.
+        perceiver_attention_mode: Attention operator for the Perceiver
+            cross-attend. ``"full"`` attends latents to every input token
+            (``windowed=False``); ``"window"`` bounds the cross-attend to the
+            last ``window_size`` tokens (causal SWA); ``"sparse"`` compresses
+            the KV stream ``m:1`` with :class:`BlockCompressor` and attends
+            latents to the compressed store (no full-attention matrix over
+            the input). Default: ``"full"``.
+        perceiver_query_mode: How the query stream is seeded.
+            ``"learned"`` uses a learned latent-query parameter as the initial
+            latent array (classic Perceiver: queries are a free parameter, K/V
+            come from the single input stream). ``"cross"`` seeds the latents
+            via a two-stream cross-attention: the query stream (``x_proj``)
+            gathered at latent anchors provides the queries, the KV stream
+            (``x_gated``) provides keys/values. ``"masked"`` selects which
+            tokens produce queries with a ``(B, L)`` boolean mask; every token
+            still produces keys and values, attention is causal over the whole
+            sequence, and only the masked tokens get their representation
+            updated. Default: ``"learned"``.
+        perceiver_share_weights: Share the cross-attend and latent self-attend
+            modules across iterations (the recurrent / weight-shared Perceiver,
+            ~10x fewer params). Default: ``False``.
+        perceiver_sparse_compression_ratio: Block size ``m`` for the sparse
+            cross-attend KV compression. Default: ``8``.
+        perceiver_causal: Whether the Perceiver cross-attend and latent
+            self-attend are causal. Default: ``True``.
         window_size: Sliding-window width. ``<= 0`` disables the window
             (full attention); ``> 0`` bounds causal attention to the last
             ``window_size`` keys (plain SWA: 256). Compressed/sparse/shared
@@ -249,6 +278,12 @@ class MemoryMachineConfig:
     output_attentions: bool = False
     output_hidden_states: bool = False
     num_perceiver_query: int = 6
+    perceiver_num_iterations: int = 1
+    perceiver_attention_mode: str = "full"
+    perceiver_query_mode: str = "learned"
+    perceiver_share_weights: bool = False
+    perceiver_sparse_compression_ratio: int = 8
+    perceiver_causal: bool = True
     window_size: int = 256
     swa_bounded_replay: bool = True
     csa_compression_ratio: int = 4
@@ -363,6 +398,14 @@ class MemoryMachineConfig:
             raise ValueError(f"conv_kernel_size ({self.conv_kernel_size}) must be odd to preserve length with padding kernel//2")
         if self.num_perceiver_query <= 0:
             raise ValueError(f"num_perceiver_query ({self.num_perceiver_query}) must be positive")
+        if self.perceiver_num_iterations <= 0:
+            raise ValueError(f"perceiver_num_iterations ({self.perceiver_num_iterations}) must be positive")
+        if self.perceiver_attention_mode not in ("full", "window", "sparse"):
+            raise ValueError(f"perceiver_attention_mode ({self.perceiver_attention_mode!r}) must be one of 'full', 'window', 'sparse'")
+        if self.perceiver_query_mode not in ("learned", "cross", "masked"):
+            raise ValueError(f"perceiver_query_mode ({self.perceiver_query_mode!r}) must be one of 'learned', 'cross', 'masked'")
+        if self.perceiver_sparse_compression_ratio <= 0:
+            raise ValueError(f"perceiver_sparse_compression_ratio ({self.perceiver_sparse_compression_ratio}) must be positive")
         if self.max_position_embeddings <= 0:
             raise ValueError(f"max_position_embeddings ({self.max_position_embeddings}) must be positive")
         if self.csa_compression_ratio <= 0:
