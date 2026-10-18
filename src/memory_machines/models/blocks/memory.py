@@ -605,31 +605,40 @@ class SinglePassMHC(nn.Module):
 class EngramMemory(nn.Module):
     r"""EngramMemory(config)
 
-    Hashed n-gram memory from "Engrams: Decoupling Memorization from
-    Attention in Language Models" (arXiv:2601.07372), following the
-    official DeepSeek reference implementation.
+        Hashed n-gram memory from "Engrams: Decoupling Memorization from
+        Attention in Language Models" (arXiv:2601.07372), following the
+        official DeepSeek reference implementation.
 
-    Token windows of each configured order are hashed with a
-    multiplicative-XOR function into prime-sized tables (one flat
-    :class:`torch.nn.Embedding` with per-head offsets), looked up,
-    gated against the current hidden state per MHC stream, projected
+        Token windows of each configured order are hashed with a
+        multiplicative-XOR function into prime-sized tables (one flat
+        :class:`torch.nn.Embedding` with per-head offsets), looked up,
+        gated against the current hidden state per MHC stream, projected
     back to the model dimension, and refined by a short depthwise
-    causal convolution, then added residually to the input.
+            causal convolution, then added residually to the input.
 
-    Args:
-        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
-            provides ``engram_orders``, ``engram_hash_heads``,
-            ``engram_dim_per_order``, ``engram_num_entries``,
-            ``hidden_size``, ``vocab_size``, ``mhc_num_streams``,
-            ``pad_token_id``, ``engram_use_conv``,
-            ``engram_layer_positions``, and ``seed``.
+        .. warning::
+            The SSD-backed embedding lookup (:class:`_SsdTable`) uses a custom
+            :class:`torch.autograd.Function` whose backward allocates a dense
+            gradient tensor the size of the full embedding table. Tables are
+            capped at ``_MAX_DENSE_GRAD_ELEMENTS`` (268,435,456 elements, ~1 GiB
+            in fp32) at construction time, but the dense backward allocation still
+            happens at backward time for any table under the cap. Do not build
+            near-capacity tables on memory-constrained hardware.
 
-    Examples::
+        Args:
+            config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
+                provides ``engram_orders``, ``engram_hash_heads``,
+                ``engram_dim_per_order``, ``engram_num_entries``,
+                ``hidden_size``, ``vocab_size``, ``mhc_num_streams``,
+                ``pad_token_id``, ``engram_use_conv``,
+                ``engram_layer_positions``, and ``seed``.
 
-        >>> from memory_machines.utils.config_schema import MemoryMachineConfig
-        >>> mem = EngramMemory(MemoryMachineConfig(hidden_size=32, engram_num_entries=64))
-        >>> mem(torch.tensor([[1, 2, 3, 4]]), torch.randn(1, 4, 32), layer_id=0).shape
-        torch.Size([1, 4, 32])
+        Examples::
+
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> mem = EngramMemory(MemoryMachineConfig(hidden_size=32, engram_num_entries=64))
+            >>> mem(torch.tensor([[1, 2, 3, 4]]), torch.randn(1, 4, 32), layer_id=0).shape
+            torch.Size([1, 4, 32])
     """
 
     def __init__(self, config: MemoryMachineConfig):

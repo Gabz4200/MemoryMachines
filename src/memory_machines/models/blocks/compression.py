@@ -54,6 +54,12 @@ class BlockCompressor(nn.Module):
         super().__init__()
         if compression_ratio <= 0:
             raise ValueError(f"compression_ratio ({compression_ratio}) must be positive")
+        if hidden_size <= 0:
+            raise ValueError(f"hidden_size ({hidden_size}) must be positive")
+        if num_kv_heads <= 0:
+            raise ValueError(f"num_kv_heads ({num_kv_heads}) must be positive")
+        if head_dim <= 0:
+            raise ValueError(f"head_dim ({head_dim}) must be positive")
         self.compression_ratio = compression_ratio
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -609,7 +615,8 @@ class GroupedOutputProjection(nn.Module):
         std = self.init_std
         scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
         for proj in self.group_projs:
-            assert isinstance(proj, nn.Linear), "group_projs holds nn.Linear"  # type: ignore[assert-type]
+            if not isinstance(proj, nn.Linear):
+                raise TypeError(f"group_projs must hold nn.Linear instances, got {type(proj).__name__}")
             nn.init.trunc_normal_(proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         if scale is None:
             nn.init.zeros_(self.out_proj.weight)

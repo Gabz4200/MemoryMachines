@@ -237,6 +237,9 @@ class GroupedQueryAttention(nn.Module):
         self.num_layers: int = config.num_layers
         self.residual_init_scale: bool = config.residual_init_scale
 
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers ({self.num_layers}) must be positive")
+
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})")
 
@@ -284,16 +287,8 @@ class GroupedQueryAttention(nn.Module):
             if self.cvpe_enabled
             else None
         )
-        self.frvm_gate = (
-            FRVMValueGate(self.head_dim, self.num_heads, cross_heads=config.frvm_cross_heads)
-            if self.frvm_enabled
-            else None
-        )
-        self.frvm_spatial_ov = (
-            FRVMSpatialOV(config.cvpe_max_dims, self.head_dim)
-            if (self.frvm_enabled and config.frvm_use_spatial)
-            else None
-        )
+        self.frvm_gate = FRVMValueGate(self.head_dim, self.num_heads, cross_heads=config.frvm_cross_heads) if self.frvm_enabled else None
+        self.frvm_spatial_ov = FRVMSpatialOV(config.cvpe_max_dims, self.head_dim) if (self.frvm_enabled and config.frvm_use_spatial) else None
 
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         GroupedQueryAttention.reset_parameters(self)
@@ -671,8 +666,18 @@ class GroupedQueryAttention(nn.Module):
             key_exp, value_full_exp, _ = self._expand_kv(key_states, value_full, value_current)
             vq_exp = v_q_heads.repeat_interleave(self.num_key_value_groups, dim=1)
             return self._reduce_with_pe(
-                query_states, key_exp, value_full_exp, vq_exp, q_pos, k_pos,
-                attention_mask, bsz, q_len, output_attentions, is_causal, bidirectional,
+                query_states,
+                key_exp,
+                value_full_exp,
+                vq_exp,
+                q_pos,
+                k_pos,
+                attention_mask,
+                bsz,
+                q_len,
+                output_attentions,
+                is_causal,
+                bidirectional,
                 windowed=False,
             )
 
@@ -709,6 +714,18 @@ class GroupedQueryAttention(nn.Module):
 
         if total_len > self.max_position_embeddings:
             raise ValueError(f"Sequence length ({total_len}) exceeds configured max_position_embeddings ({self.max_position_embeddings})")
+
+        if past_key_value is not None and past_positions is not None and self.window_size > 0:
+            pp_check = past_positions.to(device)
+            if pp_check.dim() == 1:
+                pp_count = pp_check.shape[0]
+            else:
+                pp_count = pp_check.shape[-1]
+            if pp_count != cached_len:
+                raise ValueError(
+                    f"past_positions holds {pp_count} entries but past_key_value holds {cached_len} cached keys; "
+                    "the windowed cache is truncated and its absolute positions must cover exactly the cached keys"
+                )
 
         if past_key_value is None:
             q_pos, k_pos = _resolve_positions(hidden_states, q_len, true_past_len, position_ids)
@@ -809,12 +826,12 @@ class GroupedQueryAttention(nn.Module):
             reference_qk_circuit,
         )
 
-        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(
-            query_states, value_query_exp, value_full_exp, q_pos, k_pos
-        )
+        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(query_states, value_query_exp, value_full_exp, q_pos, k_pos)
         attn = reference_qk_circuit(
-            query_states, key_exp, cvpe_attn_bias,
-            torch.zeros(query_states.shape[2], key_exp.shape[2], dtype=query_states.dtype, device=query_states.device),
+            query_states,
+            key_exp,
+            cvpe_attn_bias,
+            torch.zeros(query_states.shape[-2], key_exp.shape[-2], dtype=query_states.dtype, device=query_states.device),
             None,
         )
         q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
@@ -841,8 +858,13 @@ class GroupedQueryAttention(nn.Module):
             per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * value_full_exp.shape[-1]
             eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
             heads = reference_frvm_gated_reduction(
-                attn_dropped, value_full_exp, phi_vq, phi_vk,
-                spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=eff,
+                attn_dropped,
+                value_full_exp,
+                phi_vq,
+                phi_vk,
+                spatial_grid=spatial_grid,
+                ov_spatial_weight=ov_spatial_weight,
+                chunk_size=eff,
             )
         else:
             heads = attn_dropped @ value_full_exp
@@ -911,13 +933,13 @@ class GroupedQueryAttention(nn.Module):
             reference_qk_circuit,
         )
 
-        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(
-            query_states, vq_exp, val_exp, q_pos, k_pos_full
-        )
+        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(query_states, vq_exp, val_exp, q_pos, k_pos_full)
         # QK circuit identical to _score_qk (no mask yet), via the reference op.
         attn = reference_qk_circuit(
-            query_states, key_exp, cvpe_attn_bias,
-            torch.zeros(query_states.shape[2], key_exp.shape[2], dtype=query_states.dtype, device=query_states.device),
+            query_states,
+            key_exp,
+            cvpe_attn_bias,
+            torch.zeros(query_states.shape[-2], key_exp.shape[-2], dtype=query_states.dtype, device=query_states.device),
             None,
         )
         # windowed, is_causal=False is bidirectional within the
@@ -946,8 +968,13 @@ class GroupedQueryAttention(nn.Module):
             per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * val_exp.shape[-1]
             eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
             heads = reference_frvm_gated_reduction(
-                attn_dropped, val_exp, phi_vq, phi_vk,
-                spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=eff,
+                attn_dropped,
+                val_exp,
+                phi_vq,
+                phi_vk,
+                spatial_grid=spatial_grid,
+                ov_spatial_weight=ov_spatial_weight,
+                chunk_size=eff,
             )
         else:
             heads = attn_dropped @ val_exp

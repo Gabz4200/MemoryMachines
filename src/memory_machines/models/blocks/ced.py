@@ -145,6 +145,9 @@ def _build_encoder(
     enc_intervals = config.ced_encoder_ffn_update_intervals or (1,) * len(enc)
     if len(enc_intervals) != len(enc):
         raise ValueError(f"ced_encoder_ffn_update_intervals length ({len(enc_intervals)}) must equal number of encoder layers ({len(enc)})")
+    for i, iv in enumerate(enc_intervals):
+        if iv < 1:
+            raise ValueError(f"ced_encoder_ffn_update_intervals[{i}] ({iv}) must be >= 1")
     encoder_layers_ml = nn.ModuleList(enc)
     encoder_ffns_ml = nn.ModuleList(
         [
@@ -954,6 +957,8 @@ class CausalDecoder(nn.Module):
             torch.Size([1, 4, 16])
         """
         if start_pos is None:
+            if encoder_final.dim() != 3:
+                raise ValueError(f"encoder_final must be 3D (B, L, D), got {encoder_final.dim()}D {tuple(encoder_final.shape)}")
             start_pos = encoder_final.shape[1]
         if self.config.ced_decoder_looping:
             return self._decode_looped(
@@ -1046,6 +1051,11 @@ class CausalDecoder(nn.Module):
         if not isinstance(layer, CompressedSparseAttention2):
             raise TypeError(f"looped decoder layers must hold CompressedSparseAttention2 (no GDN-2 branch), got {type(layer).__name__}")
         comp, ends = self.global_projs[0](encoder_final)
+        if comp is None or ends is None:
+            raise RuntimeError(
+                "global_projs[0] returned (None, None); the compressed KV store and end positions are required "
+                "for every decoder layer (Full/Reindex/Reuse). Check that the encoder projection is initialized."
+            )
         shared: CSA2SharedState | None = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=start_pos)
         x = hidden_states
         out = hidden_states

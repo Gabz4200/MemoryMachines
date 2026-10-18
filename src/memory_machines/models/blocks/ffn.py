@@ -320,6 +320,9 @@ class DenseFFN(nn.Module):
         """
         # Registry kinds define reset_parameters, but ``nn.Module`` does not
         # declare it, so resolve dynamically instead of asserting on the type.
+        # If a registered kind omits reset_parameters, its weights are silently
+        # left at their factory defaults - callers must ensure every registered
+        # FFN implements reset_parameters (see ``_FFN_REGISTRY``).
         for sublayer in (self.norm, self.ffn):
             reset = getattr(sublayer, "reset_parameters", None)
             if callable(reset):

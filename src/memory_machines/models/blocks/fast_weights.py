@@ -869,13 +869,13 @@ class SelfReferentialTitanMemory(nn.Module):
         norm_eps: float = 1e-6,
         init_std: float = 0.02,
         backend: str = "naive",
-        chunk_size: int = 64,
+        chunk_size: int | None = None,
         use_qk_projection: bool = False,
     ) -> None:
         super().__init__()
         if backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
             raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
-        if chunk_size <= 0:
+        if chunk_size is not None and chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if hidden_size <= 0 or num_heads <= 0:
             raise ValueError("hidden_size/num_heads must be positive")
@@ -1037,7 +1037,7 @@ class SelfReferentialTitanMemory(nn.Module):
             fast = {box: [w.to(device=x.device, dtype=q_all.dtype) for w in state["fast_weights"][box]] for box in HOPE_BOXES}
         total = q_all.shape[1]
         width = self.chunk_size if chunk_size is None else chunk_size
-        if width is not None and width <= 0:
+        if width is not None and width < 0:
             width = total
         mem_out, fast = self_referential_titan(
             heads,
@@ -1096,8 +1096,8 @@ class SelfReferentialTitanMixer(nn.Module):
             (``config.titan_conv_kernel_size``).
         chunk_size: default positions per state-carry chunk (exact; bounds
             peak activation lifetime). Default: ``None``
-            (``config.titan_chunk_size``; ``0`` = whole sequence). Per-call
-            ``chunk_size`` overrides it.
+            (``config.titan_chunk_size``). Per-call ``chunk_size`` overrides
+            it. ``chunk_size`` must be positive (``<= 0`` raises).
 
     Examples::
 
@@ -1131,11 +1131,22 @@ class SelfReferentialTitanMixer(nn.Module):
         conv_kernel_size = config.titan_conv_kernel_size if conv_kernel_size is None else conv_kernel_size
         resolved_backend = getattr(config, "titan_backend", "naive") if backend is None else backend
         resolved_qk_proj = getattr(config, "titan_use_qk_projection", False) if use_qk_projection is None else use_qk_projection
-        if chunk_size is None and config.titan_chunk_size:
-            chunk_size = config.titan_chunk_size
-        resolved_chunk_size = chunk_size if chunk_size is not None else 64
-        if resolved_chunk_size <= 0:
-            raise ValueError(f"chunk_size must be positive, got {resolved_chunk_size}")
+        # ``0`` means "whole sequence" (per the Titans contract). When it comes from
+        # the config default we map it to ``None`` (single unchunked pass); an
+        # explicit per-call ``chunk_size=0`` still raises so callers cannot
+        # silently request a zero-width chunk.
+        if chunk_size is None:
+            tc = config.titan_chunk_size
+            if tc is not None and tc == 0:
+                resolved_chunk_size = None
+            elif tc is not None:
+                resolved_chunk_size = tc
+            else:
+                resolved_chunk_size = 64
+        else:
+            if chunk_size <= 0:
+                raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+            resolved_chunk_size = chunk_size
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
