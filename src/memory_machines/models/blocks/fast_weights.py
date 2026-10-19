@@ -974,25 +974,6 @@ class SelfReferentialTitanMemory(nn.Module):
     def _box_scalars(self, raw: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(raw.mean(dim=-1))
 
-    def _update_linear_box(
-        self,
-        w: torch.Tensor,
-        k: torch.Tensor,
-        vhat: torch.Tensor,
-        eta: torch.Tensor,
-        alpha: torch.Tensor,
-    ) -> torch.Tensor:
-        """Exact Eq. 92/93 row-vector form for matrix memories."""
-        kk = torch.einsum("...d,...e->...de", k, k)
-        dgd = torch.einsum("...de,...ev->...dv", kk, w)
-        pred = torch.einsum("...d,...dv->...v", k, w)
-        if self.objective == "l2":
-            grad = torch.einsum("...d,...v->...dv", k, pred - vhat)
-        else:
-            grad = -torch.einsum("...d,...v->...dv", k, vhat)
-        shape = _gate_shape(eta, w)
-        return alpha.view(*shape) * w - eta.view(*shape) * dgd - eta.view(*shape) * grad
-
     @property
     def head_k_dim(self) -> int:
         """Key head dimension."""

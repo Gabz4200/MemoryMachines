@@ -256,3 +256,34 @@ def test_config_rejects_bad_loop_fields():
         replace(tiny_cfg(), ced_decoder_loop_steps=0)
     with pytest.raises(ValueError, match="ced_decoder_loop_exit_threshold"):
         replace(tiny_cfg(), ced_decoder_loop_exit_threshold=1.5)
+
+
+def test_exit_steps_stress_never_exceeds_recurrent_depth():
+    # R4 regression: exit_steps is (cdf < threshold).sum(dim=1).clamp(max=T-1) + 1,
+    # so the result is pinned to [1, T] even under numerical drift in the
+    # cumprod/cumsum chain. The invariant this relies on is that the final
+    # step always exits (exit_distribution assigns the survival mass to it,
+    # so cdf[:, -1] == 1 exactly and no threshold in [0, 1] can push the count
+    # past T). Stress-test with random lambdas across the whole range.
+    torch.manual_seed(0)
+    for _ in range(200):
+        T = int(torch.randint(1, 9, (1,)).item())
+        lam = torch.rand(2, T, 3)  # in (0, 1): never exactly 0 or 1
+        steps = AdaptiveExitGate.exit_steps(lam, threshold=0.5)
+        assert tuple(steps.shape) == (2, 3)
+        assert bool((steps >= 1).all()) and bool((steps <= T).all())
+        # The final step's CDF is exactly 1, so a threshold of 1.0 always exits
+        # at the last step (the clamp pins the count to T-1, +1 -> T) when
+        # some earlier step is still below threshold; when every step exits
+        # immediately (lambda == 1) the count is 0 and the result is 1.
+        q1 = AdaptiveExitGate.exit_steps(lam, 1.0).tolist()
+        assert all(1 <= v <= T for row in q1 for v in row)
+
+
+def test_exit_steps_threshold_one_forces_the_final_step_even_when_all_exit_early():
+    # Every step exits with probability 1 (lambda == 1), so the CDF reaches 1
+    # at step 1 and the position exits immediately. The clamp must still pin
+    # the result to [1, T] — it never reaches T+1 even though the count of
+    # steps below threshold is 0 (clamped to 0, +1 -> 1).
+    lam = torch.ones(1, 5, 2)
+    assert AdaptiveExitGate.exit_steps(lam, 1.0).tolist() == [[1, 1]]

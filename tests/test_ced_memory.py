@@ -389,3 +389,54 @@ def test_causal_decoder_rejects_short_position_ids():
     short = torch.arange(L).unsqueeze(0)[:, :2]
     with pytest.raises(ValueError, match="must cover the replay"):
         dec.prefill(H, E, short)
+
+
+def test_causal_decoder_bounded_replay_anchors_tail_at_encoder_end():
+    # R5 regression: the replayed tail always anchors at
+    # [enc_len - replay_len, enc_len) regardless of the decoder prompt length,
+    # because the global store is projected from the encoder-final states
+    # (Eq. 1). A prompt shorter than the encoder context must still replay its
+    # last window at the encoder tail, not at seq_len - replay_len (which
+    # could go negative and mis-anchor the store). The seq_len != enc_len case
+    # now requires explicit position_ids covering the replay window.
+    torch.manual_seed(0)
+    cfg = _ced_decoder_cfg()
+    dec = CausalDecoder(cfg).eval()
+    enc_len = 8
+    window = cfg.window_size  # 4
+    # Prompt shorter than the encoder context: replay the last 4 tokens.
+    E = torch.randn(1, enc_len, 32)
+    H_short = torch.randn(1, 6, 32)
+    pos_short = torch.arange(enc_len - window, enc_len).unsqueeze(0)
+    out_short = dec.prefill(H_short, E, pos_short)
+    assert tuple(out_short.shape) == (1, window, 32)
+    # The same tail, replayed as its own prompt, must agree: the tail is the
+    # last 4 tokens of H_short, anchored at the same encoder-anchored positions.
+    tail = H_short[:, -window:, :]
+    out_tail = dec.prefill(tail, E, pos_short)
+    torch.testing.assert_close(out_short, out_tail, atol=1e-5, rtol=1e-5)
+
+
+def test_causal_decoder_bounded_replay_rejects_prompt_longer_than_encoder():
+    # A prompt longer than the encoded context cannot be replayed from the
+    # encoder states alone, so prefill must fall back to full-context decode
+    # rather than mis-anchoring a tail.
+    torch.manual_seed(1)
+    cfg = _ced_decoder_cfg()
+    dec = CausalDecoder(cfg).eval()
+    E = torch.randn(1, 4, 32)
+    H = torch.randn(1, 8, 32)
+    out = dec.prefill(H, E)
+    assert tuple(out.shape) == (1, 8, 32)
+
+
+def test_causal_decoder_bounded_replay_requires_position_ids_when_lengths_differ():
+    # seq_len != enc_len with no position_ids must raise: the tail cannot be
+    # anchored without explicit positions.
+    torch.manual_seed(2)
+    cfg = _ced_decoder_cfg()
+    dec = CausalDecoder(cfg).eval()
+    E = torch.randn(1, 8, 32)
+    H = torch.randn(1, 6, 32)
+    with pytest.raises(ValueError, match="bounded replay needs explicit position_ids"):
+        dec.prefill(H, E)

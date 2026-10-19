@@ -6,6 +6,8 @@ checks, float32 default elsewhere. All shapes kept tiny (B<=2, T<=8, D<=8,
 W<=4).
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -643,3 +645,93 @@ def test_causal_conv1d_op_raises_not_implemented():
     torch.manual_seed(65)
     with pytest.raises(NotImplementedError):
         causal_conv1d_op(torch.randn(1, 4, 2), torch.randn(2, 3), None)
+
+
+def test_dispatch_auto_warns_and_falls_back_to_reference():
+    # Ops dispatch regression: backend="auto" must try the compiled kernel
+    # (Taichi -> CPU cpp) and, since neither is implemented yet, emit a
+    # UserWarning and return the pure-PyTorch reference result. The warning
+    # must name the op so callers can silence it with backend="naive".
+    torch.manual_seed(66)
+    x = _d64(1, 4, 2)
+    w = _d64(2, 3)
+    cache = _d64(1, 2, 3)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        y, _ = dispatch_causal_conv1d(x, w, backend="auto")
+        yu, cu = dispatch_causal_conv1d_update(x[:, 0, :], cache.clone(), w, backend="auto")
+    assert any(issubclass(w.category, UserWarning) for w in caught)
+    assert any("causal_conv1d" in str(w.message) for w in caught)
+    assert any("causal_conv1d_update" in str(w.message) for w in caught)
+    # The fallback result must equal the reference exactly.
+    ey = reference_causal_conv1d_fwd(x, w)
+    torch.testing.assert_close(y, ey, atol=1e-12, rtol=1e-12)
+    eyu, ecu = reference_causal_conv1d_update(x[:, 0, :], cache.clone(), w)
+    torch.testing.assert_close(yu, eyu, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(cu, ecu, atol=1e-12, rtol=1e-12)
+
+
+def test_dispatch_auto_matches_naive_for_all_options():
+    # auto (warns + reference) and naive (reference directly) must agree
+    # exactly for every option combination — the fallback is the same code.
+    torch.manual_seed(67)
+    B, T, D, W = 2, 5, 4, 3
+    x = _d64(B, T, D)
+    weight = _d64(D, W)
+    bias = _d64(D)
+    residual = _d64(B, T, D)
+    init = _d64(B, D, W)
+    init[:, :, 0] = 0.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        y_auto, f_auto = dispatch_causal_conv1d(
+            x,
+            weight,
+            bias=bias,
+            residual=residual,
+            initial_state=init,
+            output_final_state=True,
+            activation="silu",
+            backend="auto",
+        )
+    y_naive, f_naive = dispatch_causal_conv1d(
+        x,
+        weight,
+        bias=bias,
+        residual=residual,
+        initial_state=init,
+        output_final_state=True,
+        activation="silu",
+        backend="naive",
+    )
+    torch.testing.assert_close(y_auto, y_naive, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(f_auto, f_naive, atol=0.0, rtol=0.0)
+
+
+def test_dispatch_auto_no_warning_when_explicit_naive():
+    # backend="naive" must not emit the fallback warning — it is the reference
+    # by construction, not a downgrade.
+    torch.manual_seed(68)
+    x = _d64(1, 4, 2)
+    w = _d64(2, 3)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dispatch_causal_conv1d(x, w, backend="naive")
+        dispatch_causal_conv1d_update(x[:, 0, :], torch.zeros(1, 2, 3), w, backend="naive")
+    assert not any(issubclass(w.category, UserWarning) for w in caught)
+
+
+def test_dispatch_backend_normalization_is_case_insensitive_and_tolerant():
+    # backend strings are normalized (case-insensitive, whitespace-tolerant)
+    # so " AUTO ", "Naive", and "cpu" all resolve to the same backend.
+    torch.manual_seed(69)
+    x = _d64(1, 4, 2)
+    w = _d64(2, 3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        y_auto = dispatch_causal_conv1d(x, w, backend=" AUTO ")
+        y_naive = dispatch_causal_conv1d(x, w, backend="  naive  ")
+    torch.testing.assert_close(y_auto, y_naive, atol=1e-12, rtol=1e-12)
+    # An explicit compiled backend still raises (no silent downgrade).
+    with pytest.raises(NotImplementedError):
+        dispatch_causal_conv1d(x, w, backend="GPU")

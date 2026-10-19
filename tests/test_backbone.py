@@ -120,3 +120,69 @@ def test_cheapllm_invalid_encoder_layers_raise_at_construction():
     cfg = _ced_cfg(ced_num_encoder_layers=1)
     with pytest.raises(TypeError):
         CheapLLM(cfg, encoder_layers=[torch.nn.Linear(16, 16)])
+
+
+def test_cheapllm_accepts_bare_tensor_input():
+    # D4 regression: CheapLLM.forward now accepts a bare torch.Tensor as a
+    # shorthand for ModelInput(input_ids=tensor) — the HF adapter and ad-hoc
+    # scripts must not crash with AttributeError on .inputs_embeds.
+    cfg = _ced_cfg()
+    model = CheapLLM(cfg)
+    out = model(torch.randint(0, cfg.vocab_size, (1, 6)))
+    assert tuple(out.logits.shape) == (1, 6, cfg.vocab_size)
+
+
+def test_cheapllm_bare_tensor_matches_modelinput():
+    # The coercion must be lossless: a bare tensor and the equivalent
+    # ModelInput(input_ids=tensor) produce identical logits.
+    cfg = _ced_cfg()
+    model = CheapLLM(cfg).eval()
+    ids = torch.randint(0, cfg.vocab_size, (1, 6))
+    a = model(ids).logits
+    b = model(ModelInput(input_ids=ids)).logits
+    torch.testing.assert_close(a, b, atol=1e-6, rtol=1e-6)
+
+
+def test_cheapllm_bare_tensor_requires_input_ids_when_embeds_missing():
+    # A bare ModelInput with neither input_ids nor inputs_embeds must still
+    # fail — the coercion only fills in the input_ids shorthand.
+    cfg = _ced_cfg()
+    model = CheapLLM(cfg)
+    with pytest.raises(ValueError, match="input_ids or inputs_embeds"):
+        model(ModelInput())
+
+
+def test_cheapllm_masked_token_positions_anchor_at_end():
+    # D3 regression: Perceiver-AR masked queries must anchor at [N-L, N) by
+    # contract (explicit position_ids), not by accident of the fallback
+    # arithmetic inside CausalDecoder.decode_full_context. A decoder prompt
+    # shorter than the encoder length must NOT shift the masked queries to the
+    # encoder tail — the query slice is the last L tokens of the full sequence.
+    cfg = _ced_cfg(
+        ced_num_encoder_layers=1,
+        ced_num_decoder_layers=1,
+        ced_masked_query=True,
+        ced_masked_token_count=3,
+    )
+    model = CheapLLM(cfg).eval()
+    ids = torch.randint(0, cfg.vocab_size, (1, 6))
+    out = model(ModelInput(input_ids=ids, num_masked_tokens=3))
+    # 6 input tokens + 3 masked = 9 total; only the 3 masked positions decode.
+    assert tuple(out.logits.shape) == (1, 3, cfg.vocab_size)
+
+
+def test_cheapllm_masked_token_positions_independent_of_prompt_length():
+    # The masked query slice is always the last L tokens of the full
+    # sequence, so a 4-token prompt with 2 masked tokens produces 2 logits
+    # anchored at positions [4-2, 4) = [2, 4), regardless of the encoder length.
+    for prompt_len in (4, 6, 8):
+        cfg = _ced_cfg(
+            ced_num_encoder_layers=1,
+            ced_num_decoder_layers=1,
+            ced_masked_query=True,
+            ced_masked_token_count=2,
+        )
+        model = CheapLLM(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (1, prompt_len))
+        out = model(ModelInput(input_ids=ids, num_masked_tokens=2))
+        assert tuple(out.logits.shape) == (1, 2, cfg.vocab_size)
