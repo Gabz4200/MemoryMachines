@@ -110,7 +110,7 @@ def test_example_backbone_inputs_embeds_matches_input_ids():
 
 @pytest.mark.parametrize("kwarg,value", [("embed_dim", 0), ("num_layers", 0), ("num_heads", 0), ("vocab_size", 0)])
 def test_example_backbone_invalid_dims_raise(kwarg, value):
-    cfg = dict(embed_dim=16, num_layers=2, num_heads=4, vocab_size=32)
+    cfg = {"embed_dim": 16, "num_layers": 2, "num_heads": 4, "vocab_size": 32}
     cfg[kwarg] = value
     with pytest.raises(ValueError):
         ExampleBackbone(**cfg)

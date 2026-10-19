@@ -424,7 +424,7 @@ def test_gdn2_knobs_are_config_controlled():
 
 def test_gdn2_conv_bias_is_config_controlled():
     layer = MHCAttentionGDN2(replace(_cfg(), ced_gdn2_conv_bias=True)).gdn2.layer
-    assert layer.q_conv1d.bias is not None
+    assert layer.q_conv1d.bias is not None  # pyrefly: ignore
 
 
 def test_engram_conv_kernel_size_is_config_controlled():

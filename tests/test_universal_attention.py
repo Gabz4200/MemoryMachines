@@ -41,9 +41,7 @@ def test_bidirectional_equals_unmasked_and_rejects_causal_combo():
     q = torch.randn(1, 2, 4, 8)
     k = torch.randn(1, 2, 6, 8)
     v = torch.randn(1, 2, 6, 8)
-    torch.testing.assert_close(
-        uattn(q, k, v, bidirectional=True), uattn(q, k, v, is_causal=False), atol=0, rtol=0
-    )
+    torch.testing.assert_close(uattn(q, k, v, bidirectional=True), uattn(q, k, v, is_causal=False), atol=0, rtol=0)
     try:
         uattn(q, k, v, is_causal=True, bidirectional=True)
     except ValueError:

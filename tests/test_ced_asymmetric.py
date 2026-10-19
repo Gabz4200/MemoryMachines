@@ -73,8 +73,10 @@ def test_asymmetric_decoder_layers_run_at_the_narrow_width():
 
 def test_asymmetric_gate_reads_the_narrow_width():
     dec = CausalDecoder(_asym_cfg(ced_decoder_looping=True)).eval()
-    assert dec.gate.proj.in_features == DEC
-    assert dec.gate(torch.randn(1, 4, DEC)).shape == (1, 4)
+    gate = dec.gate
+    assert gate is not None
+    assert gate.proj.in_features == DEC
+    assert gate(torch.randn(1, 4, DEC)).shape == (1, 4)
 
 
 # 3. the global-KV projection is the cross-attention downsample ----------------

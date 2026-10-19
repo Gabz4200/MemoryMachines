@@ -225,8 +225,8 @@ def test_masked_iterations_change_output():
     blk3.load_state_dict(blk1.state_dict())
     x = torch.randn(1, 6, 32)
     mask = torch.tensor([[True, False, True, False, False, True]])
-    out1 = blk1(x, query_mask=mask)
-    out3 = blk3(x, query_mask=mask)
+    blk1(x, query_mask=mask)
+    blk3(x, query_mask=mask)
     # With the registered refinement MLP, same weights yield deterministic
     # output; divergence from iteration count is bounded. The passthrough
     # checks below confirm unmasked tokens stay unchanged.

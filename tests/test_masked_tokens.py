@@ -8,8 +8,9 @@ Requirements (from user spec):
 5. Masked tokens attend to each other causally; get full-context info via encoder global KV.
 6. Preserve existing behavior when masked-token generation is disabled.
 """
-import torch
+
 import pytest
+import torch
 
 from memory_machines.models.backbone import CheapLLM
 from memory_machines.models.io import ModelInput
@@ -35,8 +36,7 @@ def _cfg(**kw):
 
 def test_config_validation_masked_token_count():
     with pytest.raises(ValueError, match="ced_masked_token_count"):
-        MemoryMachineConfig(hidden_size=8, vocab_size=8, num_attention_heads=4,
-                            num_key_value_heads=2, ced_masked_token_count=0, csa_num_output_groups=4)
+        MemoryMachineConfig(hidden_size=8, vocab_size=8, num_attention_heads=4, num_key_value_heads=2, ced_masked_token_count=0, csa_num_output_groups=4)
 
 
 def test_masked_token_embedding_exists():
@@ -45,8 +45,7 @@ def test_masked_token_embedding_exists():
     # This test FAILS (RED) — it asserts the feature does not yet exist,
     # confirming we must implement.
     model = CheapLLM(cfg)
-    assert hasattr(model, "masked_token_embed"), "missing masked_token_embed" \
-        "missing masked_token_embed"
+    assert hasattr(model, "masked_token_embed"), "missing masked_token_embedmissing masked_token_embed"
 
 
 def test_masked_generation_shape():

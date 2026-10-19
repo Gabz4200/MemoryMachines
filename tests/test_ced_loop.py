@@ -195,7 +195,9 @@ def test_looped_decoder_output_changes_with_loop_depth():
 def test_looped_decoder_stops_after_one_loop_when_the_gate_is_confident():
     dec = CausalDecoder(_loop_cfg()).eval()
     with torch.no_grad():
-        torch.nn.init.constant_(dec.gate.proj.bias, 20.0)  # lambda -> 1
+        gate = dec.gate
+        assert gate is not None
+        torch.nn.init.constant_(gate.proj.bias, 20.0)  # lambda -> 1
     with _record_loop_modes(dec) as modes:
         out = dec.decode_full_context(torch.randn(1, 5, H), torch.randn(1, 6, H))
     assert modes == ["full"]
@@ -213,7 +215,9 @@ def test_looped_decoder_honours_the_configured_exit_threshold():
 def test_looped_decoder_runs_every_step_when_the_gate_never_exits():
     dec = CausalDecoder(_loop_cfg(ced_decoder_loop_steps=3, ced_decoder_loop_exit_threshold=1.0)).eval()
     with torch.no_grad():
-        torch.nn.init.constant_(dec.gate.proj.bias, -20.0)  # lambda -> 0
+        gate = dec.gate
+        assert gate is not None
+        torch.nn.init.constant_(gate.proj.bias, -20.0)  # lambda -> 0
     with _record_loop_modes(dec) as modes:
         dec.decode_full_context(torch.randn(1, 5, H), torch.randn(1, 6, H))
     assert modes == ["full", "reindex", "reuse"]
