@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import torch
 
+from memory_machines.ops import attention as _attention  # noqa: F401
+
 # Import the op modules so they self-register with the op registry when this
 # package is imported. They are not referenced by name here beyond that.
 from memory_machines.ops import causal_conv1d as _causal_conv1d  # noqa: F401
-from memory_machines.ops import attention as _attention  # noqa: F401
-
 from memory_machines.ops.registry import dispatch_op
 
 

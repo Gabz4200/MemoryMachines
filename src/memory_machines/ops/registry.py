@@ -37,7 +37,20 @@ reference, so callers always get a working result.
 from __future__ import annotations
 
 import warnings
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
+
+
+def cpu_loader(op_name: str):
+    from memory_machines.kernels.cpu_loader import get_cpu_kernel
+
+    return lambda: get_cpu_kernel(op_name)
+
+
+def taichi_loader(op_name: str):
+    from memory_machines.kernels.taichi import get_taichi_kernel
+
+    return lambda: get_taichi_kernel(op_name)
 
 
 class OpSpec:
@@ -48,9 +61,9 @@ class OpSpec:
         *,
         name: str,
         naive: Callable[..., Any],
-        torch_op: Optional[Callable[..., Any]] = None,
-        compiled_cpu: Optional[Callable[[], Optional[Callable]]] = None,
-        compiled_taichi: Optional[Callable[[], Optional[Callable]]] = None,
+        torch_op: Callable[..., Any] | None = None,
+        compiled_cpu: Callable[[], Callable | None] | None = None,
+        compiled_taichi: Callable[[], Callable | None] | None = None,
         description: str = "",
     ):
         if not name:
@@ -85,20 +98,20 @@ def _emit_downgrade(op: str, reason: str) -> None:
     )
 
 
-def _try_load_and_call(loader: Optional[Callable[[], Optional[Callable]]], *args: Any, **kwargs: Any) -> tuple[Optional[Any], Optional[BaseException]]:
+def _try_load_and_call(loader: Callable[[], Callable | None] | None, *args: Any, **kwargs: Any) -> tuple[Any | None, BaseException | None]:
     """Resolve ``loader`` to a kernel callable and call it.
 
     Returns ``(result, None)`` on success, ``(None, exc)`` if the loader is
     missing or raises (kernel not implemented / not installed / load failure).
     """
     if loader is None:
-        return None, NotImplementedError(f"no compiled kernel registered")
+        return None, NotImplementedError("no compiled kernel registered")
     try:
         kernel = loader()
         if kernel is None:
             return None, NotImplementedError("loader returned None")
         return kernel(*args, **kwargs), None
-    except Exception as exc:  # kernel not implemented / not installed
+    except Exception as exc:  # noqa: BLE001 kernel not implemented / not installed
         return None, exc
 
 
@@ -195,10 +208,10 @@ def dispatch_op(name: str, backend: str = "auto", *args: Any, **kwargs: Any) -> 
 
 
 __all__ = [
-    "OpSpec",
     "OpRegistry",
-    "register_op",
+    "OpSpec",
+    "dispatch_op",
     "get_op",
     "list_ops",
-    "dispatch_op",
+    "register_op",
 ]

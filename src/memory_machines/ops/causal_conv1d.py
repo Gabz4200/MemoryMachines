@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import torch
 
-from memory_machines.kernels.cpu_loader import get_cpu_kernel
-from memory_machines.kernels.taichi import get_taichi_kernel
-from memory_machines.ops.registry import OpSpec, register_op
 from memory_machines.ops.references.causal_conv1d_reference import (
     reference_causal_conv1d_fwd,
     reference_causal_conv1d_update,
     reference_causal_conv1d_update_states,
 )
+from memory_machines.ops.registry import OpSpec, cpu_loader, register_op, taichi_loader
 
 
 @torch.library.custom_op("memory_machines::causal_conv1d", mutates_args=())
@@ -88,21 +86,13 @@ def causal_conv1d_naive(
     return y, final_state
 
 
-def _cpu_loader(op_name: str):
-    return lambda: get_cpu_kernel(op_name)
-
-
-def _taichi_loader(op_name: str):
-    return lambda: get_taichi_kernel(op_name)
-
-
 register_op(
     OpSpec(
         name="causal_conv1d",
         naive=causal_conv1d_naive,
         torch_op=causal_conv1d_op,
-        compiled_cpu=_cpu_loader("causal_conv1d"),
-        compiled_taichi=_taichi_loader("causal_conv1d"),
+        compiled_cpu=cpu_loader("causal_conv1d"),
+        compiled_taichi=taichi_loader("causal_conv1d"),
         description="Depthwise causal Conv1d forward pass.",
     )
 )
@@ -111,8 +101,8 @@ register_op(
     OpSpec(
         name="causal_conv1d_update",
         naive=reference_causal_conv1d_update,
-        compiled_cpu=_cpu_loader("causal_conv1d_update"),
-        compiled_taichi=_taichi_loader("causal_conv1d_update"),
+        compiled_cpu=cpu_loader("causal_conv1d_update"),
+        compiled_taichi=taichi_loader("causal_conv1d_update"),
         description="Depthwise causal Conv1d single-token decode step.",
     )
 )

@@ -78,7 +78,9 @@ def reference_frvm_gated_reduction(attn_weight, value, phi_vq=None, phi_vk=None,
         return attn_weight @ value
     if chunk_size <= 0:
         raise ValueError(f"frvm chunk_size ({chunk_size}) must be positive")
-    if (spatial_grid is None) != (ov_spatial_weight is None):
+    if spatial_grid is None and ov_spatial_weight is not None:
+        raise ValueError("spatial_grid and ov_spatial_weight must be given together (or both None)")
+    if spatial_grid is not None and ov_spatial_weight is None:
         raise ValueError("spatial_grid and ov_spatial_weight must be given together (or both None)")
     L = attn_weight.size(-2)
     outs = []
@@ -91,7 +93,7 @@ def reference_frvm_gated_reduction(attn_weight, value, phi_vq=None, phi_vk=None,
         delta = pvq_chunk - pvk_exp
         if spatial_grid is not None:
             grid_chunk = spatial_grid[..., start:end, :, :]
-            f_spatial = F.linear(grid_chunk, ov_spatial_weight.to(dtype=grid_chunk.dtype))
+            f_spatial = F.linear(grid_chunk, ov_spatial_weight.to(dtype=grid_chunk.dtype))  # pyrefly: ignore
             # grid has no head dim (B,...,C,S,Ev); delta does (B,...,H,C,S,Ev).
             while f_spatial.dim() < delta.dim():
                 f_spatial = f_spatial.unsqueeze(-4)

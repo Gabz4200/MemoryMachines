@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import torch
 
-from memory_machines.kernels.cpu_loader import get_cpu_kernel
-from memory_machines.kernels.taichi import get_taichi_kernel
-from memory_machines.ops.registry import OpSpec, register_op
 from memory_machines.ops.references.attention_reference import (
     universal_pe_scaled_dot_product_attention,
 )
+from memory_machines.ops.registry import OpSpec, cpu_loader, register_op, taichi_loader
 
 
 @torch.library.custom_op("memory_machines::universal_pe_attention", mutates_args=())
@@ -99,26 +97,18 @@ def universal_pe_attention_naive(
     )
 
 
-def _cpu_loader(op_name: str):
-    return lambda: get_cpu_kernel(op_name)
-
-
-def _taichi_loader(op_name: str):
-    return lambda: get_taichi_kernel(op_name)
-
-
 register_op(
     OpSpec(
         name="universal_pe_attention",
         naive=universal_pe_attention_naive,
         torch_op=universal_pe_attention_op,
-        compiled_cpu=_cpu_loader("universal_pe_attention"),
-        compiled_taichi=_taichi_loader("universal_pe_attention"),
+        compiled_cpu=cpu_loader("universal_pe_attention"),
+        compiled_taichi=taichi_loader("universal_pe_attention"),
         description="Universal positional-encoding scaled dot-product attention (CVPE QK + F-RVM OV).",
     )
 )
 
 __all__ = [
-    "universal_pe_attention_op",
     "universal_pe_attention_naive",
+    "universal_pe_attention_op",
 ]
