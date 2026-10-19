@@ -1102,9 +1102,8 @@ class CausalDecoder(nn.Module):
             N = encoder_final.shape[1]
             L = num_masked_tokens
             # If the decoder input is just the masked slice, adjust start_pos.
-            if hidden_states.shape[1] == L:
-                if start_pos == N:
-                    start_pos = max(0, N - L)
+            if hidden_states.shape[1] == L and start_pos == N:
+                start_pos = max(0, N - L)
         if self.config.ced_decoder_looping:
             return self._decode_looped(
                 hidden_states,
@@ -1284,6 +1283,7 @@ class CausalDecoder(nn.Module):
                 # latent — it feeds back only inside this layer's loop).
                 y_state = layer_in
                 z_state = self.z_proj(layer_in)
+                assert self.gate is not None  # ced_decoder_looping is True here
                 lam = self.gate(y_state)
                 out_trm, done_trm, survival_trm, cdf_trm = self._exit_loop(
                     y_state,
@@ -1328,7 +1328,8 @@ class CausalDecoder(nn.Module):
             # make the looped decoder's FFN skip iterations, breaking the
             # parameter-sharing invariant.
             x = self.ffns[0](x, step=0)
-            lam = self.gate(x)
+            gate = cast("AdaptiveExitGate", self.gate)
+            lam = gate(x)
             out, done, survival, cdf = self._exit_loop(
                 x,
                 out,
@@ -1413,10 +1414,8 @@ class CausalDecoder(nn.Module):
         # ([enc_len - replay_len, enc_len)) regardless of the decoder prompt
         # length: the global store is projected from the encoder-final states
         # (Eq. 1), so its total_len is the encoder length, not the decoder
-        # length. The branch used to be ``seq_len - replay_len`` when the
-        # prompt length differed, which could go negative and mis-anchor the
-        # store; the seq_len != enc_len case now requires explicit
-        # position_ids (see the guard above), and start_pos is pinned to the
+        # length. When the prompt length differs, explicit position_ids are
+        # required (see the guard above) and start_pos is pinned to the
         # encoder-anchored value so the store and the tail always agree.
         start_pos = enc_len - replay_len
         if position_ids is None:
