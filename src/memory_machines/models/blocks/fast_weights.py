@@ -82,6 +82,36 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x / torch.sqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
+def _validate_hidden_size_heads_memory_depth(
+    hidden_size: int,
+    num_heads: int,
+    memory_depth: int,
+) -> None:
+    """Shared shape validation for fast-weight blocks (hidden/heads divisibility, memory depth)."""
+    if hidden_size <= 0 or num_heads <= 0:
+        raise ValueError("hidden_size/num_heads must be positive")
+    if hidden_size % num_heads != 0:
+        raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
+    if memory_depth < 1:
+        raise ValueError(f"memory_depth must be >= 1, got {memory_depth}")
+
+
+def _validate_fast_weights_backend(backend: str) -> None:
+    """Shared backend-name validation for fast-weight blocks."""
+    if backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
+        raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
+
+
+def _fast_shapes(head_dim: int, fast_dim: int, memory_depth: int) -> list[tuple[int, int]]:
+    kd, fd, vd, depth = head_dim, fast_dim, head_dim, memory_depth
+    if depth == 1:
+        return [(kd, vd)]
+    shapes = [(kd, fd)]
+    shapes += [(fd, fd)] * (depth - 2)
+    shapes.append((fd, vd))
+    return shapes
+
+
 class TitansFastWeightsMemory(nn.Module):
     r"""TitansFastWeightsMemory(hidden_size, ...) — neural long-term memory.
 
@@ -128,16 +158,10 @@ class TitansFastWeightsMemory(nn.Module):
         chunk_size: int = 64,
     ) -> None:
         super().__init__()
-        if backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
-            raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
+        _validate_fast_weights_backend(backend)
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-        if hidden_size <= 0 or num_heads <= 0:
-            raise ValueError("hidden_size/num_heads must be positive")
-        if hidden_size % num_heads != 0:
-            raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
-        if memory_depth < 1:
-            raise ValueError(f"memory_depth must be >= 1, got {memory_depth}")
+        _validate_hidden_size_heads_memory_depth(hidden_size, num_heads, memory_depth)
         if num_persistent_tokens < 0:
             raise ValueError("num_persistent_tokens must be non-negative")
         self.hidden_size = hidden_size
@@ -181,13 +205,7 @@ class TitansFastWeightsMemory(nn.Module):
         self.reset_parameters()
 
     def _fast_shapes(self) -> list[tuple[int, int]]:
-        kd, fd, vd, depth = self.head_dim, self.fast_dim, self.head_dim, self.memory_depth
-        if depth == 1:
-            return [(kd, vd)]
-        shapes = [(kd, fd)]
-        shapes += [(fd, fd)] * (depth - 2)
-        shapes.append((fd, vd))
-        return shapes
+        return _fast_shapes(self.head_dim, self.fast_dim, self.memory_depth)
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None — init priors, gates, and projections."""
@@ -873,16 +891,10 @@ class SelfReferentialTitanMemory(nn.Module):
         use_qk_projection: bool = False,
     ) -> None:
         super().__init__()
-        if backend not in ("naive", "recurrent", "chunk", "tnt", "wy_fast"):
-            raise ValueError(f"Unknown backend: {backend!r}. Valid backends: ['naive', 'recurrent', 'chunk', 'tnt', 'wy_fast']")
+        _validate_fast_weights_backend(backend)
         if chunk_size is not None and chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-        if hidden_size <= 0 or num_heads <= 0:
-            raise ValueError("hidden_size/num_heads must be positive")
-        if hidden_size % num_heads != 0:
-            raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
-        if memory_depth < 1:
-            raise ValueError(f"memory_depth must be >= 1, got {memory_depth}")
+        _validate_hidden_size_heads_memory_depth(hidden_size, num_heads, memory_depth)
         if objective not in ("l2", "dot"):
             raise ValueError(f"objective must be 'l2' or 'dot', got {objective!r}")
         self.hidden_size = hidden_size
@@ -912,13 +924,7 @@ class SelfReferentialTitanMemory(nn.Module):
         self.reset_parameters()
 
     def _fast_shapes(self) -> list[tuple[int, int]]:
-        kd, fd, vd, depth = self.head_dim, self.fast_dim, self.head_dim, self.memory_depth
-        if depth == 1:
-            return [(kd, vd)]
-        shapes = [(kd, fd)]
-        shapes += [(fd, fd)] * (depth - 2)
-        shapes.append((fd, vd))
-        return shapes
+        return _fast_shapes(self.head_dim, self.fast_dim, self.memory_depth)
 
     def _box_weights(self, box: str) -> nn.ParameterList:
         """Per-box fast-weight parameters (typed view of ``fast_init``)."""
@@ -1018,7 +1024,7 @@ class SelfReferentialTitanMemory(nn.Module):
             fast = {box: [w.to(device=x.device, dtype=q_all.dtype) for w in state["fast_weights"][box]] for box in HOPE_BOXES}
         total = q_all.shape[1]
         width = self.chunk_size if chunk_size is None else chunk_size
-        if width is not None and width < 0:
+        if width is None or width <= 0:
             width = total
         mem_out, fast = self_referential_titan(
             heads,
