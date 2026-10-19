@@ -202,9 +202,8 @@ def _recurrent_single(
     e = b * k  # [T, K]
     z = w * v  # [T, V]
     # Centered wrapper: canonical scan on (z_tilde, s0 - S0), then shift back.
-    if resting is not None:
-        z = resting_corrected_write(z, e, resting)
-    s = s0 - resting if resting is not None else s0
+    z = _resting_write(z, e, resting)
+    s = _centered_state(s0, resting)
     outs = []
     for i in range(t):
         s_bar = alpha[i].unsqueeze(-1) * s
@@ -212,9 +211,7 @@ def _recurrent_single(
         s = s_bar + torch.outer(k[i], z[i] - r)
         outs.append(torch.matmul(s.transpose(0, 1), q[i]))
     o = torch.stack(outs, dim=0) if t else q.new_zeros(0, v.shape[-1])
-    if resting is not None:
-        return add_resting_projection(o, q, resting), s + resting
-    return o, s
+    return _resting_finalize(o, q, resting, s)
 
 
 def _chunk_single(
@@ -234,7 +231,7 @@ def _chunk_single(
     """Chunkwise WY forward for one head-group row (paper Appendix A)."""
     t = q.shape[0]
     q, k, b = _prepare_qkb(q, k, g, b, scale, use_qk_l2norm, beta_guard)
-    s = s0 - resting if resting is not None else s0
+    s = _centered_state(s0, resting)
     eye_full = torch.eye(chunk_size, dtype=q.dtype, device=q.device)
     outs = []
     for start in range(0, t, chunk_size):
@@ -248,9 +245,7 @@ def _chunk_single(
         gamma = torch.exp(torch.cumsum(gc, dim=0))  # [C, K]
         k_bar = kc / gamma
         e_bar = gamma * (bc * kc)
-        z = wc * vc
-        if resting is not None:
-            z = resting_corrected_write(z, bc * kc, resting)
+        z = _resting_write(wc * vc, bc * kc, resting)
         eye_c = eye_full[:c, :c]
         tmat = torch.tril(e_bar @ k_bar.transpose(0, 1), diagonal=-1)  # [C, C]
         a_mat = torch.linalg.solve_triangular(eye_c + tmat, eye_c, upper=False)  # A = (I + T)^{-1}
@@ -264,9 +259,49 @@ def _chunk_single(
         outs.append(q_gamma @ s + aqk @ r)
         s = gamma_c.unsqueeze(-1) * s + k_tail.transpose(0, 1) @ r
     o_tilde = torch.cat(outs, dim=0) if outs else q.new_zeros(0, v.shape[-1])
+    return _resting_finalize(o_tilde, q, resting, s)
+
+
+def _centered_state(s0: torch.Tensor, resting: torch.Tensor | None) -> torch.Tensor:
+    """Canonical scan state: ``s0 - S0`` when a resting prior is set, else ``s0``."""
+    return s0 - resting if resting is not None else s0
+
+
+def _resting_write(z: torch.Tensor, e: torch.Tensor, resting: torch.Tensor | None) -> torch.Tensor:
+    """Resting-corrected write gate ``z``; no-op when no prior is set."""
+    return resting_corrected_write(z, e, resting) if resting is not None else z
+
+
+def _resting_finalize(
+    o: torch.Tensor,
+    q: torch.Tensor,
+    resting: torch.Tensor | None,
+    s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shift the canonical scan output/state back by the resting prior."""
     if resting is not None:
-        return add_resting_projection(o_tilde, q, resting), s + resting
-    return o_tilde, s
+        return add_resting_projection(o, q, resting), s + resting
+    return o, s
+
+
+def _head_row_args(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    w: torch.Tensor,
+    s0: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+    beta_guard: bool,
+) -> tuple:
+    """Bundle the ten shared head-row arguments for the chunk/recurrent kernels.
+
+    ``_chunk_single`` and ``_recurrent_single`` differ only in their trailing
+    ``chunk_size``/``resting``; this helper keeps the two call sites in sync.
+    """
+    return q, k, v, g, b, w, s0, scale, use_qk_l2norm, beta_guard
 
 
 def _check_shapes(
@@ -379,6 +414,18 @@ def _run_path(
         cur = torch.empty_like(s0)
         for hv in range(HV):
             rest_hv = rest[hv] if rest is not None else None
+            _head_row_args(
+                qr[bn, s:e, hv],
+                kr[bn, s:e, hv],
+                vr[bn, s:e, hv],
+                gr[bn, s:e, hv],
+                br[bn, s:e, hv],
+                wr[bn, s:e, hv],
+                s0[hv],
+                scale,
+                use_qk_l2norm,
+                beta_guard,
+            )
             if chunk_size is not None:
                 o_hv, cur_hv = _chunk_single(
                     qr[bn, s:e, hv],
