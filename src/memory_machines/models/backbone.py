@@ -29,7 +29,6 @@ from memory_machines.models.blocks.ced import (
 )
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
-from memory_machines.models.protocols import Backbone, Decoder, FeedForward, GlobalKVProjection, TokenMixer, UpProjection
 from memory_machines.models.registry import register_model
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
@@ -183,10 +182,10 @@ class CheapLLM(nn.Module):
     def __init__(
         self,
         config: MemoryMachineConfig,
-        encoder_layers: list[TokenMixer] | None = None,
-        decoder_layers: list[TokenMixer] | None = None,
-        global_projs: list[GlobalKVProjection] | None = None,
-        decoder_ffns: list[FeedForward] | None = None,
+        encoder_layers: list[nn.Module] | None = None,
+        decoder_layers: list[nn.Module] | None = None,
+        global_projs: list[nn.Module] | None = None,
+        decoder_ffns: list[nn.Module] | None = None,
         vocab_size: int | None = None,
     ):
         super().__init__()

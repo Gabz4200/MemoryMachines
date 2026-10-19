@@ -11,7 +11,6 @@ from typing import Any
 import pytorch_lightning as pl
 
 from memory_machines.callbacks.logging import MetricLoggerCallback
-from memory_machines.models.protocols import LightningSystem, Trainer
 
 
 def _get(cfg, key: str, default: Any = None) -> Any:
@@ -27,7 +26,7 @@ def _get(cfg, key: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
-def create_trainer(cfg) -> Trainer:
+def create_trainer(cfg) -> pl.Trainer:
     # pl.Callback is the supertype of every callback; MetricLoggerCallback and
     # anything instantiate() returns must fit it, so annotate at the boundary.
     callbacks: list[pl.Callback] = [MetricLoggerCallback()]
