@@ -822,7 +822,6 @@ class GroupedQueryAttention(nn.Module):
         controlling the SWA bound (cross-attention passes ``False``).
         """
         from memory_machines.ops.references.attention_reference import (
-            reference_frvm_gated_reduction,
             reference_qk_circuit,
         )
 
@@ -834,10 +833,58 @@ class GroupedQueryAttention(nn.Module):
             torch.zeros(query_states.shape[-2], key_exp.shape[-2], dtype=query_states.dtype, device=query_states.device),
             None,
         )
-        q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
-        k1 = k_pos[..., 0] if k_pos.dim() == 3 else k_pos
+        heads, attn = self._mask_softmax_reduce(
+            attn,
+            attention_mask,
+            q_pos,
+            k_pos,
+            is_causal,
+            bidirectional,
+            windowed,
+            value_full_exp,
+            phi_vq,
+            phi_vk,
+            spatial_grid,
+            ov_spatial_weight,
+            bsz,
+            q_len,
+            key_exp.shape[2],
+        )
+        out = self._project_heads(heads, bsz, q_len)
+        return out, (attn if output_attentions else None), None
+
+    def _mask_softmax_reduce(
+        self,
+        attn: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        q_pos: torch.Tensor,
+        k_pos: torch.Tensor,
+        is_causal: bool,
+        bidirectional: bool,
+        windowed: bool,
+        value_exp: torch.Tensor,
+        phi_vq: torch.Tensor | None,
+        phi_vk: torch.Tensor | None,
+        spatial_grid: torch.Tensor | None,
+        ov_spatial_weight: torch.Tensor | None,
+        bsz: int,
+        q_len: int,
+        kv_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply window/causal/user-mask, softmax, sanitize, dropout, and FRVM/OV reduction.
+
+        Shared tail of :meth:`_reduce_with_pe` and :meth:`attend`: the masking
+        and reduction pipeline is identical apart from the value tensor and
+        whether the output heads are projected.
+        """
+        from memory_machines.ops.references.attention_reference import (
+            reference_frvm_gated_reduction,
+        )
+
         if bidirectional and is_causal:
             raise ValueError("bidirectional=True is incompatible with is_causal=True (pass one or neither)")
+        q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
+        k1 = k_pos[..., 0] if k_pos.dim() == 3 else k_pos
         if windowed and self.window_size > 0 and is_causal:
             win = _window_mask(q1, k1, self.window_size).unsqueeze(1)
             attn = attn.masked_fill(~win, float("-inf"))
@@ -848,18 +895,18 @@ class GroupedQueryAttention(nn.Module):
             if attention_mask is not None:
                 raise ValueError("is_causal=True requires attn_mask=None (pass one or the other)")
             attn = attn.masked_fill(~_causal_key_mask(q1, k1), float("-inf"))
-        additive_mask = _prepare_attention_mask(attention_mask, bsz, q_len, key_exp.shape[2], self.num_heads, attn)
+        additive_mask = _prepare_attention_mask(attention_mask, bsz, q_len, kv_len, self.num_heads, attn)
         if additive_mask is not None:
             attn = attn + additive_mask
-        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(attn.dtype)
         attn = _sanitize_attention_weights(attn)
         attn_dropped = self.attention_dropout(attn)
         if self.frvm_gate is not None:
-            per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * value_full_exp.shape[-1]
+            per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * value_exp.shape[-1]
             eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
             heads = reference_frvm_gated_reduction(
                 attn_dropped,
-                value_full_exp,
+                value_exp,
                 phi_vq,
                 phi_vk,
                 spatial_grid=spatial_grid,
@@ -867,9 +914,8 @@ class GroupedQueryAttention(nn.Module):
                 chunk_size=eff,
             )
         else:
-            heads = attn_dropped @ value_full_exp
-        out = self._project_heads(heads, bsz, q_len)
-        return out, (attn if output_attentions else None), None
+            heads = attn_dropped @ value_exp
+        return heads, attn
 
     def attend(
         self,
@@ -929,7 +975,6 @@ class GroupedQueryAttention(nn.Module):
         """
         key_exp, val_exp, vq_exp = self._expand_kv(key_states, value_full, value_query)
         from memory_machines.ops.references.attention_reference import (
-            reference_frvm_gated_reduction,
             reference_qk_circuit,
         )
 
@@ -946,38 +991,23 @@ class GroupedQueryAttention(nn.Module):
         # window: |q - k| < window_size in BOTH directions (the
         # caller explicitly asked for non-causal attention, so the
         # bound is symmetric). All other cells are causal-bounded.
-        if bidirectional and is_causal:
-            raise ValueError("bidirectional=True is incompatible with is_causal=True (pass one or neither)")
-        q1 = q_pos[..., 0] if q_pos.dim() == 3 else q_pos
-        k1 = k_pos_full[..., 0] if k_pos_full.dim() == 3 else k_pos_full
-        if windowed and self.window_size > 0 and is_causal:
-            win = _window_mask(q1, k1, self.window_size).unsqueeze(1)
-            attn = attn.masked_fill(~win, float("-inf"))
-        elif windowed and self.window_size > 0:
-            rel = q1.unsqueeze(-1) - k1.unsqueeze(1)
-            attn = attn.masked_fill((rel.abs() >= self.window_size).unsqueeze(1), float("-inf"))
-        elif is_causal:
-            attn = attn.masked_fill(~_causal_key_mask(q1, k1), float("-inf"))
-        additive_mask = _prepare_attention_mask(attention_mask, query_states.shape[0], query_states.shape[2], key_exp.shape[2], self.num_heads, attn)
-        if additive_mask is not None:
-            attn = attn + additive_mask
-        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn = _sanitize_attention_weights(attn)
-        attn_dropped = self.attention_dropout(attn)
-        if self.frvm_gate is not None:
-            per_q = attn.shape[0] * attn.shape[1] * attn.shape[3] * val_exp.shape[-1]
-            eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
-            heads = reference_frvm_gated_reduction(
-                attn_dropped,
-                val_exp,
-                phi_vq,
-                phi_vk,
-                spatial_grid=spatial_grid,
-                ov_spatial_weight=ov_spatial_weight,
-                chunk_size=eff,
-            )
-        else:
-            heads = attn_dropped @ val_exp
+        heads, attn = self._mask_softmax_reduce(
+            attn,
+            attention_mask,
+            q_pos,
+            k_pos_full,
+            is_causal,
+            bidirectional,
+            windowed,
+            val_exp,
+            phi_vq,
+            phi_vk,
+            spatial_grid,
+            ov_spatial_weight,
+            query_states.shape[0],
+            query_states.shape[2],
+            key_exp.shape[2],
+        )
         return heads, attn
 
     def truncate_for_replay(
