@@ -61,6 +61,7 @@ consumer's own package manager resolves the right wheel for their hardware.
 
 ```python
 import torch
+
 print(torch.__version__)
 print(f"CUDA available: {torch.cuda.is_available()}")
 ```

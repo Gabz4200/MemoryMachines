@@ -13,7 +13,7 @@ CPU kernel therefore only requires dropping a ``<op>.cpp`` file into
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from torch.utils.cpp_extension import load
 
@@ -22,7 +22,7 @@ from torch.utils.cpp_extension import load
 # was not run from the repository root).
 _NATIVE_DIR = Path(__file__).resolve().parent / "native" / "cpu"
 
-_ext: Optional[Any] = None
+_ext: Any | None = None
 
 
 def _discover_sources() -> list[str]:
