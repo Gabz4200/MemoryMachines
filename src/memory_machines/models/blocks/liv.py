@@ -13,7 +13,7 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .attention import GroupedQueryAttention
 from .causal_conv1d import ShortConvolution
-from .shared import CSA2SharedState, residual_init_scale
+from .shared import CSA2SharedState, init_residual_linears
 from .sparse import CompressedSparseAttention2
 
 
@@ -81,8 +81,7 @@ class LivDoubleGatedBase(nn.Module):
         perceiver).
         """
         std = self.initializer_range
-        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
-        nn.init.trunc_normal_(self.input_projection.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        scale = init_residual_linears(std, self.num_layers, self.residual_init_scale, self.input_projection)
         if scale is None:
             nn.init.zeros_(self.output_projection.weight)
         else:
@@ -534,10 +533,14 @@ class LivPerceiver(LivDoubleGatedBase):
             nn.init.normal_(self.latent_queries, std=self.latent_std)
             nn.init.normal_(self.latent_values, std=self.latent_std)
         if self.refine is not None:
-            nn.init.trunc_normal_(self.refine[0].weight, mean=0.0, std=self.latent_std, a=-2 * self.latent_std, b=2 * self.latent_std)
-            nn.init.zeros_(self.refine[0].bias)
-            nn.init.trunc_normal_(self.refine[2].weight, mean=0.0, std=self.latent_std, a=-2 * self.latent_std, b=2 * self.latent_std)
-            nn.init.zeros_(self.refine[2].bias)
+            w0 = typing.cast(torch.Tensor, self.refine[0].weight)
+            b0 = typing.cast(torch.Tensor, self.refine[0].bias)
+            nn.init.trunc_normal_(w0, mean=0.0, std=self.latent_std, a=-2 * self.latent_std, b=2 * self.latent_std)
+            nn.init.zeros_(b0)
+            w2 = typing.cast(torch.Tensor, self.refine[2].weight)
+            b2 = typing.cast(torch.Tensor, self.refine[2].bias)
+            nn.init.trunc_normal_(w2, mean=0.0, std=self.latent_std, a=-2 * self.latent_std, b=2 * self.latent_std)
+            nn.init.zeros_(b2)
 
     def _latent_anchors(self, seqlen: int, device: torch.device) -> torch.Tensor:
         r"""_latent_anchors(seqlen, device) -> Tensor

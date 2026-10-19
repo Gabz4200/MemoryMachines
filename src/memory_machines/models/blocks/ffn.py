@@ -18,7 +18,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .dyt import DyT
-from .shared import residual_init_scale
+from .shared import init_residual_linears
 
 
 class SwiGLU(nn.Module):
@@ -78,9 +78,7 @@ class SwiGLU(nn.Module):
         activations bounded.
         """
         std = self.initializer_range
-        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
-        nn.init.trunc_normal_(self.gate_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.up_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        scale = init_residual_linears(std, self.num_layers, self.residual_init_scale, self.gate_proj, self.up_proj)
         if scale is None:
             nn.init.zeros_(self.down_proj.weight)
         else:
@@ -154,8 +152,7 @@ class ClassicMLP(nn.Module):
         ``config.residual_init_scale`` (see :meth:`SwiGLU.reset_parameters`).
         """
         std = self.initializer_range
-        scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
-        nn.init.trunc_normal_(self.up_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        scale = init_residual_linears(std, self.num_layers, self.residual_init_scale, self.up_proj)
         if scale is None:
             nn.init.zeros_(self.down_proj.weight)
         else:
