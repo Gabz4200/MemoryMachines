@@ -22,9 +22,10 @@ from memory_machines.models.blocks import (
 )
 from memory_machines.models.blocks.ced import (
     CausalDecoder,
+    MaskedTokenEmbedding,
     VocabularyUpProjection,
     _build_encoder,
-    _run_stream_layers,
+    _run_encoder_layers,
 )
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
@@ -208,6 +209,12 @@ class CheapLLM(nn.Module):
             global_projs=global_projs,
             ffns=decoder_ffns,
         )
+        # Learnable masked-token embedding for Perceiver-AR generation
+        # (variable count of new tokens appended at the end of input).
+        self.masked_token_embed = MaskedTokenEmbedding(
+            config.ced_masked_token_count,
+            config.hidden_size,
+        )
         # Widen (possibly narrow) decoder states back to hidden_size for the head.
         self.up = VocabularyUpProjection(config)
         self.embed = nn.Embedding(self.vocab_size, config.hidden_size)
@@ -277,24 +284,9 @@ class CheapLLM(nn.Module):
             Tuple[Tensor, CSA2SharedState]: encoder-final states ``(B, Le, D)``
             and the populated :class:`~memory_machines.models.blocks.shared.CSA2SharedState`.
         """
-        shared: CSA2SharedState | None = None
-        x = hidden_states
         layers = list(self.encoder_layers)
         ffns = list(self.encoder_ffns)
-        for layer in layers:
-            if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
-                raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
-        if layers and any(isinstance(layer, MHCAttentionGDN2) for layer in layers):
-            x, shared = _run_stream_layers(cast("list[MHCAttentionGDN2]", layers), hidden_states, None, self.config.mhc_num_streams, position_ids, seeded_store=False, ffns=ffns)
-        else:
-            for i, layer in enumerate(cast("list[CompressedSparseAttention2]", layers)):
-                if shared is None:
-                    shared = CSA2SharedState(total_len=0)
-                x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
-                x = ffns[i](x, step=i)
-        if shared is None:
-            raise ValueError("encode produced no shared state (encoder_layers is empty)")
-        return x, shared
+        return _run_encoder_layers(layers, ffns, hidden_states, position_ids, self.config.mhc_num_streams)
 
     def decode_full_context(
         self,
@@ -335,8 +327,30 @@ class CheapLLM(nn.Module):
             if inputs.input_ids is None:
                 raise ValueError("CheapLLM requires input_ids or inputs_embeds")
             x = self.embed(inputs.input_ids)
+        # Perceiver-AR masked-token generation: append learnable masked embeddings.
+        L = inputs.num_masked_tokens
+        if L is not None and L > 0 and self.config.ced_masked_query:
+            # Append masked-token embeddings at the end.
+            mask_indices = torch.arange(L, device=x.device)
+            masked_embeds = self.masked_token_embed(mask_indices)  # (L, D)
+            masked_embeds = masked_embeds.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, L, D)
+            x = torch.cat([x, masked_embeds], dim=1)
         encoder_final, _ = self.encode(x)
-        dec_out = self.decoder.decode_full_context(x, encoder_final)
+        # Decode: only masked tokens produce queries; full context provides K/V.
+        if L is not None and L > 0 and self.config.ced_masked_query:
+            N = x.shape[1]
+            # Query stream = masked positions (last L); KV stream = full sequence.
+            # Set start_pos so masked queries get correct positions [N-L, N).
+            dec_out = self.decoder.decode_full_context(
+                x[:, N - L :, :],
+                encoder_final,
+                num_masked_tokens=L,
+                start_pos=N - L,
+            )
+            # Slice output to masked positions (L outputs per batch item).
+            dec_out = dec_out[:, -L:, :]
+        else:
+            dec_out = self.decoder.decode_full_context(x, encoder_final)
         out = self.up(dec_out)
         logits = self.head(out)
         return ModelOutput(logits=logits, new_state=None)

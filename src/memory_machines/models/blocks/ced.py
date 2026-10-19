@@ -198,12 +198,79 @@ def _run_stream_layers(
             shared,
             prev_a=prev_a,
             position_ids=position_ids,
-            use_cache=True,
             seeded_store=seeded_store,
         )
         if ffns is not None:
             streams = ffns[i](streams, step=i)
     return from_streams(streams), shared
+
+
+def _run_encoder_layers(
+    layers: list[nn.Module],
+    ffns: list[nn.Module],
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor | None,
+    mhc_num_streams: int,
+) -> tuple[torch.Tensor, CSA2SharedState]:
+    r"""_run_encoder_layers(layers, ffns, hidden_states, position_ids, mhc_num_streams) -> (Tensor, CSA2SharedState)
+
+    Run the CED encoder token mixers followed by their dense FFNs.
+
+    Shared by :meth:`CausalEncoderDecoderStack.encode` and
+    :meth:`~memory_machines.models.backbone.CheapLLM.encode` so the
+    encoder run logic lives in one place. The mHC path
+    (:func:`_run_stream_layers`) expands the inputs into ``mhc_num_streams``
+    persistent residual streams; the plain CSA2 path threads one shared
+    :class:`CSA2SharedState` across layers and applies each layer's FFN with
+    the layer index as the per-forward step counter (HOPE time-cycle).
+
+    Args:
+        layers (list of nn.Module): encoder token mixers (CSA2 or parallel
+            mHC blocks).
+        ffns (list of nn.Module): one :class:`DenseFFN` per layer.
+        hidden_states (Tensor): encoder inputs ``(B, Le, D)``.
+        position_ids (Tensor, optional): absolute positions.
+        mhc_num_streams (int): mHC stream count when the mHC path is used.
+
+    Returns:
+        Tensor: encoder-final states ``(B, Le, D)`` and the populated
+        :class:`~memory_machines.models.blocks.shared.CSA2SharedState`.
+
+    Raises:
+        TypeError: if any layer is not a CSA2 or parallel-mHC block.
+        ValueError: if the encoder produced no shared state (empty layers).
+    """
+    for layer in layers:
+        if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
+            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
+    if not layers:
+        raise ValueError("encode produced no shared state (encoder_layers is empty)")
+    if any(isinstance(layer, MHCAttentionGDN2) for layer in layers):
+        x, shared = _run_stream_layers(
+            cast("list[MHCAttentionGDN2]", layers),
+            hidden_states,
+            None,
+            mhc_num_streams,
+            position_ids,
+            seeded_store=False,
+            ffns=ffns,
+        )
+    else:
+        shared: CSA2SharedState | None = None
+        x = hidden_states
+        for i, layer in enumerate(cast("list[CompressedSparseAttention2]", layers)):
+            if shared is None:
+                shared = CSA2SharedState(total_len=0)
+            # SWA KV is layer-local and never persisted onto the cross-layer
+            # shared state, so ``use_cache`` is a no-op here (API parity only).
+            x, shared = layer.forward_shared(x, shared, position_ids=position_ids)
+            # The block index is the per-forward step counter shared by every
+            # encoder FFN; each block's own update_interval decides on which
+            # steps it actually applies its FFN (HOPE time-cycle).
+            x = ffns[i](x, step=i)
+    if shared is None:
+        raise ValueError("encode produced no shared state (encoder_layers is empty)")
+    return x, shared
 
 
 class CEDGlobalKVProjection(nn.Module):
@@ -447,22 +514,7 @@ class CausalEncoderDecoderStack(nn.Module):
         x = hidden_states
         layers = list(self.encoder_layers)
         ffns = list(self.encoder_ffns)
-        for layer in layers:
-            if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
-                raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
-        if layers and any(isinstance(layer, MHCAttentionGDN2) for layer in layers):
-            x, shared = _run_stream_layers(cast("list[MHCAttentionGDN2]", layers), hidden_states, None, self.config.mhc_num_streams, position_ids, seeded_store=False, ffns=ffns)
-        else:
-            for i, layer in enumerate(cast("list[CompressedSparseAttention2]", layers)):
-                if shared is None:
-                    shared = CSA2SharedState(total_len=0)
-                x, shared = layer.forward_shared(x, shared, position_ids=position_ids, use_cache=True)
-                # The block index is the per-forward step counter shared by
-                # every encoder FFN; each block's own update_interval decides
-                # on which steps it actually applies its FFN (HOPE time-cycle).
-                x = ffns[i](x, step=i)
-        if shared is None:
-            raise ValueError("encode produced no shared state (encoder_layers is empty)")
+        x, shared = _run_encoder_layers(layers, ffns, hidden_states, position_ids, self.config.mhc_num_streams)
         return x, shared
 
     def decode_full_context(
@@ -474,8 +526,9 @@ class CausalEncoderDecoderStack(nn.Module):
         start_pos: int | None = None,
         seeded_store: bool = True,
         exit_threshold: float | None = None,
+        num_masked_tokens: int | None = None,
     ) -> torch.Tensor:
-        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None) -> Tensor
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None, num_masked_tokens=None) -> Tensor
 
         Decode with every decoder layer seeded from the encoder-final states.
 
@@ -504,6 +557,14 @@ class CausalEncoderDecoderStack(nn.Module):
                 :meth:`prefill`'s bounded-replay path, which decodes
                 a tail whose own states must *not* enter the global
                 store. Default: ``True``.
+            exit_threshold (float, optional): Q-exit threshold ``q``
+                overriding ``config.ced_decoder_loop_exit_threshold`` for this
+                call (looped decoder only). ``1.0`` forces every loop step.
+                Default: ``None`` (use the config value).
+            num_masked_tokens (int, optional): Perceiver-AR masked-token
+                count; when set, the masked query slice is anchored at
+                positions ``[N-L, N)`` instead of ``[enc_len, enc_len+L)``.
+                Default: ``None`` (no masked-token mode).
 
         Returns:
             Tensor: decoder outputs of shape ``(B, Ld, D)``.
@@ -525,6 +586,7 @@ class CausalEncoderDecoderStack(nn.Module):
             start_pos=start_pos,
             seeded_store=seeded_store,
             exit_threshold=exit_threshold,
+            num_masked_tokens=num_masked_tokens,
         )
 
     def prefill(
@@ -630,6 +692,23 @@ class AdaptiveExitGate(nn.Module):
         return torch.sigmoid(self.proj(hidden_states)).squeeze(-1)
 
     @staticmethod
+    def _exit_survival(lambdas: torch.Tensor) -> torch.Tensor:
+        r"""_exit_survival(lambdas) -> Tensor
+
+        Shared survival product :math:`S_t = \prod_{j \le t} (1 - \lambda_j)`.
+
+        ``exit_distribution`` and ``cdf`` both need it; computing it once
+        avoids a redundant ``cumprod`` on the ``(B, T, L)`` tensor.
+
+        Args:
+            lambdas (Tensor): per-step exit probabilities ``(B, T, L)``.
+
+        Returns:
+            Tensor: survival product of shape ``(B, T, L)``.
+        """
+        return torch.cumprod(1.0 - lambdas, dim=1)
+
+    @staticmethod
     def exit_distribution(lambdas: torch.Tensor) -> torch.Tensor:
         r"""exit_distribution(lambdas) -> Tensor
 
@@ -644,7 +723,7 @@ class AdaptiveExitGate(nn.Module):
             step axis; the final step carries the survival mass
             :math:`S_{T-1}`.
         """
-        survival = torch.cumprod(1.0 - lambdas, dim=1)
+        survival = AdaptiveExitGate._exit_survival(lambdas)
         survival_prev = torch.cat([torch.ones_like(survival[:, :1]), survival[:, :-1]], dim=1)
         unnormalized = lambdas * survival_prev
         return torch.cat([unnormalized[:, :-1], survival_prev[:, -1:]], dim=1)
@@ -881,6 +960,19 @@ class CausalDecoder(nn.Module):
         self.exit_threshold = config.ced_decoder_loop_exit_threshold
         if config.ced_decoder_looping:
             self.gate = AdaptiveExitGate(dec_cfg)
+            # TRM mechanism (arXiv:2510.04871): the looped decoder takes
+            # [X, Y, Z] as input at each step — X is the fixed previous-layer
+            # output (decoder input / question), Y is the running answer
+            # (layer output), and Z is the loop-local latent that feeds back
+            # into the loop but never exits to the next layer. Only built when
+            # ced_decoder_trm is enabled; otherwise the plain LoopLM
+            # single-stream path runs.
+            if config.ced_decoder_trm:
+                hidden = self.decoder_hidden_size or dec_cfg.hidden_size
+                self.trm_mix = nn.Linear(hidden * 3, hidden)
+                self.z_proj = nn.Linear(hidden, hidden)
+        else:
+            self.gate = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -898,6 +990,18 @@ class CausalDecoder(nn.Module):
         gate = getattr(self, "gate", None)
         if gate is not None:
             gate.reset_parameters()
+        mix = getattr(self, "trm_mix", None)
+        if mix is not None:
+            std = self.config.initializer_range
+            nn.init.trunc_normal_(mix.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            if mix.bias is not None:
+                nn.init.zeros_(mix.bias)
+        z_proj = getattr(self, "z_proj", None)
+        if z_proj is not None:
+            std = self.config.initializer_range
+            nn.init.trunc_normal_(z_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            if z_proj.bias is not None:
+                nn.init.zeros_(z_proj.bias)
 
     def decode_full_context(
         self,
@@ -908,6 +1012,7 @@ class CausalDecoder(nn.Module):
         start_pos: int | None = None,
         seeded_store: bool = True,
         exit_threshold: float | None = None,
+        num_masked_tokens: int | None = None,
     ) -> torch.Tensor:
         r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None) -> Tensor
 
@@ -960,12 +1065,21 @@ class CausalDecoder(nn.Module):
             if encoder_final.dim() != 3:
                 raise ValueError(f"encoder_final must be 3D (B, L, D), got {encoder_final.dim()}D {tuple(encoder_final.shape)}")
             start_pos = encoder_final.shape[1]
+        # Perceiver-AR masked-token mode: masked positions at end get [N-L, N) positions.
+        if num_masked_tokens is not None and num_masked_tokens > 0:
+            N = encoder_final.shape[1]
+            L = num_masked_tokens
+            # If the decoder input is just the masked slice, adjust start_pos.
+            if hidden_states.shape[1] == L:
+                if start_pos == N:
+                    start_pos = max(0, N - L)
         if self.config.ced_decoder_looping:
             return self._decode_looped(
                 hidden_states,
                 encoder_final,
                 position_ids,
                 start_pos=start_pos,
+                num_masked_tokens=num_masked_tokens,
                 seeded_store=seeded_store,
                 exit_threshold=exit_threshold,
             )
@@ -988,11 +1102,12 @@ class CausalDecoder(nn.Module):
         )
         x = hidden_states
         for i, layer in enumerate(layers):
+            # SWA KV is layer-local and never persisted onto the cross-layer
+            # shared state, so ``use_cache`` is a no-op here (API parity only).
             x, shared = layer.forward_shared(
                 x,
                 shared,
                 position_ids=position_ids,
-                use_cache=True,
                 seeded_store=seeded_store,
             )
             # The layer index is the per-forward step counter shared by every
@@ -1020,6 +1135,56 @@ class CausalDecoder(nn.Module):
         """
         return "full" if step == 0 else ("reindex" if step % 4 == 1 else "reuse")
 
+    @staticmethod
+    def _exit_loop(
+        current_out: torch.Tensor,
+        out: torch.Tensor,
+        done: torch.Tensor,
+        survival: torch.Tensor,
+        cdf: torch.Tensor,
+        lam: torch.Tensor,
+        step: int,
+        loop_steps: int,
+        threshold: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""_exit_loop(current_out, out, done, survival, cdf, lam, step, loop_steps, threshold) -> (Tensor, Tensor, Tensor, Tensor)
+
+        Advance one step of the per-position Q-exit bookkeeping.
+
+        Shared by the TRM and plain LoopLM paths so the exit criterion
+        (first step whose cumulative exit probability crosses ``threshold``)
+        is implemented once. A position stops updating at the first iteration
+        that reaches the threshold; the final iteration absorbs every
+        still-open position so the loop never leaves a position stale.
+
+        Args:
+            current_out (Tensor): this iteration's output ``(B, L, D)``.
+            out (Tensor): running output, each position taken from its own
+                exit iteration ``(B, L, D)``.
+            done (Tensor): boolean mask of already-exited positions
+                ``(B, L)``.
+            survival (Tensor): product of ``(1 - lambda)`` so far
+                ``(B, L)``.
+            cdf (Tensor): cumulative exit probability so far ``(B, L)``.
+            lam (Tensor): per-step exit probabilities ``(B, L)``.
+            step (int): zero-based loop iteration.
+            loop_steps (int): recurrent depth ``T_max``.
+            threshold (float): Q-exit threshold ``q``.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor, Tensor]: updated
+            ``(out, done, survival, cdf)``.
+        """
+        if step == loop_steps - 1:
+            newly_done = ~done
+        else:
+            cdf = cdf + lam * survival
+            survival = survival * (1.0 - lam)
+            newly_done = (~done) & (cdf >= threshold)
+        out = torch.where(newly_done.unsqueeze(-1), current_out, out)
+        done = done | newly_done
+        return out, done, survival, cdf
+
     def _decode_looped(
         self,
         hidden_states: torch.Tensor,
@@ -1029,6 +1194,7 @@ class CausalDecoder(nn.Module):
         start_pos: int,
         seeded_store: bool,
         exit_threshold: float | None,
+        num_masked_tokens: int | None = None,
     ) -> torch.Tensor:
         r"""_decode_looped(hidden_states, encoder_final, position_ids=None, *, start_pos, seeded_store, exit_threshold) -> Tensor
 
@@ -1048,15 +1214,75 @@ class CausalDecoder(nn.Module):
         """
         threshold = self.exit_threshold if exit_threshold is None else exit_threshold
         layer = cast("CompressedSparseAttention2", self.layers[0])
-        if not isinstance(layer, CompressedSparseAttention2):
-            raise TypeError(f"looped decoder layers must hold CompressedSparseAttention2 (no GDN-2 branch), got {type(layer).__name__}")
+        # Initialize shared store (Eq. 1 encoder projection) before both paths.
         comp, ends = self.global_projs[0](encoder_final)
         if comp is None or ends is None:
             raise RuntimeError(
                 "global_projs[0] returned (None, None); the compressed KV store and end positions are required "
                 "for every decoder layer (Full/Reindex/Reuse). Check that the encoder projection is initialized."
             )
-        shared: CSA2SharedState | None = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=start_pos)
+        shared0: CSA2SharedState | None = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=start_pos)
+        # TRM mechanism (arXiv:2510.04871) when ced_decoder_trm is enabled:
+        # each loop step takes [X, Y, Z] where X is the fixed previous-layer
+        # output (decoder input / question), Y is the running answer
+        # (layer output), and Z is the loop-local latent that feeds back
+        # into the loop but never exits to the next layer.
+        if getattr(self, "trm_mix", None) is not None:
+            # X = fixed previous-layer output (decoder input hidden_states)
+            # Y = running answer, initialized to decoder input
+            # Z = loop-local latent, initialized to zero
+            x_fixed: torch.Tensor = hidden_states
+            y_state: torch.Tensor = hidden_states
+            z_state: torch.Tensor = torch.zeros_like(hidden_states)
+            out_trm = hidden_states
+            done_trm = torch.zeros(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
+            survival_trm = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
+            cdf_trm = torch.zeros_like(survival_trm)
+            shared_trm = shared0
+            for step in range(self.loop_steps):
+                if self.gate is None:
+                    raise RuntimeError("ced_decoder_trm requires looping (gate) to be enabled")
+                # Combine [X, Y, Z] into the shared CSA2 layer input.
+                # The mix projects concatenated features (B, L, 3*D) -> (B, L, D).
+                # This keeps the attention's global KV cache (Eq. 1, encoder
+                # seed) intact while giving the loop full access to all
+                # three streams at each step.
+                combined = torch.cat([x_fixed, y_state, z_state], dim=-1)
+                layer_in = self.trm_mix(combined)
+                layer_in, shared_trm = layer.forward_shared(
+                    layer_in,
+                    shared0 if step == 0 else shared_trm,
+                    position_ids=position_ids,
+                    seeded_store=seeded_store,
+                    mode=self._loop_mode(step),
+                )
+                layer_in = self.ffns[0](layer_in, step=0)
+                # Y takes the refined layer output (the answer / layer output).
+                # Z takes a projection of the same output (the loop-internal
+                # latent — it feeds back only inside this layer's loop).
+                y_state = layer_in
+                z_state = self.z_proj(layer_in)
+                lam = self.gate(y_state)
+                out_trm, done_trm, survival_trm, cdf_trm = self._exit_loop(
+                    y_state,
+                    out_trm,
+                    done_trm,
+                    survival_trm,
+                    cdf_trm,
+                    lam,
+                    step,
+                    self.loop_steps,
+                    threshold,
+                )
+                if bool(done_trm.all()):
+                    break
+            return out_trm
+
+        # Plain LoopLM (single-stream) path: kept for backward compat
+        # when ced_decoder_trm is disabled.
+        if not isinstance(layer, CompressedSparseAttention2):
+            raise TypeError(f"looped decoder layers must hold CompressedSparseAttention2 (no GDN-2 branch), got {type(layer).__name__}")
+        shared: CSA2SharedState | None = shared0
         x = hidden_states
         out = hidden_states
         done = torch.zeros(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
@@ -1067,7 +1293,6 @@ class CausalDecoder(nn.Module):
                 x,
                 shared,
                 position_ids=position_ids,
-                use_cache=True,
                 seeded_store=seeded_store,
                 mode=self._loop_mode(step),
             )
@@ -1079,14 +1304,17 @@ class CausalDecoder(nn.Module):
             # exact repetition of one shared layer.
             x = self.ffns[0](x, step=0)
             lam = self.gate(x)
-            if step == self.loop_steps - 1:
-                newly_done = ~done
-            else:
-                cdf = cdf + lam * survival
-                survival = survival * (1.0 - lam)
-                newly_done = (~done) & (cdf >= threshold)
-            out = torch.where(newly_done.unsqueeze(-1), x, out)
-            done = done | newly_done
+            out, done, survival, cdf = self._exit_loop(
+                x,
+                out,
+                done,
+                survival,
+                cdf,
+                lam,
+                step,
+                self.loop_steps,
+                threshold,
+            )
             if bool(done.all()):
                 break
         return out
@@ -1208,3 +1436,33 @@ class CausalDecoder(nn.Module):
             torch.Size([1, 4, 16])
         """
         return self.prefill(hidden_states, encoder_final, position_ids)
+
+
+class MaskedTokenEmbedding(nn.Module):
+    """Learnable masked-token embedding table for Perceiver-AR generation.
+
+    Each masked position receives a learnable vector. The caller is expected
+    to keep the masked-token count within the table size so every position
+    gets a distinct embedding; an out-of-range index raises rather than
+    silently aliasing two positions via cyclic modulo.
+
+    Args:
+        num_tokens (int): size of the embedding table (>= 1).
+        hidden_size (int): embedding dimension.
+    """
+
+    def __init__(self, num_tokens: int, hidden_size: int):
+        super().__init__()
+        if num_tokens < 1:
+            raise ValueError(f"num_tokens ({num_tokens}) must be >= 1")
+        self.num_tokens = num_tokens
+        self.embed = nn.Embedding(num_tokens, hidden_size)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        # The cyclic lookup is a safety net: callers should keep the masked
+        # count within the table size so every position gets a distinct
+        # embedding. Fail loudly when that contract is violated instead of
+        # silently aliasing two positions.
+        if indices.max().item() >= self.num_tokens:
+            raise ValueError(f"masked-token index {indices.max().item()} exceeds the table size ({self.num_tokens}); cyclic modulo would alias positions")
+        return self.embed(indices)

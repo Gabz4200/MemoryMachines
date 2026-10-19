@@ -318,7 +318,10 @@ class MemoryMachineConfig:
     ced_decoder_looping: bool = False
     ced_decoder_loop_steps: int = 4
     ced_decoder_loop_exit_threshold: float = 0.5
+    ced_decoder_trm: bool = True
     ced_decoder_hidden_size: int = 0
+    ced_masked_query: bool = False
+    ced_masked_token_count: int = 1
     ced_gdn2_backend: str = "naive"
     ced_gdn2_chunk_size: int = 64
     ced_gdn2_expand_v: float = 1.0
@@ -444,6 +447,8 @@ class MemoryMachineConfig:
                 f"= {self.csa_hier_pool_blocks * self.csa_hier_block_size} must be >= csa_top_k ({self.csa_top_k}); "
                 "otherwise Reindex silently degrades to a smaller candidate pool"
             )
+        if self.ced_masked_token_count < 1:
+            raise ValueError(f"ced_masked_token_count ({self.ced_masked_token_count}) must be >= 1")
         if self.ced_num_encoder_layers < 0:
             raise ValueError(f"ced_num_encoder_layers ({self.ced_num_encoder_layers}) must be non-negative")
         if self.ced_num_decoder_layers < 0:

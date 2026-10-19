@@ -251,11 +251,11 @@ class CompressedSparseAttention(GroupedQueryAttention):
             reference_qk_circuit,
         )
 
-        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(
-            q_heads, v_query, kv_exp, q_pos, k_pos
-        )
+        cvpe_attn_bias, phi_vq, phi_vk, spatial_grid, ov_spatial_weight = self._pe_inputs(q_heads, v_query, kv_exp, q_pos, k_pos)
         logits = reference_qk_circuit(
-            q_heads, kv_exp, cvpe_attn_bias,
+            q_heads,
+            kv_exp,
+            cvpe_attn_bias,
             torch.zeros(q_heads.shape[2], kv_exp.shape[2], dtype=q_heads.dtype, device=q_heads.device),
             None,
         )
@@ -278,8 +278,13 @@ class CompressedSparseAttention(GroupedQueryAttention):
             per_q = weights.shape[0] * weights.shape[1] * weights.shape[3] * kv_exp.shape[-1]
             eff = min(self.frvm_chunk_size, max(1, 32 * 1024 * 1024 // max(1, per_q)))
             return reference_frvm_gated_reduction(
-                weights, kv_exp, phi_vq, phi_vk,
-                spatial_grid=spatial_grid, ov_spatial_weight=ov_spatial_weight, chunk_size=eff,
+                weights,
+                kv_exp,
+                phi_vq,
+                phi_vk,
+                spatial_grid=spatial_grid,
+                ov_spatial_weight=ov_spatial_weight,
+                chunk_size=eff,
             )
         return torch.matmul(weights, kv_exp)
 
@@ -672,6 +677,8 @@ class CompressedSparseAttention2(CompressedSparseAttention):
         use_cache: bool = False,
         seeded_store: bool = False,
         mode: str | None = None,
+        kv_states: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, CSA2SharedState]:
         r"""forward_shared(hidden_states, shared=None, compress_from=None, compress_start_pos=0, position_ids=None, use_cache=False, seeded_store=False, mode=None) -> (Tensor, CSA2SharedState)
 
@@ -693,9 +700,10 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             compress_start_pos (int, optional): start position used with
                 ``compress_from``. Default: ``0``.
             position_ids (Tensor, optional): absolute positions. Default: ``None``.
-            use_cache (bool, optional): accepted for API parity; the SWA
-                branch runs without a persistent cache because SWA KV is
-                layer-local. Default: ``False``.
+            use_cache (bool, optional): accepted for API parity with
+                :meth:`CompressedSparseAttention.forward` but currently a
+                no-op — SWA KV is layer-local and is never persisted onto
+                the cross-layer :class:`CSA2SharedState`. Default: ``False``.
             seeded_store (bool, optional): when ``True`` (``full`` mode
                 only), treat ``shared.compressed_kv``/``comp_end_pos``
                 as the already-built global store: no compression of
@@ -703,6 +711,8 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                 decoder, whose global KV is projected from the
                 encoder-final states rather than derived from decoder
                 hidden states (CSA2, Eq. 1). Default: ``False``.
+            kv_states (Tensor, optional): full KV stream for masked-query mode; queries stay in hidden_states. Default: None.
+            kv_position_ids (Tensor, optional): positions for kv_states, (B, Lk). Default: None.
             mode (str, optional): per-call override of the layer's
                 ``full``/``reindex``/``reuse`` mode, used by the looped
                 CED decoder to cycle the shared layer's stage without
@@ -744,7 +754,8 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                     raise ValueError("seeded_store=True requires shared.comp_end_pos (corrupt CSA2SharedState)")
                 full_comp, full_ends = shared.compressed_kv, shared.comp_end_pos
             else:
-                src = compress_from if compress_from is not None else hidden_states
+                kv_src = kv_states if kv_states is not None else hidden_states
+                src = compress_from if compress_from is not None else kv_src
                 start = compress_start_pos if compress_from is not None else past_len_raw
                 new_comp, new_ends = self.compressor(src, start_pos=start)
                 if compress_from is not None:
@@ -793,6 +804,10 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             else:
                 scores = self.indexer.score(cq, full_comp, q_pos, full_ends)
                 topk = self.indexer.topk(scores, self.top_k)
+            # Clamp topk to available compressed entries to avoid out-of-range in gather.
+            # topk is (B, Lq, K); clamp K (dim 2) to the available entries.
+            max_entries = full_comp.shape[1]
+            topk = topk[:, :, : min(topk.shape[2], max_entries)]
             shared.topk_indices = topk
         else:
             if shared.compressed_kv is None or shared.topk_indices is None:
@@ -807,8 +822,19 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                 topk = topk[:, -1:, :].expand(bsz, q_len, -1)
         sel = self._gather_selected(full_comp, topk)
         sparse_out = self._selected_branch(q_main, sel, self._selected_positions(full_ends, topk), v_q, q_pos)
-        # Thread explicit positions into the SWA branch so both branches share
-        # the same absolute position base.
-        win_out, _, _ = self.swa(hidden_states, None, q_pos, None, False, use_cache=False)
+        # SWA branch: decoupled Q (from masked queries) from K/V (from the
+        # full KV stream) when masked-query mode is active.
+        if kv_states is not None:
+            q_len_swa = hidden_states.shape[1]
+            kv_len_swa = kv_states.shape[1]
+            q_proj_swa = self.swa.q_proj(hidden_states).view(bsz, q_len_swa, self.swa.num_heads, self.swa.head_dim).transpose(1, 2)
+            k_proj_swa = self.swa.k_proj(kv_states).view(bsz, kv_len_swa, self.swa.num_key_value_heads, self.swa.head_dim).transpose(1, 2)
+            v_full_swa = self.swa.v_proj(kv_states).view(bsz, kv_len_swa, self.swa.num_key_value_heads, self.swa.head_dim).transpose(1, 2)
+            vq_swa = self.swa.v_proj(hidden_states).view(bsz, q_len_swa, self.swa.num_key_value_heads, self.swa.head_dim).transpose(1, 2)
+            k_pos_swa = kv_position_ids if kv_position_ids is not None else torch.arange(kv_len_swa, device=hidden_states.device).unsqueeze(0).expand(bsz, -1)
+            heads_swa, _ = self.swa.attend(q_proj_swa, k_proj_swa, v_full_swa, vq_swa, q_pos, k_pos_swa, windowed=True, is_causal=True)
+            win_out = self.swa.project_heads(heads_swa, bsz, q_len_swa)
+        else:
+            win_out, _, _ = self.swa(hidden_states, None, q_pos, None, False, use_cache=False)
         out = self.grouped_out(self._fuse_branches([sparse_out, win_out], hidden_states))
         return out, shared

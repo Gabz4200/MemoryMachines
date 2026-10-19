@@ -25,6 +25,7 @@ class ModelInput:
     state: Any = None
     inputs_embeds: torch.Tensor | None = None
     pixel_values: torch.Tensor | None = None
+    num_masked_tokens: int | None = None
 
 
 @dataclass
