@@ -371,6 +371,18 @@ class CausalEncoderDecoderStack(nn.Module):
 
     Reference causal encoder-decoder (CED) stack over CSA2 layers.
 
+    **Facade, not a second implementation.** This class is a thin,
+    backward-compatible wrapper around :class:`CausalDecoder`: it owns the
+    encoder (built by :func:`_build_encoder`) and delegates
+    :meth:`encode`, :meth:`decode_full_context`, and :meth:`prefill` to the
+    decoder verbatim. The ``global_projs`` / ``decoder_layers`` /
+    ``decoder_ffns`` properties are views of :attr:`decoder` for callers that
+    pre-date the refactor. It is *not* registered as a model —
+    :class:`~memory_machines.models.backbone.CheapLLM` is the registered
+    causal encoder-decoder, and it composes the same :class:`CausalDecoder`.
+    Prefer the registered model for new code; keep this class only where the
+    public type is already pinned (tests, external integrations).
+
     Encoder layers compress with mode ``full`` (first) then ``reuse``;
     the decoder half is a :class:`CausalDecoder` (CSA2 layers in the
     paper's ``full``/``reindex``/``reuse`` cycle, each seeded with the
@@ -534,11 +546,18 @@ class CausalEncoderDecoderStack(nn.Module):
 
         Delegates to :class:`CausalDecoder.decode_full_context`:
         the decoder global KV is projected from the encoder-final
-        hidden states with each layer's own weights
-        (:class:`CEDGlobalKVProjection`, Eq. 1); it is *not*
+        hidden states once with the first layer's
+        :class:`CEDGlobalKVProjection` (Eq. 1); it is *not*
         derived from the decoder hidden states. The first decoder
         layer builds the shared store; subsequent ``reindex``/
         ``reuse`` layers consume it, so the projection runs once.
+        Per-layer ``global_projs[1:]`` are allocated (one per decoder
+        layer, for the length-zip guard) but only ``global_projs[0]``
+        is active: the ``full``/``reindex``/``reuse`` cycle threads one
+        shared compressed store across layers, so a per-layer projection
+        would break the cycle (reindex/reuse reselect from the *same*
+        store). Enable per-layer projections only by redesigning the
+        shared-state threading, not by swapping the call site.
 
         Args:
             hidden_states (Tensor): decoder inputs of shape ``(B, Ld, D)``.
@@ -758,6 +777,14 @@ class AdaptiveExitGate(nn.Module):
             Tensor: 1-based exit step per position, shape ``(B, L)``.
         """
         cdf = AdaptiveExitGate.cdf(lambdas)
+        # ``exit_distribution`` assigns the survival mass to the final step, so
+        # ``cdf[:, -1] == 1`` exactly and the final row is never below any
+        # threshold in [0, 1]. The clamp is therefore a safety net against
+        # numerical drift in the cumprod/cumsum chain: if a position's final
+        # CDF ever drifted below ``threshold`` (it shouldn't), the count would
+        # reach ``T`` and the clamp pins it to ``T - 1`` so the ``+1`` below
+        # still lands on the final step ``T`` rather than ``T + 1``. The
+        # invariant this relies on is: the last step always exits.
         steps = (cdf < threshold).sum(dim=1).clamp(max=cdf.shape[1] - 1)
         return steps + 1
 
@@ -827,17 +854,20 @@ class CausalDecoder(nn.Module):
 
     Standalone causal decoder matching the paper's decoder
     (§2.2, Eq. 1): decoder global KV is projected from the
-    encoder-final hidden states :math:`H_{L/2}` with
-    layer-dependent weights, *not* derived from the decoder's
+    encoder-final hidden states :math:`H_{L/2}` once with the
+    first layer's weights, *not* derived from the decoder's
     own hidden states. Each layer retains its own global Q and
     SWA KV (SWA-capable, per the local modification).
 
     Wraps :class:`CompressedSparseAttention2` decoder layers in
     the paper's CSA2 mode cycle (``full`` / ``reindex`` /
     ``reuse``) and per-layer :class:`CEDGlobalKVProjection`
-    (:math:`C_l = H_{L/2} W^{KV}_l`). Supports full-context
-    decoding and SWA Bounded Replay (§2.3.2) prefill. The decoder
-    carries no GDN-2 branch: the encoder owns the global GDN-2 mixer
+    (:math:`C_l = H_{L/2} W^{KV}_l`). The cycle threads one shared
+    compressed store across layers, so the projection runs once
+    (``global_projs[0]``); ``global_projs[1:]`` are allocated only
+    to satisfy the length-zip guard and are inactive. Supports
+    full-context decoding and SWA Bounded Replay (§2.3.2) prefill.
+    The decoder carries no GDN-2 branch: the encoder owns the global GDN-2 mixer
     (``config.ced_attention_gdn2_parallel``), and the decoder inherits that
     global context through the encoder's KV, so bounded replay stays valid.
     Each decoder layer is followed by a dense (non-MoE) feed-forward sub-layer
@@ -1019,12 +1049,14 @@ class CausalDecoder(nn.Module):
         Decode with every decoder layer seeded from the encoder-final states.
 
         The decoder global KV is projected from the encoder-final
-        hidden states with each layer's own weights
+        hidden states once with the first layer's weights
         (:class:`CEDGlobalKVProjection`, Eq. 1); it is *not*
         derived from the decoder hidden states. The first layer
         builds the shared store; subsequent ``reindex``/``reuse``
-        layers consume it, so the projection runs once. Each layer is
-        followed by its dense feed-forward sub-layer
+        layers consume it, so the projection runs once. Per-layer
+        ``global_projs[1:]`` are allocated for the length-zip guard
+        but inactive (the shared store is projected once). Each layer
+        is followed by its dense feed-forward sub-layer
         (:class:`~memory_machines.models.blocks.ffn.DenseFFN`,
         ``config.ced_decoder_ffn``).
 
@@ -1084,16 +1116,11 @@ class CausalDecoder(nn.Module):
                 exit_threshold=exit_threshold,
             )
         layers = cast("list[CompressedSparseAttention2]", list(self.layers))
-        for layer in layers:
-            if not isinstance(layer, CompressedSparseAttention2):
-                raise TypeError(f"decoder layers must hold CompressedSparseAttention2 (no GDN-2 branch), got {type(layer).__name__}")
         if not layers:
             return hidden_states
         # Eq. 1: C_l = H_{L/2} W^KV_l — the global store is projected
         # from the encoder-final states once, then shared by every
         # decoder layer (Full/Reindex/Reuse).
-        # NOTE: indexer_k is (re)computed inside forward_shared;
-        # do not pre-seed it here (dead compute, immediately overwritten).
         comp, ends = self.global_projs[0](encoder_final)
         shared: CSA2SharedState | None = CSA2SharedState(
             compressed_kv=comp,
@@ -1216,11 +1243,6 @@ class CausalDecoder(nn.Module):
         layer = cast("CompressedSparseAttention2", self.layers[0])
         # Initialize shared store (Eq. 1 encoder projection) before both paths.
         comp, ends = self.global_projs[0](encoder_final)
-        if comp is None or ends is None:
-            raise RuntimeError(
-                "global_projs[0] returned (None, None); the compressed KV store and end positions are required "
-                "for every decoder layer (Full/Reindex/Reuse). Check that the encoder projection is initialized."
-            )
         shared0: CSA2SharedState | None = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=start_pos)
         # TRM mechanism (arXiv:2510.04871) when ced_decoder_trm is enabled:
         # each loop step takes [X, Y, Z] where X is the fixed previous-layer
@@ -1280,8 +1302,6 @@ class CausalDecoder(nn.Module):
 
         # Plain LoopLM (single-stream) path: kept for backward compat
         # when ced_decoder_trm is disabled.
-        if not isinstance(layer, CompressedSparseAttention2):
-            raise TypeError(f"looped decoder layers must hold CompressedSparseAttention2 (no GDN-2 branch), got {type(layer).__name__}")
         shared: CSA2SharedState | None = shared0
         x = hidden_states
         out = hidden_states
@@ -1298,10 +1318,15 @@ class CausalDecoder(nn.Module):
             )
             # The loop is a black box for the update schedule: the repeated
             # CSA2 -> DenseFFN pattern counts as a single forward-call step,
-            # so the shared FFN is applied on every loop iteration (its
-            # update_interval governs across forward calls, not across
-            # loop iterations). This keeps the parameter-shared decoder an
-            # exact repetition of one shared layer.
+            # so the shared FFN is applied on every loop iteration. Its
+            # ``update_interval`` governs across *forward calls* (the
+            # encoder/decoder stack), not across loop iterations, so the
+            # step passed here is the constant 0 — ``should_update(0)``
+            # is True for any interval (0 % N == 0), which keeps the
+            # parameter-shared decoder an exact repetition of one shared
+            # layer. Do not substitute the loop index here: that would
+            # make the looped decoder's FFN skip iterations, breaking the
+            # parameter-sharing invariant.
             x = self.ffns[0](x, step=0)
             lam = self.gate(x)
             out, done, survival, cdf = self._exit_loop(
@@ -1384,7 +1409,16 @@ class CausalDecoder(nn.Module):
                 f"bounded replay needs explicit position_ids when decoder length ({seq_len}) != encoder length ({enc_len}); "
                 "pass position_ids covering the replay window so the tail anchors at its true positions"
             )
-        start_pos = enc_len - replay_len if seq_len == enc_len else seq_len - replay_len
+        # The replayed tail anchors at the end of the encoder context
+        # ([enc_len - replay_len, enc_len)) regardless of the decoder prompt
+        # length: the global store is projected from the encoder-final states
+        # (Eq. 1), so its total_len is the encoder length, not the decoder
+        # length. The branch used to be ``seq_len - replay_len`` when the
+        # prompt length differed, which could go negative and mis-anchor the
+        # store; the seq_len != enc_len case now requires explicit
+        # position_ids (see the guard above), and start_pos is pinned to the
+        # encoder-anchored value so the store and the tail always agree.
+        start_pos = enc_len - replay_len
         if position_ids is None:
             position_ids = torch.arange(start_pos, enc_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.shape[0], -1)
         else:

@@ -254,6 +254,19 @@ class DenseFFN(nn.Module):
     weight-shared FFN is sufficient because the block is pointwise across
     positions and — on the mHC path — shared across the residual streams.
 
+    **Norm axis invariant.** The pre-norm is built with ``config.hidden_size``
+    (the per-token width ``d``) and applied to ``x`` as-is. On the CSA2 path
+    ``x`` is ``(B, L, d)`` and the norm normalizes per token. On the mHC path
+    (:func:`~memory_machines.models.blocks.mhc_parallel._run_stream_layers`)
+    ``x`` is ``(B, L, n, d)`` and the norm normalizes the *last* axis — i.e.
+    per (stream, token), independently per stream, not across streams. This
+    is the intended mHC design (each residual stream normalizes itself), and
+    it is why the norm width is ``d`` rather than ``n * d``. Switching the
+    norm kind away from the broadcast-friendly ``dyT`` (the default) to
+    ``rmsnorm`` / ``layernorm`` keeps this semantics; do not reshape the
+    streams before the norm unless you want per-token-across-stream
+    normalization instead.
+
     Each instance owns an update interval ``C = update_interval`` (the
     "time cycle" of the HOPE / Continuum Memory System idea): the FFN is
     only applied when :meth:`should_update` gates it on at the current step,

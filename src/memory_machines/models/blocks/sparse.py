@@ -818,7 +818,14 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             full_ends = shared.comp_end_pos
             topk = shared.topk_indices
             if topk.shape[1] != q_len:
-                # Reuse the last query's selection (exact only for single-token decode).
+                # Reuse the last query's selection. Exact only for single-token
+                # decode (q_len == 1): the last row is broadcast to every query,
+                # so all queries share one query's compressed-entry selection.
+                # For batched multi-token reuse this is an approximation, not a
+                # silent corruption — every query reads the same top-k entries,
+                # which is a valid (if coarser) retrieval. If exact per-query
+                # reuse is required, reindex instead (a reindex recomputes top-k
+                # from the pooled scores, see the reindex branch above).
                 topk = topk[:, -1:, :].expand(bsz, q_len, -1)
         sel = self._gather_selected(full_comp, topk)
         sparse_out = self._selected_branch(q_main, sel, self._selected_positions(full_ends, topk), v_q, q_pos)

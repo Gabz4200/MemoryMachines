@@ -123,7 +123,6 @@ class ExampleBackbone(nn.Module):
         return self.embed
 
     def set_input_embeddings(self, value: nn.Module) -> None:
-        # HF passes a generic nn.Module; the attribute is an nn.Embedding.
         self.embed = cast(nn.Embedding, value)
 
     def forward(self, inputs: ModelInput) -> ModelOutput:
@@ -133,7 +132,6 @@ class ExampleBackbone(nn.Module):
                 raise ValueError("ModelInput requires input_ids or inputs_embeds")
             x = self.embed(inputs.input_ids)
         for block in self.blocks:
-            # Cast keeps the type checker honest on ModuleDict indexing.
             pair = cast(nn.ModuleDict, block)
             x = pair["ff"](pair["attn"](x))
         x = self.norm(x)
@@ -249,7 +247,6 @@ class CheapLLM(nn.Module):
         return self.embed
 
     def set_input_embeddings(self, value: nn.Module) -> None:
-        # HF passes a generic nn.Module; the attribute is an nn.Embedding.
         self.embed = cast(nn.Embedding, value)
 
     @property
@@ -314,14 +311,22 @@ class CheapLLM(nn.Module):
         """
         return self.decoder.prefill(hidden_states, encoder_final, position_ids)
 
-    def forward(self, inputs: ModelInput) -> ModelOutput:
-        """forward(ModelInput) -> ModelOutput
+    def forward(self, inputs: ModelInput | torch.Tensor) -> ModelOutput:
+        """forward(ModelInput | Tensor) -> ModelOutput
 
         Standard causal LM forward: embed the input, encode it, decode it
         full-context, widen through the vocabulary up-projection, and apply
         the LM head. ``inputs.attention_mask`` is accepted for API parity
         (the CED decoder is causal and ignores padding) but not consumed.
+
+        A bare ``torch.Tensor`` is accepted as a shorthand for
+        ``ModelInput(input_ids=tensor)`` so the HF adapter and ad-hoc
+        scripts can call ``model(ids)`` directly; ``ModelInput`` is still
+        the canonical contract and is required for anything beyond
+        ``input_ids`` (e.g. ``num_masked_tokens`` for Perceiver-AR).
         """
+        if isinstance(inputs, torch.Tensor):
+            inputs = ModelInput(input_ids=inputs)
         x = inputs.inputs_embeds
         if x is None:
             if inputs.input_ids is None:
@@ -340,10 +345,15 @@ class CheapLLM(nn.Module):
         if L is not None and L > 0 and self.config.ced_masked_query:
             N = x.shape[1]
             # Query stream = masked positions (last L); KV stream = full sequence.
-            # Set start_pos so masked queries get correct positions [N-L, N).
+            # Pass position_ids explicitly so the masked queries anchor at
+            # [N-L, N) by contract, not by accident of the fallback arithmetic
+            # inside CausalDecoder.decode_full_context (which derives positions
+            # from start_pos when position_ids is None).
+            dec_pos = torch.arange(N - L, N, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
             dec_out = self.decoder.decode_full_context(
                 x[:, N - L :, :],
                 encoder_final,
+                position_ids=dec_pos,
                 num_masked_tokens=L,
                 start_pos=N - L,
             )

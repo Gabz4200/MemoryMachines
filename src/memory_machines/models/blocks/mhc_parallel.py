@@ -109,6 +109,18 @@ def to_streams(x: torch.Tensor, num_streams: int) -> torch.Tensor:
     Expand a hidden state ``(B, L, d)`` into ``n`` identical residual streams
     ``(B, L, n, d)`` (mHC residual-stream replication).
 
+    **Aliasing contract (read before any in-place op):** the returned tensor is
+    ``x.unsqueeze(2).expand(...)`` — every stream is the *same* storage, so the
+    streams alias the input. This is safe *only* because recombination
+    (:func:`combine_parallel`) writes the residual back through a
+    doubly-stochastic (Sinkhorn) mixing matrix ``b``: the write is a convex
+    combination of the streams, so it is numerically stable and does not
+    double-count. Any in-place op on one stream (a future GDN-2 state update,
+    a masked-write, a chunked accumulation) would corrupt **all** streams —
+    materialize with ``.contiguous()`` or ``.clone()`` before mutating. The
+    streams are collapsed with a mean by :func:`from_streams`, which averages
+    the (aliased) storage back to a single stream.
+
     Examples::
 
         >>> to_streams(torch.randn(1, 4, 8), 2).shape
