@@ -56,6 +56,7 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .causal_conv1d import ShortConvolution
 from .ffn import DenseFFN
+from .shared import _l2norm
 
 __all__ = [
     "ContinuumMemorySystem",
@@ -76,10 +77,6 @@ __all__ = [
 #: only to generate its own values (Eq. 84); the query itself stays a static
 #: projection ``q = xW_q``.
 HOPE_BOXES = ("k", "v", "q", "eta", "alpha", "memory")
-
-
-def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return x / torch.sqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
 def _validate_hidden_size_heads_memory_depth(

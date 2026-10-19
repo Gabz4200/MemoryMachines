@@ -7,6 +7,16 @@ import torch
 from torch import nn
 
 
+def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    r"""_l2norm(x, eps=1e-6) -> Tensor
+
+    L2-normalize the last dimension of ``x`` (unit-norm rows), with a small
+    epsilon for numerical stability. Shared by the GDN-2 and HOPE/TITANS
+    fast-weight q/k normalization paths.
+    """
+    return x / torch.sqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+
+
 def residual_init_scale(std: float, num_layers: int, enabled: bool = True) -> float | None:
     r"""residual_init_scale(std, num_layers, enabled=True) -> float | None
 

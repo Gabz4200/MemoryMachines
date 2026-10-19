@@ -50,6 +50,19 @@ from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention2
 
 
+def _validate_encoder_layers(layers: nn.ModuleList | list[nn.Module]) -> None:
+    """Assert every encoder token-mixer is a CSA2 or parallel-mHC layer.
+
+    CheapLLM accepts ``encoder_layers`` from callers; a wrong-typed entry
+    must fail at construction, not deep inside ``encode``. This mirrors the
+    runtime check in :meth:`CausalEncoderDecoderStack.encode` so the two
+    paths share one contract.
+    """
+    for layer in layers:
+        if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
+            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
+
+
 def decoder_width(config: MemoryMachineConfig) -> int:
     r"""decoder_width(config) -> int
 
@@ -240,9 +253,7 @@ def _run_encoder_layers(
         TypeError: if any layer is not a CSA2 or parallel-mHC block.
         ValueError: if the encoder produced no shared state (empty layers).
     """
-    for layer in layers:
-        if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
-            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
+    _validate_encoder_layers(layers)
     if not layers:
         raise ValueError("encode produced no shared state (encoder_layers is empty)")
     if any(isinstance(layer, MHCAttentionGDN2) for layer in layers):

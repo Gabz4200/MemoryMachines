@@ -550,8 +550,9 @@ class AttentionSink(nn.Module):
         # inf/inf=NaN; compute in fp32 then cast back.
         l32 = logits.float()
         sink = self.sink_logit.to(torch.float32).view(1, -1, 1, 1)
-        denom = torch.exp(l32).sum(dim=-1, keepdim=True) + torch.exp(sink)
-        return (torch.exp(l32) / denom).to(logits.dtype)
+        e = torch.exp(l32)
+        denom = e.sum(dim=-1, keepdim=True) + torch.exp(sink)
+        return (e / denom).to(logits.dtype)
 
 
 class GroupedOutputProjection(nn.Module):

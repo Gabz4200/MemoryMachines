@@ -62,6 +62,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .causal_conv1d import ShortConvolution
+from .shared import _l2norm
 
 __all__ = [
     "GatedDeltaNet2",
@@ -83,10 +84,6 @@ def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
     if any(t.dtype == torch.float64 for t in tensors):
         return torch.float64
     return torch.float32
-
-
-def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return x / torch.sqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
 def _prepare_qkb(
@@ -284,26 +281,6 @@ def _resting_finalize(
     return o, s
 
 
-def _head_row_args(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    b: torch.Tensor,
-    w: torch.Tensor,
-    s0: torch.Tensor,
-    scale: float,
-    use_qk_l2norm: bool,
-    beta_guard: bool,
-) -> tuple:
-    """Bundle the ten shared head-row arguments for the chunk/recurrent kernels.
-
-    ``_chunk_single`` and ``_recurrent_single`` differ only in their trailing
-    ``chunk_size``/``resting``; this helper keeps the two call sites in sync.
-    """
-    return q, k, v, g, b, w, s0, scale, use_qk_l2norm, beta_guard
-
-
 def _check_shapes(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -346,8 +323,8 @@ def _check_shapes(
             raise ValueError(f"cu_seqlens must start at 0, got {bounds[:3] if bounds else bounds}")
         if any(b < a for a, b in itertools.pairwise(bounds)):
             raise ValueError(f"cu_seqlens must be non-decreasing, got {bounds}")
-        if int(cu_seqlens[-1].item()) != T:
-            raise ValueError(f"cu_seqlens must end at T={T}, got {int(cu_seqlens[-1].item())}")
+        if bounds[-1] != T:
+            raise ValueError(f"cu_seqlens must end at T={T}, got {bounds[-1]}")
     if initial_state is not None:
         n = len(cu_seqlens) - 1 if cu_seqlens is not None else B
         if tuple(initial_state.shape) != (n, HV, K, V):
@@ -414,18 +391,6 @@ def _run_path(
         cur = torch.empty_like(s0)
         for hv in range(HV):
             rest_hv = rest[hv] if rest is not None else None
-            _head_row_args(
-                qr[bn, s:e, hv],
-                kr[bn, s:e, hv],
-                vr[bn, s:e, hv],
-                gr[bn, s:e, hv],
-                br[bn, s:e, hv],
-                wr[bn, s:e, hv],
-                s0[hv],
-                scale,
-                use_qk_l2norm,
-                beta_guard,
-            )
             if chunk_size is not None:
                 o_hv, cur_hv = _chunk_single(
                     qr[bn, s:e, hv],

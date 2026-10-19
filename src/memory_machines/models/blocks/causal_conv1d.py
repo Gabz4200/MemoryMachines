@@ -13,12 +13,11 @@ import torch
 from torch import nn
 
 from memory_machines.ops.references.causal_conv1d_reference import (
+    _check_activation,
     reference_causal_conv1d_fwd,
     reference_causal_conv1d_update,
     reference_causal_conv1d_update_states,
 )
-
-_ACTIVATIONS = (None, "silu", "swish")
 
 
 class ShortConvolution(nn.Conv1d):
@@ -62,8 +61,7 @@ class ShortConvolution(nn.Conv1d):
             bias=bias,
         )
         self.hidden_size = hidden_size
-        if activation not in _ACTIVATIONS:
-            raise ValueError(f"activation must be one of {_ACTIVATIONS}, got {activation!r}")
+        _check_activation(activation)
         self.activation = activation
         if backend != "naive":
             raise ValueError(f"backend {backend!r} has no kernel yet; use backend='naive'")

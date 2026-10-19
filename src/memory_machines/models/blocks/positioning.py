@@ -11,6 +11,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from memory_machines.ops.references.attention_reference import (
+    reference_frvm_gated_reduction,
+)
+
+from .shared import _multi_axis_distance
+
 
 class CVPEContextBias(nn.Module):
     r"""CVPEContextBias(head_dim, mlp_hidden=32, use_log_transform=True, spatial_dims=1, axis_max=None)
@@ -75,6 +81,9 @@ class CVPEContextBias(nn.Module):
             if len(tuple(axis_max)) != spatial_dims:
                 raise ValueError(f"axis_max must hold {spatial_dims} entries (one per axis), got {tuple(axis_max)}")
             self.axis_max = axis_max
+        # Resolve the per-axis caps once: the N-dim path needs a length-``spatial_dims``
+        # tuple (zero-padded/truncated in forward), and the default is 32768 per axis.
+        self._axis_max_resolved = tuple(int(a) for a in self.axis_max) if len(tuple(self.axis_max)) == self.spatial_dims else (32768,) * self.spatial_dims
 
         self.gamma_proj = nn.Linear(head_dim, 1)
         self.beta_proj = nn.Linear(head_dim, 1)
@@ -150,8 +159,6 @@ class CVPEContextBias(nn.Module):
         if q_pos.dim() == 3 or k_pos.dim() == 3:
             # N-dim path: separate query/key coordinate streams (self-attn
             # collapses to symmetric distances; cross-attn is asymmetric LxS).
-            from .shared import _multi_axis_distance
-
             q3 = q_pos.to(dtype=torch.float32)
             k3 = k_pos.to(dtype=torch.float32)
             if q3.dim() == 2:
@@ -175,7 +182,7 @@ class CVPEContextBias(nn.Module):
             dist = _multi_axis_distance(
                 q3,
                 k3,
-                self.axis_max if len(tuple(self.axis_max)) == self.spatial_dims else (32768,) * self.spatial_dims,
+                self._axis_max_resolved,
                 self.use_log_transform,
             )  # (B, Lq, Lk, N)
             mlp_dtype = self.mlp_in_nd.weight.dtype
@@ -431,15 +438,13 @@ class FRVMValueGate(nn.Module):
         if attn_weights.shape[:2] != v_full.shape[:2] or attn_weights.shape[:2] != v_query.shape[:2]:
             raise ValueError(f"batch/heads mismatch: attn {tuple(attn_weights.shape[:2])} vs v_full {tuple(v_full.shape[:2])} vs v_query {tuple(v_query.shape[:2])}")
 
-        phi_vq = self._phi(v_query)
-        phi_vk = self._phi(v_full)
-
         per_query_elements = bsz * num_heads * lk * v_full.shape[-1]
         effective_chunk_size = min(chunk_size, max(1, self._MAX_CHUNK_ELEMENTS // max(1, per_query_elements)))
-
-        from memory_machines.ops.references.attention_reference import reference_frvm_gated_reduction
 
         if self.phi_q_weight is not None or self.phi_k_weight is not None:
             phi_vq = self._phi_q(v_query)
             phi_vk = self._phi_k(v_full)
+        else:
+            phi_vq = self._phi(v_query)
+            phi_vk = self._phi(v_full)
         return reference_frvm_gated_reduction(attn_weights, v_full, phi_vq, phi_vk, chunk_size=effective_chunk_size)

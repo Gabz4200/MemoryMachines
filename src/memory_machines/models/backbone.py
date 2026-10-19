@@ -15,9 +15,7 @@ import torch
 from torch import nn
 
 from memory_machines.models.blocks import (
-    CompressedSparseAttention2,
     GroupedQueryAttention,
-    MHCAttentionGDN2,
     SwiGLU,
 )
 from memory_machines.models.blocks.ced import (
@@ -26,24 +24,12 @@ from memory_machines.models.blocks.ced import (
     VocabularyUpProjection,
     _build_encoder,
     _run_encoder_layers,
+    _validate_encoder_layers,
 )
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
 from memory_machines.models.registry import register_model
 from memory_machines.utils.config_schema import MemoryMachineConfig
-
-
-def _validate_encoder_layers(layers: nn.ModuleList) -> None:
-    """Assert every encoder token-mixer is a CSA2 or parallel-mHC layer.
-
-    CheapLLM accepts ``encoder_layers`` from callers; a wrong-typed entry
-    must fail at construction, not deep inside ``encode``. This mirrors the
-    runtime check in :meth:`CausalEncoderDecoderStack.encode` so the two
-    paths share one contract.
-    """
-    for layer in layers:
-        if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
-            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
 
 
 class _GQAWrapper(nn.Module):
@@ -357,7 +343,6 @@ class CheapLLM(nn.Module):
                 num_masked_tokens=L,
                 start_pos=N - L,
             )
-            # Slice output to masked positions (L outputs per batch item).
             dec_out = dec_out[:, -L:, :]
         else:
             dec_out = self.decoder.decode_full_context(x, encoder_final)
