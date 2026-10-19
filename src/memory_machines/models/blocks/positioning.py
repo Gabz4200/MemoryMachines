@@ -173,7 +173,8 @@ class CVPEContextBias(nn.Module):
                 q3 = q3[..., : self.spatial_dims]
                 k3 = k3[..., : self.spatial_dims]
             dist = _multi_axis_distance(
-                q3, k3,
+                q3,
+                k3,
                 self.axis_max if len(tuple(self.axis_max)) == self.spatial_dims else (32768,) * self.spatial_dims,
                 self.use_log_transform,
             )  # (B, Lq, Lk, N)
@@ -383,9 +384,7 @@ class FRVMValueGate(nn.Module):
             return torch.einsum("bhld,hed->bhle", x, self.phi_k_weight)
         return self._phi(x)
 
-    def project_qk(
-        self, v_query: torch.Tensor, v_full: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_qk(self, v_query: torch.Tensor, v_full: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Precompute ``(phi_vq, phi_vk)`` for the functional op."""
         return self._phi_q(v_query), self._phi_k(v_full)
 
@@ -443,6 +442,4 @@ class FRVMValueGate(nn.Module):
         if self.phi_q_weight is not None or self.phi_k_weight is not None:
             phi_vq = self._phi_q(v_query)
             phi_vk = self._phi_k(v_full)
-        return reference_frvm_gated_reduction(
-            attn_weights, v_full, phi_vq, phi_vk, chunk_size=effective_chunk_size
-        )
+        return reference_frvm_gated_reduction(attn_weights, v_full, phi_vq, phi_vk, chunk_size=effective_chunk_size)
