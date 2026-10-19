@@ -1,53 +1,34 @@
-"""Strategy dispatcher.
+"""Strategy dispatcher with an explicit compiled-first fallback chain.
 
 Backends (case-insensitive, whitespace-tolerant):
-  - "naive": pure PyTorch reference (testing/debugging oracle only)
-  - "cpu"/"gpu"/"taichi"/"compiled": compiled kernel entry point. These are
-    currently aliases for "run the compiled op if available, else raise" —
-    physical device placement is chosen inside ``ensure_taichi()``
-    (CUDA if available, else CPU; ``TARCH=vulkan`` for Vulkan), not by the
-    label. A requested compiled backend that cannot run is an actionable
-    error, not a silent downgrade.
+  - "naive": pure PyTorch reference (testing/debugging oracle only).
+  - "auto": try the compiled kernel first, fall back to the reference.
+    Order: Taichi kernel -> CPU cpp extension -> pure PyTorch reference.
+    A warning is emitted whenever the reference is used because the compiled
+    kernel was unavailable.
+  - "cpu"/"gpu"/"taichi"/"compiled": compiled kernel entry point. A requested
+    compiled backend that cannot run raises an actionable error (no silent
+    downgrade).
 
-The naive path is NEVER an implicit fallback: a requested compiled backend
-that cannot run is an actionable error, not a silent downgrade.
+The ``naive`` path is NEVER an implicit fallback under ``auto``: the reference
+is used only after every compiled option has been tried and failed, and each
+downgrade surfaces an explicit ``UserWarning``.
+
+The backend logic itself lives in :mod:`memory_machines.ops.registry`; these
+functions are thin, typed adapters around ``registry.dispatch`` so every op
+shares one implementation.
 """
+
+from __future__ import annotations
 
 import torch
 
-from memory_machines.ops.causal_conv1d import causal_conv1d_naive
-from memory_machines.ops.interfaces import ElementwiseOp
-from memory_machines.ops.references.causal_conv1d_reference import (
-    reference_causal_conv1d_update,
-)
-from memory_machines.ops.references.dw_scale_reference import reference_dw_scale
+# Import the op modules so they self-register with the op registry when this
+# package is imported. They are not referenced by name here beyond that.
+from memory_machines.ops import causal_conv1d as _causal_conv1d  # noqa: F401
+from memory_machines.ops import attention as _attention  # noqa: F401
 
-# Static protocol wiring (checked by the type checker, not at runtime). The
-# compiled facade is imported lazily inside ``dispatch_dw_scale`` so merely
-# importing this dispatcher never registers its torch.library ops.
-_reference_dw_scale_op: ElementwiseOp = reference_dw_scale
-
-_VALID_BACKENDS = ("naive", "cpu", "gpu", "taichi", "compiled")
-
-
-def _normalize_backend(backend: str) -> str:
-    if not isinstance(backend, str):
-        raise TypeError(f"backend must be a str, got {type(backend).__name__}")
-    norm = backend.strip().lower()
-    if norm not in _VALID_BACKENDS:
-        raise ValueError(f"Unknown backend: '{backend}'. Valid: {list(_VALID_BACKENDS)}")
-    return norm
-
-
-def dispatch_dw_scale(x: torch.Tensor, weight: torch.Tensor, backend: str = "naive") -> torch.Tensor:
-    backend = _normalize_backend(backend)
-    if backend == "naive":
-        return reference_dw_scale(x, weight)
-    # Lazy import: importing the facade registers torch.library ops, so defer
-    # it until a compiled backend is actually requested.
-    from memory_machines.ops.dw_scale import dw_scale as compiled_op
-
-    return compiled_op(x, weight)
+from memory_machines.ops.registry import dispatch_op
 
 
 def dispatch_causal_conv1d(
@@ -59,28 +40,27 @@ def dispatch_causal_conv1d(
     output_final_state: bool = False,
     activation: str | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    backend: str = "naive",
+    backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Causal depthwise conv1d dispatcher.
+    """Causal depthwise conv1d dispatcher with fallback to the reference.
 
-    Only ``backend="naive"`` (pure-PyTorch reference) exists until the
-    compiled kernel lands. A requested compiled backend is an actionable
-    error, never a silent downgrade. The naive path delegates to
-    :func:`causal_conv1d_naive` so semantics live in one place.
+    Args:
+        backend: "naive" uses the reference directly; "auto" (default) tries
+            compiled kernels then warns and uses the reference; compiled
+            labels try the compiled path only and raise if unavailable.
     """
-    backend = _normalize_backend(backend)
-    if backend == "naive":
-        return causal_conv1d_naive(
-            x=x,
-            weight=weight,
-            bias=bias,
-            residual=residual,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            activation=activation,
-            cu_seqlens=cu_seqlens,
-        )
-    raise NotImplementedError(f"backend='{backend}' has no causal_conv1d kernel yet (TODO); use backend='naive'")
+    return dispatch_op(
+        "causal_conv1d",
+        backend,
+        x,
+        weight,
+        bias=bias,
+        residual=residual,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        activation=activation,
+        cu_seqlens=cu_seqlens,
+    )
 
 
 def dispatch_causal_conv1d_update(
@@ -90,15 +70,68 @@ def dispatch_causal_conv1d_update(
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
     activation: str | None = None,
-    backend: str = "naive",
+    backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Single-token decode-step dispatcher.
+    """Single-token decode-step dispatcher with fallback to the reference.
 
-    Returns ``(y, cache)`` where ``cache`` is updated **in place** and
-    returned aliased (``y_cache is cache``); callers must not treat the
-    return as a fresh tensor.
+    Args:
+        backend: "naive" uses the reference directly; "auto" (default) tries
+            compiled kernels then warns and uses the reference; compiled
+            labels try the compiled path only and raise if unavailable.
     """
-    backend = _normalize_backend(backend)
-    if backend == "naive":
-        return reference_causal_conv1d_update(x=x, cache=cache, weight=weight, bias=bias, residual=residual, activation=activation)
-    raise NotImplementedError(f"backend='{backend}' has no causal_conv1d kernel yet (TODO); use backend='naive'")
+    return dispatch_op(
+        "causal_conv1d_update",
+        backend,
+        x,
+        cache,
+        weight,
+        bias=bias,
+        residual=residual,
+        activation=activation,
+    )
+
+
+def dispatch_universal_pe_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cvpe_attn_bias: torch.Tensor | None = None,
+    phi_vq: torch.Tensor | None = None,
+    phi_vk: torch.Tensor | None = None,
+    spatial_grid: torch.Tensor | None = None,
+    ov_spatial_weight: torch.Tensor | None = None,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    bidirectional: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+    frvm_chunk_size: int = 128,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Universal PE attention dispatcher with fallback to the reference.
+
+    Args:
+        backend: "naive" uses the reference directly; "auto" (default) tries
+            compiled kernels then warns and uses the reference; compiled
+            labels try the compiled path only and raise if unavailable.
+    """
+    return dispatch_op(
+        "universal_pe_attention",
+        backend,
+        query,
+        key,
+        value,
+        cvpe_attn_bias=cvpe_attn_bias,
+        phi_vq=phi_vq,
+        phi_vk=phi_vk,
+        spatial_grid=spatial_grid,
+        ov_spatial_weight=ov_spatial_weight,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        bidirectional=bidirectional,
+        scale=scale,
+        enable_gqa=enable_gqa,
+        frvm_chunk_size=frvm_chunk_size,
+    )
