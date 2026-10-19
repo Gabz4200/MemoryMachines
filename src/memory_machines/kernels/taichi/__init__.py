@@ -4,6 +4,8 @@ import importlib
 import os
 from threading import Lock
 
+import torch
+
 _ti = None
 _lock = Lock()
 _initialized = False
