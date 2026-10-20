@@ -287,3 +287,100 @@ def test_hidden_not_divisible_by_heads_raises():
     bad.num_attention_heads = 3
     with pytest.raises(ValueError, match="divisible"):
         GatedDeltaNet2Mixer(bad, use_short_conv=False)
+
+
+def test_liv_conv_is_default_and_per_stream():
+    from memory_machines.models.blocks.gdn2 import GatedDeltaNet2Mixer, LivConv1d
+
+    layer = GatedDeltaNet2Mixer(_cfg()).layer
+    convs = (layer.q_conv1d, layer.k_conv1d, layer.v_conv1d)
+    assert all(isinstance(c, LivConv1d) for c in convs)
+    assert len({id(c) for c in convs}) == 3  # unique weights per stream
+    assert convs[0].hidden_size == layer.key_dim
+    assert convs[2].hidden_size == layer.value_dim
+    assert convs[0].kernel_size == (layer.conv_size,)
+
+
+def test_liv_conv_rejects_non_positive_dims():
+    from memory_machines.models.blocks.gdn2 import LivConv1d
+
+    with pytest.raises(ValueError, match="hidden_size/kernel_size"):
+        LivConv1d(hidden_size=0, kernel_size=3)
+    with pytest.raises(ValueError, match="hidden_size/kernel_size"):
+        LivConv1d(hidden_size=4, kernel_size=0)
+
+
+def test_plain_short_conv_when_liv_disabled():
+    from memory_machines.models.blocks.causal_conv1d import ShortConvolution
+    from memory_machines.models.blocks.gdn2 import GatedDeltaNet2Mixer
+
+    mixer = GatedDeltaNet2Mixer(_cfg(), liv_conv=False).eval()
+    layer = mixer.layer
+    assert isinstance(layer.q_conv1d, ShortConvolution)
+    assert isinstance(layer.v_conv1d, ShortConvolution)
+    with torch.no_grad():
+        out, _, _ = mixer(torch.randn(1, 4, 16))
+    assert tuple(out.shape) == (1, 4, 16)
+
+
+def test_liv_conv_starts_as_identity():
+    from memory_machines.models.blocks.gdn2 import LivConv1d
+
+    conv = LivConv1d(hidden_size=6, kernel_size=3).eval()
+    x = torch.randn(2, 5, 6)
+    with torch.no_grad():
+        y, _ = conv(x)
+    torch.testing.assert_close(y, x)
+
+
+def _randomize_liv_conv(conv) -> None:
+    with torch.no_grad():
+        for p in (conv.input_projection.weight, conv.input_projection.bias, conv.output_projection.weight, conv.conv.weight):
+            torch.nn.init.normal_(p, std=0.3)
+
+
+def test_liv_conv_cache_decode_matches_full_forward():
+    from memory_machines.models.blocks.gdn2 import LivConv1d
+
+    torch.manual_seed(3)
+    conv = LivConv1d(hidden_size=6, kernel_size=3).double().eval()
+    _randomize_liv_conv(conv)
+    x = torch.randn(1, 7, 6, dtype=torch.float64)
+    with torch.no_grad():
+        full, _ = conv(x)
+        head, state = conv(x[:, :4], output_final_state=True)
+        tail, _ = conv(x[:, 4:], cache=state, output_final_state=True)
+    torch.testing.assert_close(torch.cat([head, tail], dim=1), full, atol=1e-10, rtol=1e-10)
+
+
+def test_reset_parameters_restores_liv_conv_identity():
+    from memory_machines.models.blocks.gdn2 import GatedDeltaNet2Mixer
+
+    torch.manual_seed(4)
+    mixer = GatedDeltaNet2Mixer(_cfg()).eval()
+    layer = mixer.layer
+    for conv in (layer.q_conv1d, layer.k_conv1d, layer.v_conv1d):
+        _randomize_liv_conv(conv)
+    mixer.reset_parameters()
+    for conv in (layer.q_conv1d, layer.k_conv1d, layer.v_conv1d):
+        x = torch.randn(2, 5, conv.hidden_size)
+        with torch.no_grad():
+            y, _ = conv(x)
+        torch.testing.assert_close(y, x)
+
+
+def test_liv_conv_block_cache_decode_matches_full_forward():
+    from memory_machines.models.blocks.gdn2 import GatedDeltaNet2Mixer
+
+    torch.manual_seed(5)
+    mixer = GatedDeltaNet2Mixer(_cfg()).eval()
+    layer = mixer.layer
+    for conv in (layer.q_conv1d, layer.k_conv1d, layer.v_conv1d):
+        _randomize_liv_conv(conv)
+    x = torch.randn(1, 7, 16)
+    with torch.no_grad():
+        full, _, _ = mixer(x)
+        head, _, state = mixer(x[:, :4], use_cache=True)
+        assert state is not None
+        tail, _, _ = mixer(x[:, 4:], past_key_values=state)
+    torch.testing.assert_close(torch.cat([head, tail], dim=1), full, atol=1e-5, rtol=1e-5)

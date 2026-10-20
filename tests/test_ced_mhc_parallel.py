@@ -427,6 +427,20 @@ def test_gdn2_conv_bias_is_config_controlled():
     assert layer.q_conv1d.bias is not None  # pyrefly: ignore
 
 
+def test_gdn2_liv_conv_is_config_controlled():
+    from memory_machines.models.blocks.causal_conv1d import ShortConvolution
+    from memory_machines.models.blocks.gdn2 import LivConv1d
+
+    live = MHCAttentionGDN2(_cfg()).gdn2.layer
+    assert isinstance(live.q_conv1d, LivConv1d)
+    assert isinstance(live.k_conv1d, LivConv1d)
+    assert isinstance(live.v_conv1d, LivConv1d)
+
+    plain = MHCAttentionGDN2(replace(_cfg(), ced_gdn2_liv_conv=False)).gdn2.layer
+    assert isinstance(plain.q_conv1d, ShortConvolution)
+    assert isinstance(plain.v_conv1d, ShortConvolution)
+
+
 def test_engram_conv_kernel_size_is_config_controlled():
     engram = EngramMemory(replace(_cfg(), engram_use_conv=True, engram_conv_kernel_size=6))
     assert engram.conv is not None
