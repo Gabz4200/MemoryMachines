@@ -131,26 +131,43 @@ class MemoryMachineConfig:
         ced_num_encoder_layers: Bottom-half encoder layers L/2 (V4.1: 20)
         ced_num_decoder_layers: Top-half decoder layers L/2 (V4.1: 20)
         ced_attention_gdn2_parallel: Build each CED *encoder* layer as
-            parallel attention ∥ MultiHead GDN-2 branches routed by
-            Single-Pass mHC (mHC streams persist between adjacent encoder
-            layers). The decoder stays plain CSA2: GDN-2 reaches it only
+            parallel attention ∥ memory-mixer branches (GDN-2 by default),
+            fused by a ``2d -> d`` down-projection over one shared pre-norm.
+            The decoder stays plain CSA2: the memory branch reaches it only
             indirectly, through the encoder's global KV (Eq. 1). Default:
             True.
         ced_encoder_alternating: In the CED encoder, alternate between
             parallel Attention ∥ GDN-2 (even layers) and parallel
-            Attention ∥ SelfReferentialTitans (odd layers) mixed by mHC.
-            Default: True.
+            Attention ∥ SelfReferentialTitans (odd layers). Default: True.
         ced_attention_variant: MultiHead SWA variant for the encoder
             attention branch: ``dense`` (GroupedQueryAttention),
             ``compressed``, ``compressed_sparse`` (default), or
             ``heavily_compressed``. Each maps to its own sliding window
             (``window_size`` / ``window_size_compressed`` /
             ``window_size_sparse`` / ``window_size_shared``).
+        ced_encoder_first_window_size: Window of the first CED encoder
+            layer's attention branch, in *tokens*. The first encoder layer is
+            uncompressed, non-sparse sliding-window attention (no CSA2
+            compression or indexer) and is the encoder's smallest window;
+            later layers use ``ced_attention_variant`` (default CSA2, whose
+            window is in compressed tokens, i.e.
+            ``window_size_sparse * csa_encoder_compression_ratio`` tokens).
+            ``0`` uses ``window_size``. Global context comes from
+            the parallel memory branch, not from a wider window. Default:
+            ``0``.
+        ced_encoder_norm: Pre-norm kind for the encoder parallel block
+            (the norm fed to both branches). One of ``"rmsnorm"``,
+            ``"layernorm"``, or ``"dyT"``. Default: ``"dyT"``.
         ced_encoder_ffn: Dense FFN kind for every CED *encoder* layer
-            (currently ``"swiglu"``). Configured independently of the decoder
-            so the two halves may use different FFNs. Default: ``"swiglu"``.
+            (``"swiglu"`` or ``"classic_mlp"``). Configured independently of
+            the decoder so the two halves may use different FFNs. Default:
+            ``"swiglu"``.
         ced_decoder_ffn: Dense FFN kind for every CED *decoder* layer
-            (currently ``"swiglu"``). Default: ``"swiglu"``.
+            (``"swiglu"`` or ``"classic_mlp"``). Default: ``"swiglu"``.
+        ced_encoder_ffn_norm: Pre-norm kind for every CED encoder FFN
+            (``"rmsnorm"``, ``"layernorm"``, or ``"dyT"``). Default: ``"dyT"``.
+        ced_decoder_ffn_norm: Pre-norm kind for every CED decoder FFN
+            (``"rmsnorm"``, ``"layernorm"``, or ``"dyT"``). Default: ``"dyT"``.
         ced_encoder_ffn_intermediate_size: Encoder FFN hidden width; ``0``
             means the shared ``intermediate_size``. Default: ``0``.
         ced_decoder_ffn_intermediate_size: Decoder FFN hidden width; ``0``
@@ -313,8 +330,12 @@ class MemoryMachineConfig:
     ced_attention_gdn2_parallel: bool = True
     ced_encoder_alternating: bool = True
     ced_attention_variant: str = "compressed_sparse"
+    ced_encoder_first_window_size: int = 0
+    ced_encoder_norm: str = "dyT"
     ced_encoder_ffn: str = "swiglu"
     ced_decoder_ffn: str = "swiglu"
+    ced_encoder_ffn_norm: str = "dyT"
+    ced_decoder_ffn_norm: str = "dyT"
     ced_encoder_ffn_intermediate_size: int = 0
     ced_decoder_ffn_intermediate_size: int = 0
     ced_encoder_ffn_update_intervals: tuple[int, ...] = ()
@@ -458,10 +479,18 @@ class MemoryMachineConfig:
             raise ValueError(f"ced_num_encoder_layers ({self.ced_num_encoder_layers}) must be non-negative")
         if self.ced_num_decoder_layers < 0:
             raise ValueError(f"ced_num_decoder_layers ({self.ced_num_decoder_layers}) must be non-negative")
-        if self.ced_encoder_ffn not in ("swiglu",):
-            raise ValueError(f"ced_encoder_ffn ({self.ced_encoder_ffn!r}) must be 'swiglu'")
-        if self.ced_decoder_ffn not in ("swiglu",):
-            raise ValueError(f"ced_decoder_ffn ({self.ced_decoder_ffn!r}) must be 'swiglu'")
+        if self.ced_encoder_ffn not in ("swiglu", "classic_mlp"):
+            raise ValueError(f"ced_encoder_ffn ({self.ced_encoder_ffn!r}) must be 'swiglu' or 'classic_mlp'")
+        if self.ced_decoder_ffn not in ("swiglu", "classic_mlp"):
+            raise ValueError(f"ced_decoder_ffn ({self.ced_decoder_ffn!r}) must be 'swiglu' or 'classic_mlp'")
+        if self.ced_encoder_first_window_size < 0:
+            raise ValueError(f"ced_encoder_first_window_size ({self.ced_encoder_first_window_size}) must be non-negative (0 = window_size)")
+        if self.ced_encoder_norm not in ("rmsnorm", "layernorm", "dyT"):
+            raise ValueError(f"ced_encoder_norm ({self.ced_encoder_norm!r}) must be one of 'rmsnorm', 'layernorm', 'dyT'")
+        if self.ced_encoder_ffn_norm not in ("rmsnorm", "layernorm", "dyT"):
+            raise ValueError(f"ced_encoder_ffn_norm ({self.ced_encoder_ffn_norm!r}) must be one of 'rmsnorm', 'layernorm', 'dyT'")
+        if self.ced_decoder_ffn_norm not in ("rmsnorm", "layernorm", "dyT"):
+            raise ValueError(f"ced_decoder_ffn_norm ({self.ced_decoder_ffn_norm!r}) must be one of 'rmsnorm', 'layernorm', 'dyT'")
         if self.ced_encoder_ffn_intermediate_size < 0:
             raise ValueError(f"ced_encoder_ffn_intermediate_size ({self.ced_encoder_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
         if self.ced_decoder_ffn_intermediate_size < 0:

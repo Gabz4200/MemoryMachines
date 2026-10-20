@@ -14,7 +14,7 @@ from memory_machines.models.blocks import (
     CEDGlobalKVProjection,
     CompressedSparseAttention,
     CompressedSparseAttention2,
-    MHCAttentionGDN2,
+    ParallelAttentionGDN2,
 )
 from memory_machines.models.blocks.shared import CompressedCache, CSA2SharedState
 from tests.test_blocks_shapes import tiny_cfg
@@ -25,8 +25,8 @@ DH = 8
 
 
 def _csa_branch(layer):
-    """Reach the CSA2 attention branch of a CED layer (parallel mHC or plain)."""
-    return layer.attention if isinstance(layer, MHCAttentionGDN2) else layer
+    """Reach the CSA2 attention branch of a CED layer (parallel hybrid or plain)."""
+    return layer.attention if isinstance(layer, ParallelAttentionGDN2) else layer
 
 
 def _csa(**kw) -> CompressedSparseAttention:
@@ -439,10 +439,11 @@ def test_reuse_q_len_2_expands_last_row():
 
 
 def test_encoder_reuse_and_empty_layers():
-    cfg = _ced_cfg(ced_num_encoder_layers=2)
+    cfg = _ced_cfg(ced_num_encoder_layers=3)
     torch.manual_seed(0)
     stack = CausalEncoderDecoderStack(cfg).eval()
-    assert [str(getattr(layer, "mode", "")) for layer in stack.encoder_layers] == ["full", "reuse"]
+    # Layer 0 is plain SWA, then the first CSA2 layer seeds the store.
+    assert [layer.mode for layer in stack.encoder_layers] == [None, "full", "reuse"]
     torch.manual_seed(1)
     with torch.no_grad():
         out, shared = stack.encode(torch.randn(1, 8, H))
@@ -451,3 +452,29 @@ def test_encoder_reuse_and_empty_layers():
     empty = CausalEncoderDecoderStack(cfg, encoder_layers=[])
     with pytest.raises(ValueError, match="empty"), torch.no_grad():
         empty.encode(torch.randn(1, 8, H))
+
+
+def test_explicit_encoder_layers_bypass_config_building():
+    cfg = _ced_cfg(ced_num_encoder_layers=2)
+    explicit: list[nn.Module] = [CompressedSparseAttention2(cfg, cfg.csa_encoder_compression_ratio, "full")]
+    stack = CausalEncoderDecoderStack(cfg, encoder_layers=explicit).eval()
+    assert len(stack.encoder_layers) == len(stack.encoder_ffns) == 1
+    assert type(stack.encoder_layers[0]) is CompressedSparseAttention2
+    with torch.no_grad():
+        out, shared = stack.encode(torch.randn(1, 8, H))
+    assert tuple(out.shape) == (1, 8, H)
+    assert shared.compressed_kv is not None
+
+
+def test_stack_encode_rejects_a_wrong_typed_encoder_layer():
+    cfg = _ced_cfg()
+    stack = CausalEncoderDecoderStack(cfg, encoder_layers=[nn.Linear(H, H)])
+    with pytest.raises(TypeError, match="CompressedSparseAttention2 or ParallelAttentionGDN2"), torch.no_grad():
+        stack.encode(torch.randn(1, 4, H))
+
+
+def test_explicit_encoder_layers_intervals_must_match_the_explicit_count():
+    cfg = _ced_cfg(ced_num_encoder_layers=2, ced_encoder_ffn_update_intervals=(1, 2))
+    explicit: list[nn.Module] = [CompressedSparseAttention2(cfg, cfg.csa_encoder_compression_ratio, "full")]
+    with pytest.raises(ValueError, match="must equal number of encoder layers"):
+        CausalEncoderDecoderStack(cfg, encoder_layers=explicit)

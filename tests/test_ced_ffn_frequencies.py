@@ -8,6 +8,7 @@ at specific steps otherwise.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -226,3 +227,37 @@ def test_default_config_preserves_exact_output() -> None:
     out1 = stack1.decode_full_context(y, enc1)
     out2 = stack2.decode_full_context(y, enc2)
     torch.testing.assert_close(out1, out2, atol=1e-4, rtol=1e-4)
+
+
+def test_encoder_ffn_step_counter_is_the_layer_index() -> None:
+    """Each encoder FFN is called with its own block index, not a constant."""
+    cfg = _ced_cfg(ced_encoder_ffn_update_intervals=(1, 2))
+    stack = CausalEncoderDecoderStack(cfg).eval()
+    steps: list[int] = []
+    for ffn in cast("list[DenseFFN]", list(stack.encoder_ffns)):
+        original = ffn.forward
+
+        def spy(hidden_states: torch.Tensor, step: int = 0, _original=original) -> torch.Tensor:
+            steps.append(step)
+            return _original(hidden_states, step=step)
+
+        ffn.forward = spy  # type: ignore[method-assign]
+    with torch.no_grad():
+        stack.encode(torch.randn(1, 6, cfg.hidden_size))
+    assert steps == [0, 1]
+
+
+def test_ffn_update_interval_guards_fire_at_config_construction() -> None:
+    """``__post_init__`` rejects bad intervals before any model is built."""
+    with pytest.raises(ValueError, match="ced_encoder_ffn_update_intervals"):
+        replace(tiny_cfg(), ced_num_encoder_layers=2, ced_encoder_ffn_update_intervals=(1,))
+    with pytest.raises(ValueError, match="ced_encoder_ffn_update_intervals"):
+        replace(tiny_cfg(), ced_num_encoder_layers=2, ced_encoder_ffn_update_intervals=(1, 0))
+    # The looped decoder shares one layer, so it takes exactly one interval.
+    with pytest.raises(ValueError, match="ced_decoder_ffn_update_intervals"):
+        replace(
+            tiny_cfg(),
+            ced_num_decoder_layers=3,
+            ced_decoder_looping=True,
+            ced_decoder_ffn_update_intervals=(1, 1),
+        )

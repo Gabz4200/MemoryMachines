@@ -1,10 +1,10 @@
 """Direct coverage for :meth:`SinglePassMHC.mix_input` (the mHC input-mixing step).
 
 ``mix_input`` is the static ``[B, L, 1, n] @ [B, L, n, d] -> [B, L, 1, d]``
-mixer used by ``SinglePassMHC.forward``/``forward_parallel`` and therefore by
-``MHCAttentionGDN2``, but it had no test of its own. These pin the matmul
-contract, the equal-weight stream-mean property, and the coefficient-shape
-guard. No model is constructed (the mixer is a pure staticmethod).
+mixer used by ``SinglePassMHC.forward``/``forward_parallel``. It had no test
+of its own. These pin the matmul contract, the equal-weight stream-mean
+property, and the coefficient-shape guard. No model is constructed (the mixer
+is a pure staticmethod).
 """
 
 import pytest

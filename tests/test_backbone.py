@@ -5,10 +5,17 @@ construction validation, forward shapes, encoding, reset_parameters, tie_word_em
 and invalid-encoder-layer rejection.
 """
 
+from typing import cast
+
 import pytest
 import torch
 
 from memory_machines.models.backbone import CheapLLM, ExampleBackbone
+from memory_machines.models.blocks import (
+    CausalEncoderDecoderStack,
+    GroupedQueryAttention,
+    ParallelAttentionGDN2,
+)
 from memory_machines.models.io import ModelInput
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
@@ -186,3 +193,31 @@ def test_cheapllm_masked_token_positions_independent_of_prompt_length():
         ids = torch.randint(0, cfg.vocab_size, (1, prompt_len))
         out = model(ModelInput(input_ids=ids, num_masked_tokens=2))
         assert tuple(out.logits.shape) == (1, 2, cfg.vocab_size)
+
+
+@pytest.mark.parametrize("explicit_positions", [False, True], ids=["implicit", "explicit"])
+def test_cheapllm_encode_matches_the_stack_encoder_with_shared_layers(explicit_positions: bool) -> None:
+    """``CheapLLM.encode`` and ``CausalEncoderDecoderStack.encode`` share one loop."""
+    cfg = _ced_cfg(ced_num_encoder_layers=2, ced_encoder_alternating=False)
+    torch.manual_seed(0)
+    model = CheapLLM(cfg).eval()
+    stack = CausalEncoderDecoderStack(cfg, encoder_layers=list(model.encoder_layers)).eval()
+    stack.encoder_ffns.load_state_dict(model.encoder_ffns.state_dict())
+    x = torch.randn(1, 7, cfg.hidden_size)
+    pos = torch.arange(7).unsqueeze(0) if explicit_positions else None
+    with torch.no_grad():
+        a, shared_a = model.encode(x, pos)
+        b, shared_b = stack.encode(x, pos)
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+    assert shared_a.total_len == shared_b.total_len
+    assert shared_a.compressed_kv is not None and shared_b.compressed_kv is not None
+    torch.testing.assert_close(shared_a.compressed_kv, shared_b.compressed_kv, atol=0, rtol=0)
+
+
+def test_cheapllm_hybrid_encoder_starts_with_plain_swa_then_seeds_the_store() -> None:
+    cfg = _ced_cfg(ced_num_encoder_layers=3, ced_encoder_alternating=False)
+    model = CheapLLM(cfg)
+    assert [layer.mode for layer in model.encoder_layers] == [None, "full", "reuse"]
+    first = cast("ParallelAttentionGDN2", model.encoder_layers[0])
+    assert type(getattr(first.attention, "inner", None)) is GroupedQueryAttention
+    assert len(model.encoder_ffns) == 3

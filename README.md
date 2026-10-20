@@ -99,9 +99,16 @@ message rather than blowing up deep inside a layer. Notable knobs:
 - **Attention**: `ced_attention_variant` (`dense` / `compressed` /
   `compressed_sparse` / `heavily_compressed`), sliding-window sizes, CSA2
   compression ratios, top-K, hierarchical indexer pool.
-- **Encoder**: parallel attention ∥ GDN-2 via Single-Pass mHC
-  (`ced_attention_gdn2_parallel`, default on). GDN-2 mixes the full encoder
-  sequence — never windowed.
+- **Encoder**: parallel attention ∥ memory mixer (GDN-2, or Titans on
+  alternating layers) behind one pre-norm, fused by a `2d -> d` down-projection
+  (`ced_attention_gdn2_parallel`, default on). Layer 0's attention branch is
+  plain (uncompressed, non-sparse) SWA with the encoder's smallest window
+  (`ced_encoder_first_window_size`, default `window_size`); later layers run
+  CSA2 (`ced_attention_variant`). The memory branch mixes the full encoder
+  sequence — never windowed — so it supplies global context instead of a
+  widened attention window. Pre-norm and FFN kind/norm are configurable
+  (`ced_encoder_norm`, `ced_encoder_ffn`, `ced_encoder_ffn_norm`; defaults DyT,
+  SwiGLU, DyT).
 - **Decoder**: always plain CSA2, inherits global context through the encoder's
   KV (Eq. 1). Optional Looped Language Model mode
   (`ced_decoder_looping`) with per-position Q-exit.

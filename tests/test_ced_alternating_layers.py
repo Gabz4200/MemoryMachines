@@ -1,23 +1,25 @@
-"""Alternating GDN-2 / SelfReferentialTitans encoder layers under single-pass mHC.
+"""Alternating GDN-2 / SelfReferentialTitans encoder layers.
 
 Covers:
 - ``CausalEncoderDecoderStack`` builds alternating
-  ``MHCAttentionGDN2`` / ``MHCAttentionTitan`` layers when
+  ``ParallelAttentionGDN2`` / ``ParallelAttentionTitan`` layers when
   ``ced_encoder_alternating=True`` (even -> GDN-2, odd -> Titan).
 - ``ced_encoder_alternating=False`` recovers the all-GDN-2 stack.
-- The mHC mix property holds: single-pass routing coefficients are threaded
-  between adjacent blocks and the output shape is unchanged.
+- Output shapes are unchanged and the residual stream is threaded normally.
 - Titan chunkwise / recurrent backends both run end-to-end through the stack.
 """
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 
-from memory_machines.models.blocks import MHCAttentionTitan
+from memory_machines.models.blocks import CompressedSparseAttention2, ParallelAttentionTitan
+from memory_machines.models.blocks.attention import GroupedQueryAttention
 from memory_machines.models.blocks.ced import CausalEncoderDecoderStack
-from memory_machines.models.blocks.mhc_parallel import MHCAttentionGDN2
+from memory_machines.models.blocks.parallel_hybrid import ParallelAttentionGDN2
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 _BASE_KWARGS = {
@@ -40,17 +42,17 @@ def _base_kwargs(num_encoder_layers: int = 4) -> dict:
 def test_alternating_layers_default() -> None:
     cfg = MemoryMachineConfig(**_base_kwargs())
     stack = CausalEncoderDecoderStack(cfg)
-    assert isinstance(stack.encoder_layers[0], MHCAttentionGDN2)
-    assert isinstance(stack.encoder_layers[1], MHCAttentionTitan)
-    assert isinstance(stack.encoder_layers[2], MHCAttentionGDN2)
-    assert isinstance(stack.encoder_layers[3], MHCAttentionTitan)
+    assert isinstance(stack.encoder_layers[0], ParallelAttentionGDN2)
+    assert isinstance(stack.encoder_layers[1], ParallelAttentionTitan)
+    assert isinstance(stack.encoder_layers[2], ParallelAttentionGDN2)
+    assert isinstance(stack.encoder_layers[3], ParallelAttentionTitan)
 
 
 def test_alternating_disabled_all_gdn2() -> None:
     cfg = MemoryMachineConfig(**_base_kwargs(), ced_encoder_alternating=False)
     stack = CausalEncoderDecoderStack(cfg)
-    assert all(isinstance(l, MHCAttentionGDN2) for l in stack.encoder_layers)
-    assert not any(isinstance(l, MHCAttentionTitan) for l in stack.encoder_layers)
+    assert all(isinstance(layer, ParallelAttentionGDN2) for layer in stack.encoder_layers)
+    assert not any(isinstance(layer, ParallelAttentionTitan) for layer in stack.encoder_layers)
 
 
 def test_encode_alternating_runs() -> None:
@@ -96,11 +98,11 @@ def test_encode_alternating_titan_qk_projection() -> None:
 
 
 def test_titan_is_exported_from_blocks_package() -> None:
-    """MHCAttentionTitan is part of the public memory_machines.models.blocks API."""
+    """ParallelAttentionTitan is part of the public memory_machines.models.blocks API."""
     from memory_machines.models import blocks
 
-    assert blocks.MHCAttentionTitan is MHCAttentionTitan
-    assert "MHCAttentionTitan" in blocks.__all__
+    assert blocks.ParallelAttentionTitan is ParallelAttentionTitan
+    assert "ParallelAttentionTitan" in blocks.__all__
 
 
 def test_full_stack_alternating_decode() -> None:
@@ -116,7 +118,7 @@ def test_single_layer_alternating() -> None:
     cfg = MemoryMachineConfig(**_base_kwargs(num_encoder_layers=1))
     stack = CausalEncoderDecoderStack(cfg)
     # Even index 0 is always GDN-2.
-    assert isinstance(stack.encoder_layers[0], MHCAttentionGDN2)
+    assert isinstance(stack.encoder_layers[0], ParallelAttentionGDN2)
     enc = torch.randn(1, 6, 32)
     out, _ = stack.encode(enc)
     assert out.shape == enc.shape
@@ -125,20 +127,20 @@ def test_single_layer_alternating() -> None:
 def test_two_layers_alternating() -> None:
     cfg = MemoryMachineConfig(**_base_kwargs(num_encoder_layers=2))
     stack = CausalEncoderDecoderStack(cfg)
-    assert isinstance(stack.encoder_layers[0], MHCAttentionGDN2)
-    assert isinstance(stack.encoder_layers[1], MHCAttentionTitan)
+    assert isinstance(stack.encoder_layers[0], ParallelAttentionGDN2)
+    assert isinstance(stack.encoder_layers[1], ParallelAttentionTitan)
     enc = torch.randn(1, 6, 32)
     out, _ = stack.encode(enc)
     assert out.shape == enc.shape
 
 
-def test_backward_compatibility_isinstance() -> None:
-    """Existing isinstance(layer, MHCAttentionGDN2) checks still hold."""
+def test_titan_isinstance_of_gdn2_block() -> None:
+    """Existing isinstance(layer, ParallelAttentionGDN2) checks still hold."""
     cfg = MemoryMachineConfig(**_base_kwargs())
     stack = CausalEncoderDecoderStack(cfg)
     titan = stack.encoder_layers[1]
-    assert isinstance(titan, MHCAttentionGDN2)
-    assert isinstance(titan, MHCAttentionTitan)
+    assert isinstance(titan, ParallelAttentionGDN2)
+    assert isinstance(titan, ParallelAttentionTitan)
 
 
 def test_gradient_flow_through_alternating_stack() -> None:
@@ -149,3 +151,23 @@ def test_gradient_flow_through_alternating_stack() -> None:
     out.sum().backward()
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
+
+
+def _attention_branch(layer):
+    """Unwrap the shared-state adapter to reach the attention variant."""
+    attention = getattr(layer, "attention", layer)
+    return getattr(attention, "inner", attention)
+
+
+def test_alternating_layers_keep_the_dense_first_window_and_the_csa2_variant() -> None:
+    cfg = MemoryMachineConfig(**_base_kwargs(num_encoder_layers=4), ced_encoder_first_window_size=3)
+    stack = CausalEncoderDecoderStack(cfg)
+    assert [layer.mode for layer in stack.encoder_layers] == [None, "full", "reuse", "reuse"]
+    first = cast("GroupedQueryAttention", _attention_branch(stack.encoder_layers[0]))
+    assert type(first) is GroupedQueryAttention
+    assert first.window_size == 3
+    titan = stack.encoder_layers[1]
+    assert isinstance(titan, ParallelAttentionTitan)
+    titan_branch = cast("CompressedSparseAttention2", _attention_branch(titan))
+    assert isinstance(titan_branch, CompressedSparseAttention2)
+    assert titan_branch.window_size == cfg.window_size_sparse

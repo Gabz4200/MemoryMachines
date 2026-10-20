@@ -1,23 +1,32 @@
-r"""Parallel attention ∥ GDN-2 token mixer routed by Single-Pass mHC.
+r"""Parallel attention ∥ memory mixer encoder block.
 
-:class:`MHCAttentionGDN2` is a drop-in CED layer that runs a
-:class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`
-attention branch and a
-:class:`~memory_machines.models.blocks.gdn2.GatedDeltaNet2Mixer` branch in
-parallel, routed by :class:`~memory_machines.models.blocks.memory.SinglePassMHC`.
-
-Following single-pass mHC (DeepSeek-V4.1, §2.4.1 Eq. 6) generalized to two
-branches, the ``n`` residual streams ``X_l`` persist between adjacent blocks
-and are routed per branch:
+:class:`ParallelAttentionGDN2` is a drop-in CED encoder layer with the
+architecture:
 
 .. math::
-    X_{l+1} = B_l X_l + C^{a}_l F_a(A^{a}_{l-1} X_l) + C^{g}_l F_g(A^{g}_{l-1} X_l)
+    h &= \mathrm{PreNorm}(X) \\
+    Z &= W_O [\mathrm{Attn}(h) \,\|\, \mathrm{Memory}(h)] \\
+    X' &= X + Z \\
 
-where ``F_a`` is attention, ``F_g`` is GDN-2, ``A^{a}``/``A^{g}`` are the two
-Sinkhorn/mHC-parameterized read-outs that route the streams each branch needs,
-and ``B`` is the shared doubly-stochastic residual mapping. The stack expands
-the input into streams once (:func:`to_streams`) and collapses the final
-streams with a mean (:func:`from_streams`).
+The pre-norm is configurable (``config.ced_encoder_norm``, default ``dyT``)
+and feeds both branches from the *same* normalized representation. The two
+branch outputs, each already in model width ``d`` after its own MultiHead
+output projection, are concatenated to ``2d`` and mixed back to ``d`` by one
+down-projection ``W_O``. That projection is the only place the two branches
+interact: the attention branch keeps its local sliding window and the memory
+branch (GDN-2, or Titans on alternating layers) mixes the full sequence. The
+CED encoder builds layer 0 with a plain, uncompressed and non-sparse SWA
+attention branch (``variant="dense"``) and every later layer with the
+configured attention variant.
+
+At step 0 ``W_O`` starts with its attention half at standard scale and its
+memory half near zero, so the block begins as a standard attention block and
+lets the memory branch grow in without an initial gradient spike.
+
+The dense FFN sub-layer stays a separate :class:`~memory_machines.models.blocks.ffn.DenseFFN`
+(after the block, as in the rest of the CED stack), so the full layer is
+``X + W_O([Attn(h) || Memory(h)])`` followed by the FFN's own pre-norm
+residual.
 """
 
 from __future__ import annotations
@@ -29,12 +38,12 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .attention import GroupedQueryAttention
 from .fast_weights import SelfReferentialTitanMixer
+from .ffn import build_norm
 from .gdn2 import GatedDeltaNet2Mixer
-from .memory import SinglePassMHC
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention, CompressedSparseAttention2, HeavilyCompressedAttention
 
-__all__ = ["MHCAttentionGDN2", "MHCAttentionTitan", "from_streams", "to_streams"]
+__all__ = ["ParallelAttentionGDN2", "ParallelAttentionTitan"]
 
 
 # variant -> (config window attribute, builder). Each attention variant is
@@ -103,90 +112,43 @@ class _SharedStateAdapter(nn.Module):
         return out, shared
 
 
-def to_streams(x: torch.Tensor, num_streams: int) -> torch.Tensor:
-    r"""to_streams(x, num_streams) -> Tensor
+class ParallelAttentionGDN2(nn.Module):
+    r"""ParallelAttentionGDN2(config, compression_ratio=None, mode="full", top_k=None, variant=None, window_size=None, memory_init_scale=1e-3)
 
-    Expand a hidden state ``(B, L, d)`` into ``n`` identical residual streams
-    ``(B, L, n, d)`` (mHC residual-stream replication).
+    Parallel attention ∥ MultiHead memory mixer with a fused down-projection.
 
-    **Aliasing contract (read before any in-place op):** the returned tensor is
-    ``x.unsqueeze(2).expand(...)`` — every stream is the *same* storage, so the
-    streams alias the input. This is safe *only* because recombination
-    (:func:`combine_parallel`) writes the residual back through a
-    doubly-stochastic (Sinkhorn) mixing matrix ``b``: the write is a convex
-    combination of the streams, so it is numerically stable and does not
-    double-count. Any in-place op on one stream (a future GDN-2 state update,
-    a masked-write, a chunked accumulation) would corrupt **all** streams —
-    materialize with ``.contiguous()`` or ``.clone()`` before mutating. The
-    streams are collapsed with a mean by :func:`from_streams`, which averages
-    the (aliased) storage back to a single stream.
-
-    Examples::
-
-        >>> to_streams(torch.randn(1, 4, 8), 2).shape
-        torch.Size([1, 4, 2, 8])
-    """
-    if x.dim() != 3:
-        raise ValueError(f"x must be [B, L, d], got {tuple(x.shape)}")
-    return x.unsqueeze(2).expand(x.shape[0], x.shape[1], num_streams, x.shape[2])
-
-
-def from_streams(streams: torch.Tensor) -> torch.Tensor:
-    r"""from_streams(streams) -> Tensor
-
-    Collapse ``n`` streams ``(B, L, n, d)`` to a hidden state ``(B, L, d)`` by
-    averaging (the mHC read-out preserves the stream mean).
-
-    Examples::
-
-        >>> from_streams(torch.randn(1, 4, 2, 8)).shape
-        torch.Size([1, 4, 8])
-    """
-    if streams.dim() != 4:
-        raise ValueError(f"streams must be [B, L, n, d], got {tuple(streams.shape)}")
-    return streams.mean(dim=2)
-
-
-class MHCAttentionGDN2(nn.Module):
-    r"""MHCAttentionGDN2(config, compression_ratio=None, mode="full", top_k=None, variant=None, window_size=None)
-
-    Parallel attention ∥ MultiHead GDN-2 encoder layer routed by Single-Pass mHC.
-
-    Operates on mHC residual streams ``(B, L, n, d)``. Each call computes the
-    two-branch coefficients, routes the streams into an attention branch input
-    ``A^{a} X`` and a GDN-2 branch input ``A^{g} X`` (single-pass mHC: the
-    previous block's ``A``, falling back to the current block's for the first
-    block), runs both branches, then recombines with the shared Sinkhorn
-    residual mapping and per-branch output scales:
+    Each call normalizes the input once (``config.ced_encoder_norm``, default
+    ``dyT``), runs a MultiHead sliding-window attention branch and a MultiHead
+    memory branch (GDN-2 here) on that same normalized representation,
+    concatenates their ``d``-wide outputs to ``2d``, projects them back to
+    ``d`` with :attr:`out_proj`, and adds the input residual:
 
     .. math::
-        X_{l+1} = B_l X_l + C^{a}_l F_a(A^{a}_{l-1} X_l) + C^{g}_l F_g(A^{g}_{l-1} X_l)
+        h = \mathrm{norm}(X), \quad
+        X' = X + W_O [F_a(h) \,\|\, F_g(h)]
 
-    ``F_a`` is a MultiHead sliding-window attention variant (see
-    ``config.ced_attention_variant``); ``F_g`` is a full
+    ``F_a`` is the attention variant selected by
+    ``config.ced_attention_variant``; ``F_g`` is a full
     :class:`~memory_machines.models.blocks.gdn2.GatedDeltaNet2Mixer`. Both
-    branches are MultiHead; the attention branch runs its variant's own
-    sliding window (``dense`` → ``window_size``, ``compressed`` →
-    ``window_size_compressed``, ``compressed_sparse`` → ``window_size_sparse``,
-    ``heavily_compressed`` → ``window_size_shared``).
+    branches are MultiHead with their own input and output projections, so the
+    down-projection only mixes the two branch outputs.
 
-    The GDN-2 branch is the block's *global* mixer: it consumes the whole
-    sequence in input order and is never windowed, so the attention branch is
-    free to focus its precision on a window. Which reference form performs
-    that global mixing is selected by ``config.ced_gdn2_backend``
+    The memory branch is the block's *global* mixer: it consumes the whole
+    sequence in input order and is never windowed. Which reference form
+    performs that global mixing is selected by ``config.ced_gdn2_backend``
     (``naive``/``recurrent`` for inference, ``chunk``/``wy_fast`` for a
     training-only speed-up); the form never changes the sequence span.
 
     This block is an *encoder* layer. The decoder stays plain CSA2 and sees
-    GDN-2 only indirectly, through the encoder's global KV (Eq. 1).
+    the memory branch only indirectly, through the encoder's global KV (Eq. 1).
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
-            provides ``hidden_size``, head counts, ``mhc_num_streams``,
-            ``mhc_sinkhorn_iters``, ``rms_norm_eps``, ``conv_kernel_size``, the
+            provides ``hidden_size``, head counts, ``ced_encoder_norm``,
+            ``rms_norm_eps``, ``conv_kernel_size``, the
             ``ced_attention_variant``/``window_size*`` SWA configuration, the
-            ``ced_gdn2_backend``/``ced_gdn2_chunk_size`` GDN-2 form, and
-            the ``csa_*`` sparse-attention hyperparameters.
+            ``ced_gdn2_backend``/``ced_gdn2_chunk_size`` GDN-2 form, and the
+            ``csa_*`` sparse-attention hyperparameters.
         compression_ratio (int, optional): attention block size ``m``. Default:
             ``None`` (falls back to ``config.csa_compression_ratio``).
         mode (str, optional): CSA2 sharing mode (``full``/``reindex``/``reuse``,
@@ -196,18 +158,19 @@ class MHCAttentionGDN2(nn.Module):
             ``config.ced_attention_variant``. Default: ``None``.
         window_size (int, optional): attention SWA width, in compressed tokens;
             overrides the variant's config window. Default: ``None``.
+        memory_init_scale (float, optional): std of the memory half of
+            :attr:`out_proj` at init; the attention half keeps standard
+            trunc-normal init. Default: ``1e-3``.
 
     Examples::
 
         >>> from memory_machines.utils.config_schema import MemoryMachineConfig
         >>> cfg = MemoryMachineConfig(hidden_size=32, num_attention_heads=4,
-        ...     num_key_value_heads=2, csa_top_k=4, csa_num_output_groups=4,
-        ...     mhc_num_streams=2)
-        >>> block = MHCAttentionGDN2(cfg)
-        >>> streams = to_streams(torch.randn(1, 8, 32), 2)
-        >>> out, shared, a = block.forward_shared(streams)
-        >>> out.shape, a.shape
-        (torch.Size([1, 8, 2, 32]), torch.Size([1, 8, 2, 2]))
+        ...     num_key_value_heads=2, csa_top_k=4, csa_num_output_groups=4)
+        >>> block = ParallelAttentionGDN2(cfg)
+        >>> out, shared = block.forward_shared(torch.randn(1, 8, 32))
+        >>> out.shape
+        torch.Size([1, 8, 32])
     """
 
     def __init__(
@@ -218,14 +181,18 @@ class MHCAttentionGDN2(nn.Module):
         top_k: int | None = None,
         variant: str | None = None,
         window_size: int | None = None,
+        memory_init_scale: float = 1e-3,
     ):
         super().__init__()
-        self.num_streams = config.mhc_num_streams
+        self.hidden_size = config.hidden_size
+        self.initializer_range: float = config.initializer_range
         self.attention_variant = variant if variant is not None else config.ced_attention_variant
         resolved_window = window_size if window_size is not None else getattr(config, _variant_window_attr(self.attention_variant))
+        self.norm = build_norm(config.ced_encoder_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.attention = _build_attention(self.attention_variant, config, compression_ratio, mode, top_k, resolved_window)
         self.gdn2: GatedDeltaNet2Mixer | SelfReferentialTitanMixer = self._build_branch(config)
-        self.mhc = SinglePassMHC(config, parallel_branches=True)
+        self.memory_init_scale = memory_init_scale
+        self.out_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.reset_parameters()
 
     def _build_branch(self, config: MemoryMachineConfig) -> GatedDeltaNet2Mixer | SelfReferentialTitanMixer:
@@ -262,66 +229,69 @@ class MHCAttentionGDN2(nn.Module):
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None
 
-        Re-applies the attention, GDN-2 and mHC inits so a freshly built
-        block starts from a neutral point (balanced branch fusion, uniform
-        pooling, zero-start outputs).
+        Re-applies the pre-norm, attention, and memory-branch inits, then
+        re-initializes the fused down-projection: standard trunc-normal for
+        the attention half and near-zero for the memory half, so the block
+        starts as a standard attention block.
         """
-        for module in (self.attention, self.gdn2, self.mhc):
+        for module in (self.norm, self.attention, self.gdn2):
             reset = getattr(module, "reset_parameters", None)
             if callable(reset):
                 reset()
+        std = self.initializer_range
+        attention_half = self.out_proj.weight[:, : self.hidden_size]
+        memory_half = self.out_proj.weight[:, self.hidden_size :]
+        nn.init.trunc_normal_(attention_half, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        nn.init.normal_(memory_half, mean=0.0, std=self.memory_init_scale)
 
     def forward_shared(
         self,
-        streams: torch.Tensor,
+        hidden_states: torch.Tensor,
         shared: CSA2SharedState | None = None,
-        prev_a: torch.Tensor | None = None,
+        compress_from: torch.Tensor | None = None,
+        compress_start_pos: int = 0,
         position_ids: torch.Tensor | None = None,
         use_cache: bool = False,
         seeded_store: bool = False,
-        compress_from: torch.Tensor | None = None,
-        compress_start_pos: int = 0,
-    ) -> tuple[torch.Tensor, CSA2SharedState | None, torch.Tensor]:
-        r"""forward_shared(streams, shared=None, prev_a=None, position_ids=None, use_cache=False, seeded_store=False, compress_from=None, compress_start_pos=0) -> (Tensor, CSA2SharedState | None, Tensor)
+    ) -> tuple[torch.Tensor, CSA2SharedState | None]:
+        r"""forward_shared(hidden_states, shared=None, compress_from=None, compress_start_pos=0, position_ids=None, use_cache=False, seeded_store=False) -> (Tensor, CSA2SharedState | None)
 
-        Run one parallel attention ∥ GDN-2 layer on mHC streams.
+        Run one parallel attention ∥ memory layer.
 
-        Routes the streams into the two branches with this block's
-        coefficients (or the previous block's ``prev_a`` for single-pass
-        mHC), runs the attention branch through its
+        Normalizes the input once, routes the normalized representation to
+        both branches, runs the attention branch through its
         :meth:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2.forward_shared`
-        (threading the shared CSA2 state) and the GDN-2 branch
-        independently, then recombines.
+        (threading the shared CSA2 state) and the memory branch independently,
+        concatenates their outputs, and applies the fused down-projection plus
+        input residual.
 
         Args:
-            streams (Tensor): mHC residual streams ``(B, L, n, d)``.
+            hidden_states (Tensor): input ``(B, L, d)``.
             shared (CSA2SharedState, optional): cross-layer CSA2 state. Default: ``None``.
-            prev_a (Tensor, optional): previous block's routing coefficients
-                ``(B, L, 2, n)`` (index 0 attention, 1 GDN-2). ``None`` uses
-                this block's own coefficients. Default: ``None``.
+            compress_from (Tensor, optional): alternate compression source. Default: ``None``.
+            compress_start_pos (int, optional): start position for ``compress_from``. Default: ``0``.
             position_ids (Tensor, optional): absolute positions. Default: ``None``.
             use_cache (bool, optional): CSA2 API parity flag. Default: ``False``.
             seeded_store (bool, optional): pre-built global store (decoder). Default: ``False``.
-            compress_from (Tensor, optional): alternate compression source. Default: ``None``.
-            compress_start_pos (int, optional): start position for ``compress_from``. Default: ``0``.
 
         Returns:
-            Tensor: updated streams ``(B, L, n, d)``, the updated shared state,
-            and this block's ``(a1, a2)`` coefficients ``(B, L, 2, n)`` for the
-            next block.
+            Tensor: outputs ``(B, L, d)`` and the updated shared state.
+
+        Examples::
+
+            >>> from memory_machines.utils.config_schema import MemoryMachineConfig
+            >>> cfg = MemoryMachineConfig(hidden_size=16, num_attention_heads=2,
+            ...     num_key_value_heads=1, csa_top_k=2, csa_num_output_groups=2)
+            >>> block = ParallelAttentionGDN2(cfg)
+            >>> out, _ = block.forward_shared(torch.randn(1, 4, 16))
+            >>> out.shape
+            torch.Size([1, 4, 16])
         """
-        if streams.dim() != 4 or streams.shape[2] != self.num_streams:
-            raise ValueError(f"streams must be [B, L, n={self.num_streams}, d], got {tuple(streams.shape)}")
-        bsz, lq, _, _ = streams.shape
-        if prev_a is not None and (prev_a.dim() != 4 or tuple(prev_a.shape[:3]) != (bsz, lq, 2) or prev_a.shape[3] != self.num_streams):
-            raise ValueError(f"prev_a must be [B, L, 2, n]=({bsz}, {lq}, 2, {self.num_streams}), got {tuple(prev_a.shape)}")
-        a1, a2, b, c1, c2 = self.mhc.parallel_coefficients(streams)
-        pa1 = prev_a[:, :, 0, :].unsqueeze(2) if prev_a is not None else a1
-        pa2 = prev_a[:, :, 1, :].unsqueeze(2) if prev_a is not None else a2
-        mix1 = self.mhc.mix_input(streams, pa1).squeeze(2)
-        mix2 = self.mhc.mix_input(streams, pa2).squeeze(2)
+        if hidden_states.dim() != 3 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(f"hidden_states must be [B, L, d={self.hidden_size}], got {tuple(hidden_states.shape)}")
+        h = self.norm(hidden_states)
         attn_out, shared = self.attention.forward_shared(
-            mix1,
+            h,
             shared,
             compress_from=compress_from,
             compress_start_pos=compress_start_pos,
@@ -329,38 +299,37 @@ class MHCAttentionGDN2(nn.Module):
             use_cache=use_cache,
             seeded_store=seeded_store,
         )
-        gdn_out, _, _ = self.gdn2(mix2)
-        out = self.mhc.combine_parallel(streams, b, c1, attn_out, c2, gdn_out)
-        next_a = torch.stack((a1.squeeze(2), a2.squeeze(2)), dim=2)
-        return out, shared, next_a
+        memory_out, _, _ = self.gdn2(h)
+        mixed = torch.cat((attn_out, memory_out), dim=-1)
+        return hidden_states + self.out_proj(mixed), shared
 
     def forward(
         self,
-        streams: torch.Tensor,
+        hidden_states: torch.Tensor,
         shared: CSA2SharedState | None = None,
-        prev_a: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        r"""forward(streams, shared=None, prev_a=None, **kwargs) -> Tensor
+        r"""forward(hidden_states, shared=None, **kwargs) -> Tensor
 
-        Streams-only convenience wrapper around :meth:`forward_shared`.
+        Convenience wrapper around :meth:`forward_shared` that drops the
+        shared state.
         """
-        out, _, _ = self.forward_shared(streams, shared, prev_a, **kwargs)
+        out, _ = self.forward_shared(hidden_states, shared, **kwargs)
         return out
 
 
-class MHCAttentionTitan(MHCAttentionGDN2):
-    r"""MHCAttentionTitan(config, compression_ratio=None, mode="full", top_k=None, variant=None, window_size=None)
+class ParallelAttentionTitan(ParallelAttentionGDN2):
+    r"""ParallelAttentionTitan(config, compression_ratio=None, mode="full", top_k=None, variant=None, window_size=None, memory_init_scale=1e-3)
 
-    Parallel attention ∥ MultiHead SelfReferentialTitans encoder layer routed by Single-Pass mHC.
+    Parallel attention ∥ MultiHead SelfReferentialTitans encoder layer.
 
-    Alternates with :class:`MHCAttentionGDN2` in the CED encoder stack:
+    Alternates with :class:`ParallelAttentionGDN2` in the CED encoder stack:
     runs a MultiHead sliding-window attention variant in parallel with a
-    MultiHead :class:`~memory_machines.models.blocks.fast_weights.SelfReferentialTitanMixer`,
-    routed by :class:`~memory_machines.models.blocks.memory.SinglePassMHC`
-    over persistent residual streams. Subclass of :class:`MHCAttentionGDN2` so
-    existing ``isinstance(layer, MHCAttentionGDN2)`` checks still hold; only
-    the second branch is swapped.
+    MultiHead :class:`~memory_machines.models.blocks.fast_weights.SelfReferentialTitanMixer`
+    on the same pre-normalized input, fused by the shared ``2d -> d``
+    down-projection. Subclass of :class:`ParallelAttentionGDN2` so
+    ``isinstance(layer, ParallelAttentionGDN2)`` checks hold; only the second
+    branch is swapped.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
@@ -370,6 +339,8 @@ class MHCAttentionTitan(MHCAttentionGDN2):
         top_k (int, optional): entries per query. Default: ``None``.
         variant (str, optional): attention variant override. Default: ``None``.
         window_size (int, optional): attention SWA width override. Default: ``None``.
+        memory_init_scale (float, optional): std of the memory half of the
+            fused down-projection at init. Default: ``1e-3``.
     """
 
     def _build_branch(self, config: MemoryMachineConfig) -> GatedDeltaNet2Mixer | SelfReferentialTitanMixer:

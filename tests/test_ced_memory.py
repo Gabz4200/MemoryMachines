@@ -13,7 +13,7 @@ from memory_machines.models.blocks import (
     CompressedSparseAttention2,
     DSparkDrafter,
     EngramMemory,
-    MHCAttentionGDN2,
+    ParallelAttentionGDN2,
     SinglePassMHC,
 )
 from tests.test_blocks_shapes import tiny_cfg
@@ -22,11 +22,13 @@ from tests.test_blocks_shapes import tiny_cfg
 def _csa(layer):
     """Reach the CSA2 attention branch of a CED layer.
 
-    CED layers are parallel attention ∥ GDN-2 blocks by default
+    CED layers are parallel attention ∥ memory blocks by default
     (``ced_attention_gdn2_parallel=True``); the CSA2-specific attributes
-    live on the block's ``attention`` branch.
+    live on the block's ``attention`` branch. Encoder layer 0 is plain SWA
+    (wrapped in the shared-state adapter), so unwrap that too.
     """
-    return layer.attention if isinstance(layer, MHCAttentionGDN2) else layer
+    attention = layer.attention if isinstance(layer, ParallelAttentionGDN2) else layer
+    return getattr(attention, "inner", attention)
 
 
 def _ced_cfg():
@@ -34,7 +36,7 @@ def _ced_cfg():
         tiny_cfg(),
         swa_bounded_replay=True,
         window_size=4,
-        ced_num_encoder_layers=1,
+        ced_num_encoder_layers=2,
         ced_num_decoder_layers=2,
         csa_encoder_compression_ratio=2,
         csa_decoder_compression_ratio=1,
@@ -84,7 +86,8 @@ def test_ced_bounded_replay_does_not_leak_future_tokens():
     with torch.no_grad():
         for layer in list(model.encoder_layers) + list(model.decoder_layers):
             csa = _csa(layer)
-            assert isinstance(csa, CompressedSparseAttention2)
+            if not isinstance(csa, CompressedSparseAttention2):
+                continue  # encoder layer 0 is plain SWA
             for w in (
                 csa.q_down.weight,
                 csa.q_up_main.weight,
@@ -123,7 +126,8 @@ def test_ced_decode_is_globally_conditioned():
     with torch.no_grad():
         for layer in list(model.encoder_layers) + list(model.decoder_layers):
             csa = _csa(layer)
-            assert isinstance(csa, CompressedSparseAttention2)
+            if not isinstance(csa, CompressedSparseAttention2):
+                continue  # encoder layer 0 is plain SWA
             torch.nn.init.xavier_uniform_(csa.grouped_out.out_proj.weight)
     torch.manual_seed(1)
     H = torch.randn(1, 6, 32)

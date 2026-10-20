@@ -16,7 +16,7 @@ from memory_machines.models.blocks import (
     CausalEncoderDecoderStack,
     CompressedSparseAttention2,
     DenseFFN,
-    MHCAttentionGDN2,
+    ParallelAttentionGDN2,
     SwiGLU,
     build_ffn,
     to_streams,
@@ -230,7 +230,14 @@ def test_ffns_do_not_leak_future_tokens():
         assert perturb(future)[0].item() == 0.0, f"future token {future} leaked"
 
 
-def test_stream_path_still_builds_mhc_blocks():
+def test_parallel_encoder_path_builds_hybrid_blocks():
     stack = CausalEncoderDecoderStack(_ced_cfg()).eval()
-    assert all(isinstance(layer, MHCAttentionGDN2) for layer in stack.encoder_layers)
-    assert [layer.mode for layer in stack.encoder_layers] == ["full", "reuse"]
+    assert all(isinstance(layer, ParallelAttentionGDN2) for layer in stack.encoder_layers)
+    # Layer 0 is plain SWA, so the first CSA2 layer seeds the store.
+    assert [layer.mode for layer in stack.encoder_layers] == [None, "full"]
+
+
+def test_encoder_ffn_intermediate_size_zero_uses_the_shared_width():
+    cfg = _ced_cfg(ced_encoder_ffn_intermediate_size=0)
+    stack = CausalEncoderDecoderStack(cfg).eval()
+    assert {_inner(ffn).intermediate_size for ffn in _encoder_ffns(stack)} == {cfg.intermediate_size}

@@ -1,4 +1,4 @@
-r"""Causal encoder-decoder stack over CSA2 / parallel mHC layers.
+r"""Causal encoder-decoder stack over CSA2 / parallel-hybrid layers.
 
 :class:`CausalEncoderDecoderStack` wires
 :class:`~memory_machines.models.blocks.sparse.CompressedSparseAttention2`
@@ -9,22 +9,33 @@ states. The decoder half is a standalone :class:`CausalDecoder`
 
 When ``config.ced_attention_gdn2_parallel`` is set (default), every
 *encoder* layer becomes a
-:class:`~memory_machines.models.blocks.mhc_parallel.MHCAttentionGDN2` block:
-a MultiHead sliding-window attention variant
-(``config.ced_attention_variant``, default ``compressed_sparse``) runs in
-parallel with a MultiHead GDN-2 mixer, routed by Single-Pass mHC over
-persistent residual streams. The GDN-2 branch mixes the *whole* encoder
+:class:`~memory_machines.models.blocks.parallel_hybrid.ParallelAttentionGDN2`
+block: the input is pre-normalized once (``config.ced_encoder_norm``, default
+``dyT``), a MultiHead sliding-window attention variant
+(``config.ced_attention_variant``, default ``compressed_sparse``) and a
+MultiHead memory mixer (GDN-2, or Titans on alternating layers) run in
+parallel on that same representation, their outputs are concatenated and
+mixed back to model width by one ``2d -> d`` down-projection, and the result
+is added as a residual. Encoder layer 0 is the exception: its attention
+branch is plain, uncompressed and non-sparse SWA
+(:class:`~memory_machines.models.blocks.attention.GroupedQueryAttention`)
+with the encoder's smallest window
+(``config.ced_encoder_first_window_size``, default ``config.window_size``);
+every later layer runs ``config.ced_attention_variant`` (CSA2 by default),
+whose first occurrence seeds the cross-layer store. No encoder layer widens
+its window for global reach — the memory branch mixes the *whole* encoder
 sequence (never a window), so it supplies the global context while the
-attention branch keeps its precision local. The decoder is never a GDN-2
-block — it stays plain CSA2 and inherits the global context through the
-encoder's KV (Eq. 1). Set the flag to ``False`` to recover plain CSA2
-encoder layers.
+attention branch keeps its precision local. The decoder is never a memory-hybrid block
+— it stays plain CSA2 and inherits the global context through the encoder's
+KV (Eq. 1). Set the flag to ``False`` to recover plain CSA2 encoder layers.
 
 Every encoder layer is followed by a dense (non-MoE) feed-forward sub-layer
 (:class:`~memory_machines.models.blocks.ffn.DenseFFN`, kind
-``config.ced_encoder_ffn``, default SwiGLU) with a pre-norm residual, and
+``config.ced_encoder_ffn``, default SwiGLU, pre-norm
+``config.ced_encoder_ffn_norm``, default DyT) with a pre-norm residual, and
 every decoder layer is followed by its own independently configured FFN
-(``config.ced_decoder_ffn``, default SwiGLU).
+(``config.ced_decoder_ffn`` / ``config.ced_decoder_ffn_norm``, default
+SwiGLU / DyT).
 
 With ``config.ced_decoder_looping`` the decoder half becomes a Looped
 Language Model (arXiv:2510.25741): the repeated ``CSA2 -> DenseFFN`` pattern
@@ -45,13 +56,13 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .compression import BlockCompressor
 from .ffn import DenseFFN
-from .mhc_parallel import MHCAttentionGDN2, MHCAttentionTitan, from_streams, to_streams
+from .parallel_hybrid import ParallelAttentionGDN2, ParallelAttentionTitan
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention2
 
 
 def _validate_encoder_layers(layers: nn.ModuleList | list[nn.Module]) -> None:
-    """Assert every encoder token-mixer is a CSA2 or parallel-mHC layer.
+    """Assert every encoder token-mixer is a CSA2 or parallel-hybrid layer.
 
     CheapLLM accepts ``encoder_layers`` from callers; a wrong-typed entry
     must fail at construction, not deep inside ``encode``. This mirrors the
@@ -59,8 +70,8 @@ def _validate_encoder_layers(layers: nn.ModuleList | list[nn.Module]) -> None:
     paths share one contract.
     """
     for layer in layers:
-        if not isinstance(layer, (CompressedSparseAttention2, MHCAttentionGDN2)):
-            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or MHCAttentionGDN2, got {type(layer).__name__}")
+        if not isinstance(layer, (CompressedSparseAttention2, ParallelAttentionGDN2)):
+            raise TypeError(f"encoder_layers must hold CompressedSparseAttention2 or ParallelAttentionGDN2, got {type(layer).__name__}")
 
 
 def decoder_width(config: MemoryMachineConfig) -> int:
@@ -131,8 +142,9 @@ def _build_encoder(
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``ced_num_encoder_layers``,
             ``ced_attention_gdn2_parallel``, ``ced_attention_variant``,
-            ``ced_encoder_alternating``, ``ced_encoder_ffn``,
-            ``ced_encoder_ffn_intermediate_size``,
+            ``ced_encoder_first_window_size``, ``ced_encoder_alternating``,
+            ``ced_encoder_norm``, ``ced_encoder_ffn``,
+            ``ced_encoder_ffn_norm``, ``ced_encoder_ffn_intermediate_size``,
             ``ced_encoder_ffn_update_intervals``, and
             ``csa_encoder_compression_ratio``.
         encoder_layers (list of nn.Module, optional): explicit encoder layers.
@@ -147,12 +159,18 @@ def _build_encoder(
         enc = list(encoder_layers)
     elif config.ced_attention_gdn2_parallel:
         enc: list[nn.Module] = []
+        # Layer 0 is plain SWA with the smallest window; later layers are the
+        # configured variant, whose first occurrence seeds the cross-layer store.
+        swa_window = config.ced_encoder_first_window_size or config.window_size
         for i in range(enc_n):
-            mode = "full" if i == 0 else "reuse"
+            first = i == 0
+            variant = "dense" if first else None
+            window = swa_window if first else None
+            mode = "full" if i == 1 else "reuse"
             if config.ced_encoder_alternating and i % 2 == 1:
-                enc.append(MHCAttentionTitan(config, config.csa_encoder_compression_ratio, mode))
+                enc.append(ParallelAttentionTitan(config, config.csa_encoder_compression_ratio, mode, variant=variant, window_size=window))
             else:
-                enc.append(MHCAttentionGDN2(config, config.csa_encoder_compression_ratio, mode))
+                enc.append(ParallelAttentionGDN2(config, config.csa_encoder_compression_ratio, mode, variant=variant, window_size=window))
     else:
         enc = [CompressedSparseAttention2(config, config.csa_encoder_compression_ratio, "full" if i == 0 else "reuse") for i in range(enc_n)]
     enc_intervals = config.ced_encoder_ffn_update_intervals or (1,) * len(enc)
@@ -167,6 +185,7 @@ def _build_encoder(
             DenseFFN(
                 config,
                 config.ced_encoder_ffn,
+                norm_kind=config.ced_encoder_ffn_norm,
                 intermediate_size=config.ced_encoder_ffn_intermediate_size or None,
                 update_interval=enc_intervals[i],
             )
@@ -176,109 +195,54 @@ def _build_encoder(
     return encoder_layers_ml, encoder_ffns_ml
 
 
-def _run_stream_layers(
-    layers: list[MHCAttentionGDN2],
-    hidden_states: torch.Tensor,
-    shared: CSA2SharedState | None,
-    num_streams: int,
-    position_ids: torch.Tensor | None = None,
-    seeded_store: bool = False,
-    ffns: list[nn.Module] | None = None,
-) -> tuple[torch.Tensor, CSA2SharedState | None]:
-    r"""_run_stream_layers(layers, hidden_states, shared, num_streams, position_ids=None, seeded_store=False, ffns=None) -> (Tensor, CSA2SharedState | None)
-
-    Run parallel mHC blocks over persistent residual streams.
-
-    Expands ``hidden_states`` into ``num_streams`` mHC streams
-    (:func:`~memory_machines.models.blocks.mhc_parallel.to_streams`), threads
-    the single-pass routing coefficients ``prev_a`` between adjacent blocks,
-    and collapses the final streams with a mean
-    (:func:`~memory_machines.models.blocks.mhc_parallel.from_streams`).
-
-    When ``ffns`` is given (one per block), each FFN is applied to the streams
-    right after its block. The block index is the per-forward step counter
-    shared by every block (each block's own ``update_interval`` decides on
-    which steps it actually applies its FFN — the HOPE / Continuum Memory
-    time-cycle idea).
-    """
-    streams = to_streams(hidden_states, num_streams)
-    if shared is None:
-        shared = CSA2SharedState(total_len=0)
-    prev_a: torch.Tensor | None = None
-    for i, layer in enumerate(layers):
-        streams, shared, prev_a = layer.forward_shared(
-            streams,
-            shared,
-            prev_a=prev_a,
-            position_ids=position_ids,
-            seeded_store=seeded_store,
-        )
-        if ffns is not None:
-            streams = ffns[i](streams, step=i)
-    return from_streams(streams), shared
-
-
 def _run_encoder_layers(
     layers: list[nn.Module],
     ffns: list[nn.Module],
     hidden_states: torch.Tensor,
     position_ids: torch.Tensor | None,
-    mhc_num_streams: int,
 ) -> tuple[torch.Tensor, CSA2SharedState]:
-    r"""_run_encoder_layers(layers, ffns, hidden_states, position_ids, mhc_num_streams) -> (Tensor, CSA2SharedState)
+    r"""_run_encoder_layers(layers, ffns, hidden_states, position_ids) -> (Tensor, CSA2SharedState)
 
     Run the CED encoder token mixers followed by their dense FFNs.
 
     Shared by :meth:`CausalEncoderDecoderStack.encode` and
     :meth:`~memory_machines.models.backbone.CheapLLM.encode` so the
-    encoder run logic lives in one place. The mHC path
-    (:func:`_run_stream_layers`) expands the inputs into ``mhc_num_streams``
-    persistent residual streams; the plain CSA2 path threads one shared
-    :class:`CSA2SharedState` across layers and applies each layer's FFN with
-    the layer index as the per-forward step counter (HOPE time-cycle).
+    encoder run logic lives in one place. Both layer kinds (plain CSA2 and
+    parallel attention ∥ memory hybrids) take ``(B, L, d)`` states, so one
+    loop threads the shared :class:`CSA2SharedState` across layers and applies
+    each layer's FFN with the layer index as the per-forward step counter
+    (HOPE time-cycle).
 
     Args:
         layers (list of nn.Module): encoder token mixers (CSA2 or parallel
-            mHC blocks).
+            hybrid blocks).
         ffns (list of nn.Module): one :class:`DenseFFN` per layer.
         hidden_states (Tensor): encoder inputs ``(B, Le, D)``.
         position_ids (Tensor, optional): absolute positions.
-        mhc_num_streams (int): mHC stream count when the mHC path is used.
 
     Returns:
         Tensor: encoder-final states ``(B, Le, D)`` and the populated
         :class:`~memory_machines.models.blocks.shared.CSA2SharedState`.
 
     Raises:
-        TypeError: if any layer is not a CSA2 or parallel-mHC block.
+        TypeError: if any layer is not a CSA2 or parallel-hybrid block.
         ValueError: if the encoder produced no shared state (empty layers).
     """
     _validate_encoder_layers(layers)
     if not layers:
         raise ValueError("encode produced no shared state (encoder_layers is empty)")
-    if any(isinstance(layer, MHCAttentionGDN2) for layer in layers):
-        x, shared = _run_stream_layers(
-            cast("list[MHCAttentionGDN2]", layers),
-            hidden_states,
-            None,
-            mhc_num_streams,
-            position_ids,
-            seeded_store=False,
-            ffns=ffns,
-        )
-    else:
-        shared: CSA2SharedState | None = None
-        x = hidden_states
-        for i, layer in enumerate(cast("list[CompressedSparseAttention2]", layers)):
-            if shared is None:
-                shared = CSA2SharedState(total_len=0)
-            # SWA KV is layer-local and never persisted onto the cross-layer
-            # shared state, so ``use_cache`` is a no-op here (API parity only).
-            x, shared = layer.forward_shared(x, shared, position_ids=position_ids)
-            # The block index is the per-forward step counter shared by every
-            # encoder FFN; each block's own update_interval decides on which
-            # steps it actually applies its FFN (HOPE time-cycle).
-            x = ffns[i](x, step=i)
+    shared: CSA2SharedState | None = None
+    x = hidden_states
+    for i, layer in enumerate(cast("list[CompressedSparseAttention2 | ParallelAttentionGDN2]", layers)):
+        if shared is None:
+            shared = CSA2SharedState(total_len=0)
+        # SWA KV is layer-local and never persisted onto the cross-layer
+        # shared state, so ``use_cache`` is a no-op here (API parity only).
+        x, shared = layer.forward_shared(x, shared, position_ids=position_ids)
+        # The block index is the per-forward step counter shared by every
+        # encoder FFN; each block's own update_interval decides on which
+        # steps it actually applies its FFN (HOPE time-cycle).
+        x = ffns[i](x, step=i)
     if shared is None:
         raise ValueError("encode produced no shared state (encoder_layers is empty)")
     return x, shared
@@ -394,29 +358,34 @@ class CausalEncoderDecoderStack(nn.Module):
     Prefer the registered model for new code; keep this class only where the
     public type is already pinned (tests, external integrations).
 
-    Encoder layers compress with mode ``full`` (first) then ``reuse``;
+    Encoder layer 0 runs plain SWA; the first CSA2 encoder layer compresses
+    with mode ``full`` and the rest ``reuse``;
     the decoder half is a :class:`CausalDecoder` (CSA2 layers in the
     paper's ``full``/``reindex``/``reuse`` cycle, each seeded with the
     encoder-final global KV, Eq. 1). Decoding supports full-context and
     bounded-replay (last-window) prefill. By default each *encoder* layer
-    is a parallel attention ∥ GDN-2 block routed by Single-Pass mHC
-    (``config.ced_attention_gdn2_parallel``); the residual streams persist
-    between adjacent encoder layers and the routing coefficients are threaded
-    single-pass. Each encoder layer is followed by a dense (non-MoE)
-    feed-forward sub-layer (:class:`DenseFFN`, kind ``config.ced_encoder_ffn``,
-    default SwiGLU); the decoder uses its own independently configured FFN
-    (``config.ced_decoder_ffn``). The decoder carries no GDN-2
-    branch — it consumes the encoder's global KV, so GDN-2 reaches it only
-    indirectly, even under bounded replay. With ``config.ced_decoder_looping``
-    the decoder is a parameter-shared looped :class:`CausalDecoder`
-    (arXiv:2510.25741, ``ced_decoder_loop_steps``).
+    is a parallel attention ∥ memory-mixer block
+    (``config.ced_attention_gdn2_parallel``): one pre-norm feeds both
+    branches, a ``2d -> d`` down-projection fuses their outputs, and the
+    result is added as a residual. Each encoder layer is followed by a dense
+    (non-MoE) feed-forward sub-layer (:class:`DenseFFN`, kind
+    ``config.ced_encoder_ffn``, pre-norm ``config.ced_encoder_ffn_norm``,
+    defaults SwiGLU / DyT); the decoder uses its own independently configured
+    FFN (``config.ced_decoder_ffn`` / ``config.ced_decoder_ffn_norm``). The
+    decoder carries no memory branch — it consumes the encoder's global KV,
+    so the memory mixer reaches it only indirectly, even under bounded replay.
+    With ``config.ced_decoder_looping`` the decoder is a parameter-shared
+    looped :class:`CausalDecoder` (arXiv:2510.25741,
+    ``ced_decoder_loop_steps``).
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             provides ``ced_num_encoder_layers``, ``ced_num_decoder_layers``,
             ``ced_attention_gdn2_parallel``, ``ced_attention_variant``,
-            ``ced_encoder_ffn``, ``ced_decoder_ffn``,
-            ``ced_gdn2_backend``,
+            ``ced_encoder_first_window_size``, ``ced_encoder_norm``,
+            ``ced_encoder_ffn``,
+            ``ced_encoder_ffn_norm``, ``ced_decoder_ffn``,
+            ``ced_decoder_ffn_norm``, ``ced_gdn2_backend``,
             ``csa_encoder_compression_ratio``,
             ``csa_decoder_compression_ratio``, ``window_size``, and
             ``swa_bounded_replay``.
@@ -513,7 +482,7 @@ class CausalEncoderDecoderStack(nn.Module):
 
         Each encoder layer's token mixer is followed by its dense
         feed-forward sub-layer (:class:`~memory_machines.models.blocks.ffn.DenseFFN`,
-        ``config.ced_encoder_ffn``).
+        ``config.ced_encoder_ffn`` / ``config.ced_encoder_ffn_norm``).
 
         Args:
             hidden_states (Tensor): encoder inputs of shape ``(B, Le, D)``.
@@ -537,7 +506,7 @@ class CausalEncoderDecoderStack(nn.Module):
         x = hidden_states
         layers = list(self.encoder_layers)
         ffns = list(self.encoder_ffns)
-        x, shared = _run_encoder_layers(layers, ffns, hidden_states, position_ids, self.config.mhc_num_streams)
+        x, shared = _run_encoder_layers(layers, ffns, hidden_states, position_ids)
         return x, shared
 
     def decode_full_context(
@@ -878,11 +847,12 @@ class CausalDecoder(nn.Module):
     (``global_projs[0]``); ``global_projs[1:]`` are allocated only
     to satisfy the length-zip guard and are inactive. Supports
     full-context decoding and SWA Bounded Replay (§2.3.2) prefill.
-    The decoder carries no GDN-2 branch: the encoder owns the global GDN-2 mixer
-    (``config.ced_attention_gdn2_parallel``), and the decoder inherits that
-    global context through the encoder's KV, so bounded replay stays valid.
-    Each decoder layer is followed by a dense (non-MoE) feed-forward sub-layer
-    (:class:`DenseFFN`, kind ``config.ced_decoder_ffn``, default SwiGLU),
+    The decoder carries no memory-branch mixer: the encoder owns the global
+    GDN-2/Titans branch (``config.ced_attention_gdn2_parallel``), and the
+    decoder inherits that global context through the encoder's KV, so bounded
+    replay stays valid. Each decoder layer is followed by a dense (non-MoE)
+    feed-forward sub-layer (:class:`DenseFFN`, kind ``config.ced_decoder_ffn``,
+    pre-norm ``config.ced_decoder_ffn_norm``, defaults SwiGLU / DyT),
     configured independently of the encoder's FFN.
 
     With ``config.ced_decoder_looping``, the decoder is built in the Looped
@@ -958,8 +928,9 @@ class CausalDecoder(nn.Module):
         if layers_list is not None:
             built = layers_list
         else:
-            # The decoder never carries a GDN-2 branch: the encoder owns the
-            # global GDN-2 mixer, and the decoder uses its global KV (Eq. 1).
+            # The decoder never carries a memory-branch mixer: the encoder
+            # owns the global GDN-2/Titans branch, and the decoder uses its
+            # global KV (Eq. 1).
             built = [
                 CompressedSparseAttention2(
                     dec_cfg,
@@ -990,6 +961,7 @@ class CausalDecoder(nn.Module):
                 DenseFFN(
                     dec_cfg,
                     dec_cfg.ced_decoder_ffn,
+                    norm_kind=dec_cfg.ced_decoder_ffn_norm,
                     intermediate_size=dec_cfg.ced_decoder_ffn_intermediate_size or None,
                     update_interval=dec_intervals[i],
                 )

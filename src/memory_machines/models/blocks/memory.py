@@ -16,6 +16,50 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 from .shared import _sinkhorn
 
 
+def to_streams(x: torch.Tensor, num_streams: int) -> torch.Tensor:
+    r"""to_streams(x, num_streams) -> Tensor
+
+    Expand a hidden state ``(B, L, d)`` into ``n`` identical residual streams
+    ``(B, L, n, d)`` (mHC residual-stream replication).
+
+    **Aliasing contract (read before any in-place op):** the returned tensor is
+    ``x.unsqueeze(2).expand(...)`` — every stream is the *same* storage, so the
+    streams alias the input. This is safe *only* because recombination
+    (:meth:`SinglePassMHC.combine_parallel`) writes the residual back through a
+    doubly-stochastic (Sinkhorn) mixing matrix ``b``: the write is a convex
+    combination of the streams, so it is numerically stable and does not
+    double-count. Any in-place op on one stream (a masked-write, a chunked
+    accumulation) would corrupt **all** streams — materialize with
+    ``.contiguous()`` or ``.clone()`` before mutating. The streams are
+    collapsed with a mean by :func:`from_streams`, which averages the
+    (aliased) storage back to a single stream.
+
+    Examples::
+
+        >>> to_streams(torch.randn(1, 4, 8), 2).shape
+        torch.Size([1, 4, 2, 8])
+    """
+    if x.dim() != 3:
+        raise ValueError(f"x must be [B, L, d], got {tuple(x.shape)}")
+    return x.unsqueeze(2).expand(x.shape[0], x.shape[1], num_streams, x.shape[2])
+
+
+def from_streams(streams: torch.Tensor) -> torch.Tensor:
+    r"""from_streams(streams) -> Tensor
+
+    Collapse ``n`` streams ``(B, L, n, d)`` to a hidden state ``(B, L, d)`` by
+    averaging (the mHC read-out preserves the stream mean).
+
+    Examples::
+
+        >>> from_streams(torch.randn(1, 4, 2, 8)).shape
+        torch.Size([1, 4, 8])
+    """
+    if streams.dim() != 4:
+        raise ValueError(f"streams must be [B, L, n, d], got {tuple(streams.shape)}")
+    return streams.mean(dim=2)
+
+
 def _is_prime(n: int) -> bool:
     r"""Deterministic Miller-Rabin primality test for ``n < 2^64``."""
     if n < 2:

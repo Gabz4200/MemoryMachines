@@ -10,6 +10,7 @@ from dataclasses import replace
 
 import torch
 
+import memory_machines.models.blocks.attention as attention_mod
 import memory_machines.models.blocks.sparse as sparse_mod
 from memory_machines.models.blocks import CausalEncoderDecoderStack, CompressedSparseAttention2
 from memory_machines.models.blocks.memory import EngramMemory
@@ -103,14 +104,21 @@ def test_ced_stack_positions_stay_correct_across_layers():
     stack = CausalEncoderDecoderStack(cfg).eval()
 
     seen: list[list[int]] = []
-    orig = sparse_mod._resolve_positions
+    orig_dense = attention_mod._resolve_positions
+    orig_sparse = sparse_mod._resolve_positions
 
-    def spy(hidden_states, q_len, past_len, position_ids):
-        q_pos, k_pos = orig(hidden_states, q_len, past_len, position_ids)
-        seen.append(q_pos[:, -1].tolist())
-        return q_pos, k_pos
+    def _spy(orig):
+        def inner(hidden_states, q_len, past_len, position_ids):
+            q_pos, k_pos = orig(hidden_states, q_len, past_len, position_ids)
+            seen.append(q_pos[:, -1].tolist())
+            return q_pos, k_pos
 
-    sparse_mod._resolve_positions = spy
+        return inner
+
+    # Encoder layer 0 is plain SWA and resolves through the dense path;
+    # every other layer is CSA2. Both must agree on the positions.
+    attention_mod._resolve_positions = _spy(orig_dense)
+    sparse_mod._resolve_positions = _spy(orig_sparse)
     try:
         enc = torch.randn(1, 8, cfg.hidden_size)
         stack.encode(enc)
@@ -118,12 +126,14 @@ def test_ced_stack_positions_stay_correct_across_layers():
         enc_final = torch.randn(1, 8, cfg.hidden_size)
         stack.decode_full_context(dec, enc_final)
     finally:
-        sparse_mod._resolve_positions = orig
+        attention_mod._resolve_positions = orig_dense
+        sparse_mod._resolve_positions = orig_sparse
 
-    # 2 encoder layers: all see positions ending at 7.
-    assert seen[:2] == [[7], [7]], f"encoder positions {seen[:2]}; expected both [7]"
+    # 2 encoder layers (plain SWA then CSA2): every call sees positions ending
+    # at 7. CSA2 resolves twice — its sparse main branch and its internal SWA.
+    assert seen[:3] == [[7], [7], [7]], f"encoder positions {seen[:3]}; expected all [7]"
     # 3 decoder layers: all see positions ending at 13 (8 + 6 - 1).
-    assert seen[2:] == [[13], [13], [13]], f"decoder positions {seen[2:]}; expected all [13]"
+    assert seen[3:] == [[13]] * 6, f"decoder positions {seen[3:]}; expected all [13]"
 
 
 def test_engram_hash_is_dtype_invariant():

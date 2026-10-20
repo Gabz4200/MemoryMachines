@@ -214,7 +214,7 @@ class CheapLLM(nn.Module):
         up-projection init. The embedding uses PyTorch's default init; the
         head is re-initialized only when it is not weight-tied to the embedding.
         """
-        # Every registered component here (CSA2, MHC, DenseFFN, CEDGlobalKVProjection,
+        # Every registered component here (CSA2/parallel-hybrid, DenseFFN, CEDGlobalKVProjection,
         # CausalDecoder, VocabularyUpProjection) defines ``reset_parameters``;
         # the ``getattr`` guard is defensive only and should never skip a
         # module in practice. A missing ``reset_parameters`` is a contract
@@ -269,7 +269,7 @@ class CheapLLM(nn.Module):
         """
         layers = list(self.encoder_layers)
         ffns = list(self.encoder_ffns)
-        return _run_encoder_layers(layers, ffns, hidden_states, position_ids, self.config.mhc_num_streams)
+        return _run_encoder_layers(layers, ffns, hidden_states, position_ids)
 
     def decode_full_context(
         self,

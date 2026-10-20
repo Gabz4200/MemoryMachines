@@ -29,8 +29,8 @@ from .ffn import DenseFFN, SwiGLU, build_ffn
 from .gdn2 import GatedDeltaNet2, GatedDeltaNet2Mixer, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
-from .memory import DSparkDrafter, EngramMemory, SinglePassMHC
-from .mhc_parallel import MHCAttentionGDN2, MHCAttentionTitan, from_streams, to_streams
+from .memory import DSparkDrafter, EngramMemory, SinglePassMHC, from_streams, to_streams
+from .parallel_hybrid import ParallelAttentionGDN2, ParallelAttentionTitan
 from .positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
 from .rkan import JacobiRKAN, PadeRKAN
 from .shared import (
@@ -84,10 +84,10 @@ __all__ = [
     "LivConvBlock",
     "LivDoubleGatedBase",
     "LivPerceiver",
-    "MHCAttentionGDN2",
-    "MHCAttentionTitan",
     "NativeSparseAttention",
     "PadeRKAN",
+    "ParallelAttentionGDN2",
+    "ParallelAttentionTitan",
     "SelfReferentialTitanMemory",
     "SelfReferentialTitanMixer",
     "ShortConvolution",
