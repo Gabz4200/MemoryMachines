@@ -264,6 +264,38 @@ class MemoryMachineConfig:
             (``"rmsnorm"``, ``"layernorm"``, or ``"dyT"``). Default: ``"dyT"``.
         dspark_num_drafts: Parallel draft positions (V4.1: 5)
         dspark_window: Drafter window (V4.1: 128)
+        blt_vocab_size: Byte vocabulary for the BLT local models; ``0`` uses
+            ``vocab_size``. Default: ``0``.
+        blt_patch_size: Strided-patching fallback: bytes per patch when
+            ``ModelInput.patch_ids`` is not supplied. Default: ``4``.
+        blt_local_hidden_size: Byte-model width ``h_E``/``h_D``; ``0`` uses
+            ``hidden_size``. Default: ``0``.
+        blt_local_layers: Number of local encoder and local decoder layers.
+            Default: ``2``.
+        blt_local_window_size: Sliding-window width of the byte transformers.
+            Default: ``512`` (paper).
+        blt_local_ffn: Dense FFN kind of the byte transformers. Default:
+            ``"swiglu"``.
+        blt_local_ffn_intermediate_size: Byte FFN hidden width; ``0`` uses
+            ``intermediate_size``. Default: ``0``.
+        blt_local_norm: Pre-norm kind of the byte transformers. Default:
+            ``"rmsnorm"``.
+        blt_ngram_sizes: Byte n-gram sizes for hash embeddings. Default:
+            ``(3, 4, 5, 6, 7, 8)`` (paper).
+        blt_ngram_hash_size: Entries per n-gram hash table. Default: ``8192``
+            (paper uses 500k).
+        blt_use_ngram_embeddings: Whether to add hash n-gram embeddings to the
+            byte embeddings. Default: ``True``.
+        blt_cross_attn_heads: Heads of the encoder/decoder cross-attention
+            blocks; ``0`` uses ``num_attention_heads``. Default: ``0``.
+        blt_max_patch_bytes: Byte slots decoded per masked patch in
+            Perceiver-AR generation. Default: ``8``.
+        blt_local_max_position_embeddings: Position limit of the byte
+            transformers; ``0`` uses ``max_position_embeddings *
+            blt_patch_size``. Default: ``0``.
+        blt_tie_word_embeddings: Tie the byte embedding table and the local
+            decoder output projection. Default: ``False`` (paper does not tie
+            local encoder/decoder logits).
     """
 
     vocab_size: int = 32768
@@ -383,6 +415,21 @@ class MemoryMachineConfig:
     seed: int = 0
     dspark_num_drafts: int = 5
     dspark_window: int = 128
+    blt_vocab_size: int = 0
+    blt_patch_size: int = 4
+    blt_local_hidden_size: int = 0
+    blt_local_layers: int = 2
+    blt_local_window_size: int = 512
+    blt_local_ffn: str = "swiglu"
+    blt_local_ffn_intermediate_size: int = 0
+    blt_local_norm: str = "rmsnorm"
+    blt_ngram_sizes: tuple[int, ...] = (3, 4, 5, 6, 7, 8)
+    blt_ngram_hash_size: int = 8192
+    blt_use_ngram_embeddings: bool = True
+    blt_cross_attn_heads: int = 0
+    blt_max_patch_bytes: int = 8
+    blt_local_max_position_embeddings: int = 0
+    blt_tie_word_embeddings: bool = False
 
     def __post_init__(self):
         """Validate invariant bounds across configuration fields."""
@@ -572,6 +619,34 @@ class MemoryMachineConfig:
             raise ValueError(f"dspark_num_drafts ({self.dspark_num_drafts}) must be positive")
         if self.dspark_window <= 0:
             raise ValueError(f"dspark_window ({self.dspark_window}) must be positive")
+        if self.blt_vocab_size < 0:
+            raise ValueError(f"blt_vocab_size ({self.blt_vocab_size}) must be non-negative (0 = vocab_size)")
+        if self.blt_patch_size < 1:
+            raise ValueError(f"blt_patch_size ({self.blt_patch_size}) must be >= 1")
+        if self.blt_local_hidden_size < 0:
+            raise ValueError(f"blt_local_hidden_size ({self.blt_local_hidden_size}) must be non-negative (0 = hidden_size)")
+        if self.blt_local_hidden_size and self.blt_local_hidden_size % self.num_attention_heads != 0:
+            raise ValueError(f"blt_local_hidden_size ({self.blt_local_hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})")
+        if self.blt_local_layers < 1:
+            raise ValueError(f"blt_local_layers ({self.blt_local_layers}) must be >= 1")
+        if self.blt_local_ffn not in ("swiglu", "classic_mlp"):
+            raise ValueError(f"blt_local_ffn ({self.blt_local_ffn!r}) must be 'swiglu' or 'classic_mlp'")
+        if self.blt_local_ffn_intermediate_size < 0:
+            raise ValueError(f"blt_local_ffn_intermediate_size ({self.blt_local_ffn_intermediate_size}) must be non-negative (0 = intermediate_size)")
+        if self.blt_local_norm not in ("rmsnorm", "layernorm", "dyT"):
+            raise ValueError(f"blt_local_norm ({self.blt_local_norm!r}) must be one of 'rmsnorm', 'layernorm', 'dyT'")
+        if any(n < 2 for n in self.blt_ngram_sizes):
+            raise ValueError(f"blt_ngram_sizes ({self.blt_ngram_sizes}) must all be >= 2")
+        if self.blt_ngram_hash_size < 2:
+            raise ValueError(f"blt_ngram_hash_size ({self.blt_ngram_hash_size}) must be >= 2")
+        if self.blt_cross_attn_heads < 0:
+            raise ValueError(f"blt_cross_attn_heads ({self.blt_cross_attn_heads}) must be non-negative (0 = num_attention_heads)")
+        if self.blt_cross_attn_heads and (self.blt_local_hidden_size or self.hidden_size) % self.blt_cross_attn_heads != 0:
+            raise ValueError(f"blt_cross_attn_heads ({self.blt_cross_attn_heads}) must divide the local width ({self.blt_local_hidden_size or self.hidden_size})")
+        if self.blt_max_patch_bytes < 1:
+            raise ValueError(f"blt_max_patch_bytes ({self.blt_max_patch_bytes}) must be >= 1")
+        if self.blt_local_max_position_embeddings < 0:
+            raise ValueError(f"blt_local_max_position_embeddings ({self.blt_local_max_position_embeddings}) must be non-negative (0 = max_position_embeddings * blt_patch_size)")
 
     @classmethod
     def from_pretrained_size(cls, size: str) -> "MemoryMachineConfig":

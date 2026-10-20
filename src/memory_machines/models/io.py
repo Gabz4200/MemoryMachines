@@ -22,6 +22,9 @@ class ModelInput:
 
     input_ids: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    # BLT: byte -> patch assignment, ``(B, N)`` non-decreasing and contiguous
+    # from 0. ``None`` falls back to strided patching.
+    patch_ids: torch.Tensor | None = None
     state: Any = None
     inputs_embeds: torch.Tensor | None = None
     pixel_values: torch.Tensor | None = None
