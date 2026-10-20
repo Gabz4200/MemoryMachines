@@ -221,3 +221,24 @@ def test_cheapllm_hybrid_encoder_starts_with_plain_swa_then_seeds_the_store() ->
     first = cast("ParallelAttentionGDN2", model.encoder_layers[0])
     assert type(getattr(first.attention, "inner", None)) is GroupedQueryAttention
     assert len(model.encoder_ffns) == 3
+
+
+def test_cheapllm_rejects_a_masked_count_above_the_embedding_table() -> None:
+    cfg = _ced_cfg(ced_masked_query=True, ced_masked_token_count=2)
+    model = CheapLLM(cfg).eval()
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    with pytest.raises(ValueError, match="exceeds the table size"):
+        model(ModelInput(input_ids=ids, num_masked_tokens=3))
+
+
+def test_num_masked_tokens_is_ignored_when_masked_query_is_disabled() -> None:
+    cfg = _ced_cfg(ced_masked_query=False, ced_masked_token_count=3)
+    model = CheapLLM(cfg).eval()
+    ids = torch.randint(0, cfg.vocab_size, (1, 6))
+    with torch.no_grad():
+        a = model(ModelInput(input_ids=ids, num_masked_tokens=3)).logits
+        b = model(ModelInput(input_ids=ids)).logits
+        c = model(ModelInput(input_ids=ids, num_masked_tokens=0)).logits
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+    torch.testing.assert_close(b, c, atol=0, rtol=0)
+    assert tuple(a.shape) == (1, 6, cfg.vocab_size)
