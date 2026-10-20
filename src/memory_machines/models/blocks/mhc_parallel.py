@@ -241,6 +241,7 @@ class MHCAttentionGDN2(nn.Module):
             expand_v=config.ced_gdn2_expand_v,
             use_short_conv=config.ced_gdn2_use_short_conv,
             conv_bias=config.ced_gdn2_conv_bias,
+            liv_conv=config.ced_gdn2_liv_conv,
             backend=config.ced_gdn2_backend,
             chunk_size=config.ced_gdn2_chunk_size,
             use_qk_l2norm=config.ced_gdn2_use_qk_l2norm,

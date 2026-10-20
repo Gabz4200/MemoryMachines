@@ -190,6 +190,10 @@ class MemoryMachineConfig:
         ced_gdn2_use_short_conv: Depthwise short convs on GDN-2 q/k/v.
             Default: ``True``.
         ced_gdn2_conv_bias: Bias in the GDN-2 short convs. Default: ``False``.
+        ced_gdn2_liv_conv: Use the double-gated LIV convolution
+            (``LivConv1d``) for the GDN-2 q/k/v short convs instead of a
+            plain depthwise causal conv. Each stream keeps its own weights.
+            Default: ``True``.
         ced_gdn2_use_qk_l2norm: L2-normalize GDN-2 q/k. Default: ``True``.
         ced_gdn2_allow_neg_eigval: Scale the GDN-2 erase gate to ``[0, 2]``.
             Default: ``False``.
@@ -328,6 +332,7 @@ class MemoryMachineConfig:
     ced_gdn2_num_v_heads: int = 0
     ced_gdn2_use_short_conv: bool = True
     ced_gdn2_conv_bias: bool = False
+    ced_gdn2_liv_conv: bool = True
     ced_gdn2_use_qk_l2norm: bool = True
     ced_gdn2_allow_neg_eigval: bool = False
     ced_gdn2_beta_guard: bool = False
