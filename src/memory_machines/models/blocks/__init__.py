@@ -6,6 +6,7 @@ mixers, auxiliary memory, positioning, and shared cache helpers so existing
 """
 
 from .attention import GroupedQueryAttention
+from .blt import VocabularyDecoder, VocabularyEncoder, compute_patch_ids
 from .causal_conv1d import ShortConvolution
 from .ced import AdaptiveExitGate, CausalDecoder, CausalEncoderDecoderStack, CEDGlobalKVProjection, VocabularyUpProjection
 from .compression import (
@@ -96,6 +97,8 @@ __all__ = [
     "SwiGLU",
     "TitansFastWeightsMemory",
     "TitansMAGBlock",
+    "VocabularyDecoder",
+    "VocabularyEncoder",
     "VocabularyUpProjection",
     "_causal_comp_mask",
     "_check_position_bounds",
@@ -107,6 +110,7 @@ __all__ = [
     "add_resting_projection",
     "apply_beta_guard",
     "build_ffn",
+    "compute_patch_ids",
     "from_streams",
     "gated_delta_rule_2",
     "resting_corrected_write",
