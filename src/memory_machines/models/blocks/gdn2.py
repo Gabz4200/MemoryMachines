@@ -36,7 +36,8 @@ gradients flow through plain autograd (no manual backward needed). Compiled
 backends (``"compiled"``/``"triton"``/``"ascend"``/``"cuda"``) raise — they
 are reserved for the future kernel split (``naive``/``wy_fast``/``chunk_*``).
 The short convolutions run through
-:class:`~memory_machines.models.blocks.causal_conv1d.ShortConvolution`.
+:class:`~memory_machines.models.blocks.causal_conv1d.ShortConvolution`, or the
+double-gated :class:`LivConv1d` (one unique instance per q/k/v stream).
 
 Examples::
 
@@ -67,6 +68,7 @@ from .shared import _l2norm
 __all__ = [
     "GatedDeltaNet2",
     "GatedDeltaNet2Mixer",
+    "LivConv1d",
     "add_resting_projection",
     "apply_beta_guard",
     "gated_delta_rule_2",
@@ -587,14 +589,126 @@ def gated_delta_rule_2(
     raise ValueError(f"Unknown backend: {backend!r}. Valid reference backends: {list(_REFERENCE_BACKENDS)}")
 
 
+class LivConv1d(nn.Module):
+    r"""LivConv1d(hidden_size, kernel_size, bias=False)
+
+    Double-gated causal short convolution (LIV conv), replacing the plain
+    short convs on GDN-2's q/k/v streams.
+
+    The stream is projected to ``(pre_gate, post_gate, x_proj)``, gated as
+    ``pre_gate * x_proj``, mixed by a depthwise causal convolution, gated again
+    as ``post_gate * mixed``, and projected back to ``hidden_size``.
+
+    The enclosing token mixer already owns the head split (GDN-2 keeps heads
+    batched as ``[B, T, H, Dh]`` and its short convs see the merged
+    ``H * Dh`` channels in head order), so this module is single-head: it
+    introduces no head axis of its own. GDN-2 instantiates one unique conv per
+    q/k/v stream, exactly as it did for the plain short convs.
+
+    The cache holds the *gated* convolution input history (``[N, D, W]``), so
+    incremental decode produces the same result as a full-sequence forward.
+
+    Args:
+        hidden_size (int): number of input/output channels of the stream.
+        kernel_size (int): convolution width.
+        bias (bool): learn a channel bias inside the depthwise conv.
+            Default: ``False``.
+
+    Examples::
+
+        >>> import torch
+        >>> from memory_machines.models.blocks.gdn2 import LivConv1d
+        >>> conv = LivConv1d(hidden_size=8, kernel_size=3)
+        >>> y, _ = conv(torch.randn(2, 5, 8))
+        >>> y.shape
+        torch.Size([2, 5, 8])
+    """
+
+    def __init__(self, hidden_size: int, kernel_size: int, bias: bool = False) -> None:
+        super().__init__()
+        if hidden_size <= 0 or kernel_size <= 0:
+            raise ValueError(f"hidden_size/kernel_size must be positive, got {hidden_size}/{kernel_size}")
+        self.hidden_size = hidden_size
+        self.input_projection = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.conv = ShortConvolution(hidden_size=hidden_size, kernel_size=kernel_size, bias=bias, activation=None, backend="naive")
+        self.output_projection = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Neutral (identity) start: pre/post gates are biased to one, the value
+        and output projections are identity, and the conv is causal-Dirac
+        (each channel reads only its own current token). The module therefore
+        passes its input through unchanged at step 0 and learns gating and
+        local context from there, instead of starting with the two
+        multiplicative gates shrinking the stream by their product.
+        """
+        d = self.hidden_size
+        with torch.no_grad():
+            eye = torch.eye(d, dtype=self.input_projection.weight.dtype, device=self.input_projection.weight.device)
+            self.input_projection.weight.zero_()
+            self.input_projection.weight[2 * d :] = eye  # x_proj = x
+            self.input_projection.bias.zero_()
+            self.input_projection.bias[: 2 * d] = 1.0  # pre_gate = post_gate = 1
+            self.output_projection.weight.copy_(eye)
+            self.conv.weight.zero_()
+            self.conv.weight[:, 0, -1] = 1.0
+            if self.conv.bias is not None:
+                self.conv.bias.zero_()
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        """Depthwise conv bias ``[D]`` (``None`` when ``bias=False``)."""
+        return self.conv.bias
+
+    @property
+    def kernel_size(self) -> tuple[int, ...]:
+        """Kernel width as an ``nn.Conv1d``-style tuple."""
+        return self.conv.kernel_size
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        r"""forward(x, cache=None, output_final_state=False, cu_seqlens=None) -> (y, final_state)
+
+        Args:
+            x (Tensor): stream ``[B, T, D]``, or packed ``[1, L, D]`` with
+                ``cu_seqlens``.
+            cache (Tensor, optional): gated-input history ``[N, D, W]`` from a
+                previous call. Default: ``None``.
+            output_final_state (bool): whether to return the updated cache.
+            cu_seqlens (Tensor, optional): packed sequence offsets, ``[N+1]``.
+
+        Returns:
+            Tensor: outputs shaped like ``x`` and the returned cache (or
+            ``None``).
+        """
+        bsz, seqlen, _ = x.shape
+        pre_gate, post_gate, x_proj = self.input_projection(x).view(bsz, seqlen, 3, self.hidden_size).unbind(dim=2)
+        h, state = self.conv(
+            x=pre_gate * x_proj,
+            cache=cache,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+        return self.output_projection(post_gate * h), state
+
+
 class GatedDeltaNet2(nn.Module):
     r"""GatedDeltaNet2(hidden_size, num_heads, ...)
 
     GDN-2 token mixer block: projections → short convs → Gated Delta Rule-2 →
     gated RMSNorm → output projection. Mirrors the NVLabs layer parameterization
     (``f_proj`` bottleneck decay, ``A_log``/``dt_bias``, ``b``/``w`` gates,
-    ``g_proj`` output gate) with local :class:`ShortConvolution` modules and the
-    pure-PyTorch reference oracle (no kernels yet).
+    ``g_proj`` output gate) with local short-conv modules and the
+    pure-PyTorch reference oracle (no kernels yet). Each of q/k/v has its own
+    conv weights; ``liv_conv`` selects the double-gated :class:`LivConv1d`
+    instead of a plain :class:`ShortConvolution`.
 
     Args:
         hidden_size (int): model width.
@@ -608,6 +722,9 @@ class GatedDeltaNet2(nn.Module):
         use_short_conv (bool): depthwise short convs on q/k/v. Default: ``True``.
         conv_size (int): conv width. Default: ``4``.
         conv_bias (bool): conv bias. Default: ``False``.
+        liv_conv (bool): use the double-gated :class:`LivConv1d` (LIV conv)
+            instead of a plain :class:`ShortConvolution` for each of q/k/v
+            (separate weights per stream either way). Default: ``True``.
         allow_neg_eigval (bool): scale erase gate to ``[0, 2]``. Default: ``False``.
         norm_eps (float): RMSNorm epsilon. Default: ``1e-5``.
         backend (str): reference path (``"naive"``/``"recurrent"``/``"chunk"``/``"wy_fast"``,
@@ -640,6 +757,7 @@ class GatedDeltaNet2(nn.Module):
         use_short_conv: bool = True,
         conv_size: int = 4,
         conv_bias: bool = False,
+        liv_conv: bool = True,
         allow_neg_eigval: bool = False,
         norm_eps: float = 1e-5,
         backend: str = "naive",
@@ -671,6 +789,7 @@ class GatedDeltaNet2(nn.Module):
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
+        self.liv_conv = liv_conv
         self.allow_neg_eigval = allow_neg_eigval
         self.backend = backend
         self.chunk_size = chunk_size
@@ -686,9 +805,10 @@ class GatedDeltaNet2(nn.Module):
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         if use_short_conv:
-            self.q_conv1d = ShortConvolution(hidden_size=self.key_dim, kernel_size=conv_size, bias=conv_bias)
-            self.k_conv1d = ShortConvolution(hidden_size=self.key_dim, kernel_size=conv_size, bias=conv_bias)
-            self.v_conv1d = ShortConvolution(hidden_size=self.value_dim, kernel_size=conv_size, bias=conv_bias)
+            conv_type = LivConv1d if liv_conv else ShortConvolution
+            self.q_conv1d = conv_type(hidden_size=self.key_dim, kernel_size=conv_size, bias=conv_bias)
+            self.k_conv1d = conv_type(hidden_size=self.key_dim, kernel_size=conv_size, bias=conv_bias)
+            self.v_conv1d = conv_type(hidden_size=self.value_dim, kernel_size=conv_size, bias=conv_bias)
         self.f_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
             nn.Linear(self.head_v_dim, self.key_dim, bias=False),
@@ -704,7 +824,23 @@ class GatedDeltaNet2(nn.Module):
         )
         self.o_norm = nn.RMSNorm(self.head_v_dim, eps=norm_eps)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""reset_parameters() -> None
+
+        Re-applies the block init: Xavier input projections (gain
+        ``2**-2.5``) with zeroed biases, then the LIV convs' own neutral
+        (identity) init when ``liv_conv`` is on. Plain short convs keep their
+        ``nn.Conv1d`` default init.
+        """
+        for module in self.modules():
+            if "_is_hf_initialized" in module.__dict__:
+                del module.__dict__["_is_hf_initialized"]
         self.apply(self._initialize_weights)
+        if self.use_short_conv and self.liv_conv:
+            for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d):
+                conv.reset_parameters()
 
     def _initialize_weights(self, module: nn.Module) -> None:
         if getattr(module, "_is_hf_initialized", False):
@@ -881,6 +1017,9 @@ class GatedDeltaNet2Mixer(nn.Module):
         conv_size (int, optional): conv width. Default: ``None``
             (``config.conv_kernel_size``).
         conv_bias (bool): conv bias. Default: ``False``.
+        liv_conv (bool): use the double-gated LIV conv
+            (:class:`LivConv1d`) for q/k/v instead of a plain
+            :class:`ShortConvolution`. Default: ``True``.
         allow_neg_eigval (bool): scale erase gate to ``[0, 2]``. Default: ``False``.
         norm_eps (float, optional): RMSNorm epsilon. Default: ``None``
             (``config.rms_norm_eps``).
@@ -912,6 +1051,7 @@ class GatedDeltaNet2Mixer(nn.Module):
         use_short_conv: bool = True,
         conv_size: int | None = None,
         conv_bias: bool = False,
+        liv_conv: bool = True,
         allow_neg_eigval: bool = False,
         norm_eps: float | None = None,
         backend: str = "naive",
@@ -937,6 +1077,7 @@ class GatedDeltaNet2Mixer(nn.Module):
             use_short_conv=use_short_conv,
             conv_size=conv_size if conv_size is not None else config.conv_kernel_size,
             conv_bias=conv_bias,
+            liv_conv=liv_conv,
             allow_neg_eigval=allow_neg_eigval,
             norm_eps=norm_eps if norm_eps is not None else config.rms_norm_eps,
             backend=backend,
@@ -970,15 +1111,11 @@ class GatedDeltaNet2Mixer(nn.Module):
         r"""reset_parameters() -> None
 
         Re-applies the wrapped :class:`GatedDeltaNet2` init (Xavier input
-        projections with gain ``2**-2.5``, zero-start output biases) so a
-        freshly built (or re-initialized) mixer starts from the same
-        neutral point as the raw block.
+        projections with gain ``2**-2.5``, zero-start output biases, and the
+        LIV conv identity start) so a freshly built (or re-initialized) mixer
+        starts from the same neutral point as the raw block.
         """
-        layer = self.layer
-        for m in layer.modules():
-            if "_is_hf_initialized" in m.__dict__:
-                del m.__dict__["_is_hf_initialized"]
-        layer.apply(layer._initialize_weights)
+        self.layer.reset_parameters()
 
     def forward(
         self,
