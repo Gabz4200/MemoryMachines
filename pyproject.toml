@@ -78,6 +78,9 @@ python_version = "3.11"
 warn_unused_ignores = true
 disallow_untyped_defs = false
 
+[tool.coverage.run]
+source = ["memory_machines"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "src/memory_machines/models/blocks", "src/memory_machines/utils"]
 python_files = ["test_*.py"]
