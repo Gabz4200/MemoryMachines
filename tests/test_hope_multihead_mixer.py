@@ -6,6 +6,7 @@ Interface parity with GatedDeltaNet2 (the other token mixers):
           chunk_size=None) -> (out, None, cache|None)
 """
 
+import pytest
 import torch
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
@@ -262,6 +263,9 @@ def test_mixer_ctor_chunk_default_and_override():
         defaulted, _, _ = mixer(x)
         full, _, _ = mixer(x, chunk_size=6)
     torch.testing.assert_close(defaulted, full, atol=1e-5, rtol=1e-5)
+    # Unset per-call chunk resolves from config: nonzero is used verbatim, 0 means whole sequence.
+    assert SelfReferentialTitanMixer(_cfg(titan_chunk_size=3), memory_depth=1, use_short_conv=False).chunk_size == 3
+    assert SelfReferentialTitanMixer(_cfg(titan_chunk_size=0), memory_depth=1, use_short_conv=False).chunk_size is None
 
 
 def test_mixer_reset_fast_init_and_package_export():
@@ -280,3 +284,74 @@ def test_mixer_reset_fast_init_and_package_export():
     with torch.no_grad():
         out, weights, _ = mixer(x, output_attentions=True)
     assert tuple(out.shape) == (1, 3, 16) and weights is None
+
+
+@pytest.mark.parametrize("objective", ["l2", "dot"], ids=["l2", "dot"])
+@pytest.mark.parametrize("memory_depth", [1, 2], ids=["depth_1", "depth_2"])
+def test_mixer_chunk_backend_matches_naive_at_chunk_size_one(memory_depth: int, objective: str) -> None:
+    """TNT chunk path with one-token chunks equals the sequential backend (depth-1 closed form and deep autograd arms)."""
+    from memory_machines.models.blocks.fast_weights import (
+        HOPE_BOXES,
+        SelfReferentialTitanMixer,
+    )
+
+    torch.manual_seed(0)
+    naive = SelfReferentialTitanMixer(_cfg(titan_backend="naive"), memory_depth=memory_depth, objective=objective, use_short_conv=False).eval()
+    torch.manual_seed(0)
+    chunk = SelfReferentialTitanMixer(_cfg(titan_backend="chunk"), memory_depth=memory_depth, objective=objective, use_short_conv=False, chunk_size=1).eval()
+    chunk.load_state_dict(naive.state_dict())
+    torch.manual_seed(1)
+    x = torch.randn(1, 7, 16)
+    with torch.no_grad():
+        out_naive, _, state_naive = naive(x, use_cache=True)
+        out_chunk, _, state_chunk = chunk(x, use_cache=True)
+    assert state_naive is not None and state_chunk is not None
+    torch.testing.assert_close(out_chunk, out_naive, atol=1e-6, rtol=1e-5)
+    for box in HOPE_BOXES:
+        for got, ref in zip(state_chunk["fast_weights"][box], state_naive["fast_weights"][box]):
+            torch.testing.assert_close(got, ref, atol=1e-6, rtol=1e-5)
+
+
+def test_mixer_qk_projection_changes_retrieval_and_stays_causal() -> None:
+    """TNT query projection (arXiv:2511.07343 Sec. 4.1.2) rewrites queries yet keeps strict causality."""
+    from memory_machines.models.blocks.fast_weights import SelfReferentialTitanMixer
+
+    torch.manual_seed(0)
+    proj = SelfReferentialTitanMixer(_cfg(titan_backend="chunk", titan_use_qk_projection=True), memory_depth=1, use_short_conv=False, chunk_size=1).eval()
+    torch.manual_seed(0)
+    plain = SelfReferentialTitanMixer(_cfg(titan_backend="chunk"), memory_depth=1, use_short_conv=False, chunk_size=1).eval()
+    plain.load_state_dict(proj.state_dict())
+    torch.manual_seed(1)
+    x = torch.randn(1, 6, 16)
+    with torch.no_grad():
+        out_proj, _, _ = proj(x)
+        out_plain, _, _ = plain(x)
+        x2 = x.clone()
+        x2[0, 5] += 10.0
+        out_perturbed, _, _ = proj(x2)
+    assert (out_proj - out_plain).abs().amax().item() > 1e-5
+    delta = (out_perturbed - out_proj).abs().amax(-1)[0]
+    assert delta[:5].max().item() == 0.0
+    assert delta[5].item() > 0.0
+
+
+def test_mixer_packed_empty_segment_passes_through() -> None:
+    """A zero-length packed segment contributes no tokens and does not disturb its neighbours."""
+    mixer = _mixer()
+    torch.manual_seed(1)
+    x = torch.randn(1, 7, 16)
+    cu = torch.tensor([0, 3, 3, 7])
+    with torch.no_grad():
+        packed, _, _ = mixer(x, cu_seqlens=cu)
+        first, _, _ = mixer(x[:, :3])
+        last, _, _ = mixer(x[:, 3:])
+    assert tuple(packed.shape) == (1, 7, 16)
+    torch.testing.assert_close(packed[:, :3], first, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(packed[:, 3:], last, atol=1e-6, rtol=1e-5)
+
+
+def test_mixer_public_head_dims_and_backend() -> None:
+    mixer = _mixer(backend="chunk")
+    assert mixer.backend == "chunk"
+    assert mixer.head_dim_k == mixer.head_dim_v == mixer.head_dim == 8
+    assert mixer.memory.head_k_dim == mixer.memory.head_v_dim == 8

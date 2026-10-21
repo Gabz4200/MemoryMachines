@@ -13,6 +13,7 @@ from memory_machines.models.blocks.fast_weights import (
     HOPE_BOXES,
     SelfReferentialTitanMemory,
     _sr_mlp,
+    apply_qk_projection,
 )
 
 D, H = 8, 2
@@ -250,10 +251,33 @@ def test_selfref_error_paths():
     mem = _mk()
     with pytest.raises(ValueError, match=r"\[B, T, D="):
         mem(torch.randn(1, 3, D + 1))
+    with pytest.raises(ValueError, match=r"\[B, T, D="):
+        mem.project_qkv(torch.randn(1, 2, D + 1))
     with pytest.raises(ValueError, match="chunk_size"):
         mem(torch.randn(1, 3, D), chunk_size=0)
     with pytest.raises(ValueError, match="conv_state"):
         mem.project_qkv(torch.randn(1, 2, D), conv_state=torch.zeros(1))
+
+
+def test_qk_projection_matches_causal_key_accumulation() -> None:
+    """TNT Sec. 4.1.2: M_t q_t = sum_{tau<=t} (q_t . k_tau) k_tau, plus the carried M q_t."""
+    torch.manual_seed(2)
+    q = torch.randn(2, 4, H, KD)
+    k = _l2(torch.randn(2, 4, H, KD))
+    proj, carry = apply_qk_projection(q, k)
+    ref = torch.zeros_like(q)
+    for t in range(4):
+        for tau in range(t + 1):
+            ref[:, t] += (q[:, t] * k[:, tau]).sum(-1, keepdim=True) * k[:, tau]
+    torch.testing.assert_close(proj, ref, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(carry, torch.einsum("bthd,bthe->bhde", k, k), atol=1e-6, rtol=1e-5)
+
+    m0 = torch.randn(2, H, KD, KD)
+    proj2, carry2 = apply_qk_projection(q, k, m0)
+    torch.testing.assert_close(proj2, torch.einsum("bthd,bhde->bthe", q, m0) + ref, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(carry2, m0 + carry, atol=1e-6, rtol=1e-5)
+    # The carry is load-bearing: it changes the projected queries.
+    assert (proj2 - proj).abs().amax().item() > 1e-5
 
 
 def test_state_not_mutated_by_continuation():

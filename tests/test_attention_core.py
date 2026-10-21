@@ -154,6 +154,13 @@ def test_position_ids_explicit_and_overflow():
         m_short(torch.randn(1, 2, 32), position_ids=torch.tensor([[6, 8]]))
 
 
+def test_residual_init_scale_off_zero_starts_the_output_projection() -> None:
+    scaled = GroupedQueryAttention(dataclasses.replace(plain_cfg(), residual_init_scale=True))
+    zero = GroupedQueryAttention(dataclasses.replace(plain_cfg(), residual_init_scale=False))
+    assert torch.count_nonzero(scaled.o_proj.weight) > 0
+    assert torch.count_nonzero(zero.o_proj.weight) == 0
+
+
 def test_output_attentions_and_cache_none_contract():
     torch.manual_seed(5)
     x = torch.randn(1, 5, 32)

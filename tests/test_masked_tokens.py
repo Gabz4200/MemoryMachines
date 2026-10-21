@@ -12,6 +12,7 @@ from memory_machines.models.blocks.ced import CausalDecoder, MaskedTokenEmbeddin
 from memory_machines.models.blocks.positioning import CVPEContextBias
 from memory_machines.models.io import ModelInput
 from memory_machines.utils.config_schema import MemoryMachineConfig
+from tests.test_ced_loop import _amp_signal
 
 
 def _cfg(**kw):
@@ -150,6 +151,36 @@ def test_masked_decoder_queries_and_kv_are_encoder_states():
         del model.decoder.decode_full_context
     assert torch.equal(captured["queries"], captured["encoder"][:, -L:, :])
     assert torch.equal(captured["kv"], captured["encoder"])
+
+
+def test_masked_decoder_infers_the_tail_anchor_without_start_pos() -> None:
+    """A masked-query slice is anchored at [N-L, N) even when start_pos is omitted."""
+    torch.manual_seed(0)
+    dec = CausalDecoder(_cfg(ced_masked_token_count=4)).eval()
+    _amp_signal(dec)  # depth-scaled residual init leaves the output signal tiny
+    N, L = 6, 2
+    enc = torch.randn(1, N, 16)
+    queries = torch.randn(1, N, 16)[:, -L:]
+    with torch.no_grad():
+        implicit = dec.decode_full_context(queries, enc, num_masked_tokens=L)
+        explicit = dec.decode_full_context(queries, enc, start_pos=N - L, num_masked_tokens=L)
+        at_end = dec.decode_full_context(queries, enc, start_pos=N, num_masked_tokens=L)
+        at_zero = dec.decode_full_context(queries, enc, start_pos=0)
+    torch.testing.assert_close(implicit, explicit, atol=0, rtol=0)
+    # start_pos=N is routed through the same fallback, so it must agree too.
+    torch.testing.assert_close(at_end, implicit, atol=0, rtol=0)
+    # The inferred anchor is real, not a no-op: a different anchor changes the output.
+    assert not torch.allclose(at_zero, implicit)
+
+
+def test_masked_token_embedding_requires_a_positive_table_size() -> None:
+    with pytest.raises(ValueError, match="must be >= 1"):
+        MaskedTokenEmbedding(0, 3)
+
+
+def test_masked_token_embedding_rejects_rank_zero_indices() -> None:
+    with pytest.raises(ValueError, match="at least one dimension"):
+        MaskedTokenEmbedding(1, 3)(torch.tensor(0))
 
 
 def test_masked_decoder_kv_attention_uses_positional_encoding():

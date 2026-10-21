@@ -15,6 +15,28 @@ def plain_cfg():
     return dataclasses.replace(tiny_cfg(), cvpe_enabled=False, frvm_enabled=False)
 
 
+def test_cross_attention_rejects_kv_caching() -> None:
+    m = GroupedQueryAttention(plain_cfg()).eval()
+    with pytest.raises(ValueError, match="cross-attention"):
+        m(torch.randn(1, 3, 32), encoder_hidden_states=torch.randn(1, 5, 32), use_cache=True)
+
+
+def test_windowed_cache_replay_requires_past_positions() -> None:
+    m = GroupedQueryAttention(dataclasses.replace(plain_cfg(), window_size=4)).eval()
+    with torch.no_grad():
+        _, _, past = m(torch.randn(1, 6, 32), use_cache=True)
+    with pytest.raises(ValueError, match="past_positions"):
+        m(torch.randn(1, 1, 32), past_key_value=past, use_cache=True)
+
+
+def test_cache_replay_rejects_a_mismatched_position_batch() -> None:
+    m = GroupedQueryAttention(dataclasses.replace(plain_cfg(), window_size=0)).eval()  # untruncated: past_positions optional
+    with torch.no_grad():
+        _, _, past = m(torch.randn(1, 4, 32), use_cache=True)
+    with pytest.raises(ValueError, match="position_ids batch size"):
+        m(torch.randn(1, 1, 32), past_key_value=past, position_ids=torch.zeros(2, 1, dtype=torch.long))
+
+
 def test_full_attention_window_disabled_matches_manual_sdpa():
     # window_size=0 must run pure full attention: no window mask,
     # matching manual SDPA under both causal and non-causal modes.

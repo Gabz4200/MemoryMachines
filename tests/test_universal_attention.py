@@ -9,8 +9,13 @@ route to this op internally.
 
 import math
 
+import pytest
 import torch
 
+from memory_machines.ops.attention import (
+    _universal_pe_attention_fake,
+    universal_pe_attention_op,
+)
 from memory_machines.ops.references.attention_reference import (
     universal_pe_scaled_dot_product_attention as uattn,
 )
@@ -178,6 +183,49 @@ def test_ndim_zero_padding_toggle_matches_1d():
     assert torch.isfinite(b3).all()
 
 
+def test_gqa_cross_attention_promotes_1d_position_ids() -> None:
+    import dataclasses
+
+    from memory_machines.models.blocks import GroupedQueryAttention
+    from tests.test_blocks_shapes import tiny_cfg
+
+    torch.manual_seed(15)
+    cfg = dataclasses.replace(tiny_cfg(), window_size=0, cvpe_enabled=False, frvm_enabled=False)
+    m = GroupedQueryAttention(cfg).eval()
+    xq, xkv = torch.randn(1, 4, cfg.hidden_size), torch.randn(1, 9, cfg.hidden_size)
+    q1d, k1d = torch.arange(4), torch.arange(9)  # Lq=4 != S=9
+    with torch.no_grad():
+        out_1d, w_1d, _ = m(xq, encoder_hidden_states=xkv, position_ids=q1d, encoder_position_ids=k1d, bidirectional=True, output_attentions=True)
+        out_2d, w_2d, _ = m(
+            xq,
+            encoder_hidden_states=xkv,
+            position_ids=q1d.unsqueeze(0),
+            encoder_position_ids=k1d.unsqueeze(0),
+            bidirectional=True,
+            output_attentions=True,
+        )
+    torch.testing.assert_close(out_1d, out_2d, atol=0, rtol=0)
+    assert w_1d is not None and w_2d is not None
+    torch.testing.assert_close(w_1d, w_2d, atol=0, rtol=0)
+
+
+def test_pe_inputs_pads_1d_positions_to_the_spatial_width() -> None:
+    import dataclasses
+
+    from memory_machines.models.blocks import GroupedQueryAttention
+    from tests.test_blocks_shapes import tiny_cfg
+
+    torch.manual_seed(16)
+    m = GroupedQueryAttention(dataclasses.replace(tiny_cfg(), window_size=0, cvpe_max_dims=3)).eval()
+    q = torch.randn(1, m.num_heads, 4, m.head_dim)
+    vq = torch.randn(1, m.num_heads, 4, m.head_dim)
+    vk = torch.randn(1, m.num_heads, 6, m.head_dim)
+    _, _, _, grid, weight = m._pe_inputs(q, vq, vk, torch.arange(4).unsqueeze(0), torch.arange(6).unsqueeze(0))
+    # 1D positions are zero-padded to cvpe_max_dims before the offset grid.
+    assert grid is not None and tuple(grid.shape) == (1, 4, 6, 3)
+    assert weight is not None and tuple(weight.shape) == (m.head_dim, 3)
+
+
 def test_gqa_class_ndim_self_and_cross():
     import dataclasses
 
@@ -199,3 +247,47 @@ def test_gqa_class_ndim_self_and_cross():
     assert tuple(out_self.shape) == (1, 5, cfg.hidden_size)
     assert tuple(out_cross.shape) == (1, 5, cfg.hidden_size)
     assert w is not None and tuple(w.shape) == (1, m.num_heads, 5, 7)
+
+
+@pytest.mark.parametrize(
+    "q_shape,k_shape,v_shape",
+    [
+        ((2, 3, 8), (2, 3, 8), (2, 3, 8)),
+        ((2, 4, 5, 8), (2, 4, 5, 8), (2, 4, 5, 6)),
+        ((2, 3, 4, 5, 8), (2, 3, 4, 5, 8), (2, 3, 4, 5, 6)),
+    ],
+    ids=["3d", "4d", "5d"],
+)
+def test_fake_attention_accepts_rank_3_and_up(
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+) -> None:
+    torch.manual_seed(11)
+    out = _universal_pe_attention_fake(torch.randn(*q_shape), torch.randn(*k_shape), torch.randn(*v_shape))
+    # Output keeps the query layout except the last axis, which is value's.
+    assert tuple(out.shape) == (*q_shape[:-1], v_shape[-1])
+
+
+@pytest.mark.parametrize("bad", ["query", "key", "value"], ids=["query-2d", "key-2d", "value-2d"])
+def test_fake_attention_rejects_rank_below_3(bad: str) -> None:
+    torch.manual_seed(12)
+    tensors = {"query": torch.randn(3, 8), "key": torch.randn(3, 8), "value": torch.randn(3, 8)}
+    tensors[bad] = torch.randn(3)  # rank 1 for the axis under test
+    with pytest.raises(RuntimeError):
+        _universal_pe_attention_fake(tensors["query"], tensors["key"], tensors["value"])
+
+
+def test_universal_pe_attention_op_raises_not_implemented() -> None:
+    torch.manual_seed(13)
+    with pytest.raises(NotImplementedError, match="no compiled kernel yet"):
+        universal_pe_attention_op(torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
+
+
+def test_universal_pe_attention_custom_op_dispatches_to_registered_fake() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    torch.manual_seed(14)
+    with FakeTensorMode():
+        out = universal_pe_attention_op(torch.randn(2, 6, 8), torch.randn(2, 9, 8), torch.randn(2, 9, 5))
+        assert tuple(out.shape) == (2, 6, 5)

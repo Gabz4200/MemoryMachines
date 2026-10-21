@@ -20,6 +20,7 @@ from memory_machines.models.blocks import (
     AdaptiveExitGate,
     CausalDecoder,
     CausalEncoderDecoderStack,
+    CEDGlobalKVProjection,
     CompressedSparseAttention2,
     CSA2SharedState,
     DenseFFN,
@@ -170,6 +171,42 @@ def test_trm_looped_decoder_uses_three_stream_input():
     # features, and z_proj extracts the loop-local latent from the
     # The output must have the correct decoder-output shape.
     assert tuple(out.shape) == (1, 5, H)
+
+
+def test_plain_looped_decoder_skips_trm_and_runs_the_shared_layer() -> None:
+    dec = CausalDecoder(_loop_cfg(ced_decoder_trm=False, ced_decoder_loop_steps=3)).eval()
+    # The [X, Y, Z] mix and loop-local latent are TRM-only.
+    assert not hasattr(dec, "trm_mix")
+    assert not hasattr(dec, "z_proj")
+    with _record_loop_modes(dec) as modes:
+        out = dec.decode_full_context(torch.randn(1, 5, H), torch.randn(1, 6, H), exit_threshold=1.0)
+    assert modes == ["full", "reuse", "reuse"]
+    assert tuple(out.shape) == (1, 5, H)
+
+
+def test_plain_looped_decoder_matches_a_manual_single_stream_replay() -> None:
+    torch.manual_seed(0)
+    dec = CausalDecoder(_loop_cfg(ced_decoder_trm=False, ced_decoder_loop_steps=3)).eval()
+    gate = dec.gate
+    assert gate is not None
+    with torch.no_grad():
+        torch.nn.init.constant_(gate.proj.bias, -20.0)  # lambda -> 0, no early exit
+    h, enc = torch.randn(1, 5, H), torch.randn(1, 6, H)
+    with torch.no_grad(), _record_loop_modes(dec) as modes:
+        out = dec.decode_full_context(h, enc)
+    assert modes == ["full", "reuse", "reuse"]
+    # The plain path threads one running state through the shared layer + FFN,
+    # seeded once from the encoder projection.
+    layer = cast("CompressedSparseAttention2", dec.layers[0])
+    ffn = cast("DenseFFN", dec.ffns[0])
+    comp, ends = dec.global_projs[0](enc)
+    shared: CSA2SharedState | None = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=enc.shape[1])
+    x = h
+    with torch.no_grad():
+        for step in range(3):
+            x, shared = layer.forward_shared(x, shared, seeded_store=True, mode=CausalDecoder._loop_mode(step))
+            x = ffn(x, step=0)
+    torch.testing.assert_close(out, x, atol=1e-6, rtol=1e-6)
 
 
 def test_looped_decoder_reindexes_on_the_configured_cycle():
@@ -370,3 +407,31 @@ def test_exit_steps_threshold_one_forces_the_final_step_even_when_all_exit_early
     # steps below threshold is 0 (clamped to 0, +1 -> 1).
     lam = torch.ones(1, 5, 2)
     assert AdaptiveExitGate.exit_steps(lam, 1.0).tolist() == [[1, 1]]
+
+
+# 6. decoder construction and decode-entry guards -----------------------------
+def test_decoder_rejects_an_ffn_count_mismatch() -> None:
+    cfg = replace(tiny_cfg(), ced_num_decoder_layers=1)
+    base = CausalDecoder(cfg)
+    with pytest.raises(ValueError, match=r"ffns \(2\) must match"):
+        CausalDecoder(cfg, layers=[base.layers[0]], ffns=[base.ffns[0], base.ffns[0]])
+
+
+def test_global_kv_projection_rejects_indivisible_decoder_width() -> None:
+    with pytest.raises(ValueError, match="divisible by num_attention_heads"):
+        CEDGlobalKVProjection(tiny_cfg(), decoder_hidden_size=tiny_cfg().hidden_size - 2)
+
+
+def test_decode_full_context_rejects_a_2d_encoder_stream() -> None:
+    dec = CausalDecoder(replace(tiny_cfg(), ced_num_decoder_layers=1)).eval()
+    with pytest.raises(ValueError, match="encoder_final must be 3D"):
+        dec.decode_full_context(torch.randn(1, 2, H), torch.randn(6, H))
+
+
+def test_zero_layer_decoder_returns_its_input_unchanged() -> None:
+    cfg = replace(tiny_cfg(), ced_num_decoder_layers=1)
+    dec = CausalDecoder(cfg, layers=[], global_projs=[], ffns=[]).eval()
+    h = torch.randn(1, 4, H)
+    with torch.no_grad():
+        out = dec.decode_full_context(h, torch.randn(1, 6, H))
+    torch.testing.assert_close(out, h, atol=0, rtol=0)

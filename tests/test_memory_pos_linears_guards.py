@@ -10,7 +10,7 @@ from torch import nn
 
 from memory_machines.models.blocks.linears import ChunkedBottleneckLinear
 from memory_machines.models.blocks.memory import EngramMemory, _SsdTable
-from memory_machines.models.blocks.positioning import CVPEContextBias
+from memory_machines.models.blocks.positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 
@@ -331,3 +331,78 @@ def test_frvm_pairwise_delta_basic():
     out = gate.pairwise_delta(v_i, v_j)
     assert tuple(out.shape) == (1, 2, 3, 4)
     assert torch.isfinite(out).all()
+
+
+# --- CVPE N-dim coordinate handling (rank promotion, pad, truncate) -----------
+def _coords(length: int, n: int, batch: int = 1) -> torch.Tensor:
+    """Build ``(B, L, n)`` coordinates with distinct values per axis."""
+    base = torch.arange(length, dtype=torch.float32).unsqueeze(0).expand(batch, -1)
+    if n == 1:
+        return base.unsqueeze(-1)
+    cols = [base] + [torch.full_like(base, float(axis * 10)) for axis in range(1, n)]
+    return torch.stack(cols, dim=-1)
+
+
+@pytest.mark.parametrize("n", [1, 2], ids=["pad-from-1d", "pad-from-2d"])
+def test_cvpe_ndim_zero_pads_short_coordinate_streams(n: int) -> None:
+    mod = _nonzero_cvpe(head_dim=4, seed=5, spatial_dims=3)
+    q = torch.randn(1, 1, 3, 4)
+    q_short, k_short = _coords(3, n), _coords(5, n)
+    q_padded, k_padded = torch.zeros(1, 3, 3), torch.zeros(1, 5, 3)
+    q_padded[..., :n], k_padded[..., :n] = q_short, k_short
+    with torch.no_grad():
+        promoted = mod(q, q_short, k_short)
+        explicit = mod(q, q_padded, k_padded)
+    torch.testing.assert_close(promoted, explicit, atol=0, rtol=0)
+
+
+def test_cvpe_ndim_promotes_mixed_2d_and_3d_streams() -> None:
+    mod = _nonzero_cvpe(head_dim=4, seed=6, spatial_dims=1)
+    q = torch.randn(2, 1, 3, 4)
+    q_2d = _coords(3, 1, batch=2)[..., 0]  # (B, Lq), promoted by the N-dim path
+    k_3d = _coords(5, 1).expand(2, -1, -1)  # (B, Lk, 1)
+    with torch.no_grad():
+        mixed = mod(q, q_2d, k_3d)
+        both_3d = mod(q, q_2d.unsqueeze(-1), k_3d)
+    torch.testing.assert_close(mixed, both_3d, atol=0, rtol=0)
+
+
+def test_cvpe_ndim_truncates_extra_coordinate_axes() -> None:
+    mod = _nonzero_cvpe(head_dim=4, seed=7, spatial_dims=1)
+    q = torch.randn(1, 1, 3, 4)
+    q_3d, k_3d = _coords(3, 3), _coords(5, 3)
+    with torch.no_grad():
+        truncated = mod(q, q_3d, k_3d)
+        first_axis_only = mod(q, q_3d[..., :1], k_3d[..., :1])
+    assert tuple(truncated.shape) == (1, 1, 3, 5)
+    torch.testing.assert_close(truncated, first_axis_only, atol=0, rtol=0)
+
+
+def test_cvpe_ndim_rejects_mismatched_query_length() -> None:
+    mod = CVPEContextBias(head_dim=4, spatial_dims=2)
+    with pytest.raises(ValueError, match="q_pos shape"):
+        mod(torch.randn(1, 1, 3, 4), torch.zeros(1, 2, 2), torch.zeros(1, 5, 2))
+
+
+def test_cvpe_ndim_rejects_mismatched_key_batch() -> None:
+    mod = CVPEContextBias(head_dim=4, spatial_dims=2)
+    with pytest.raises(ValueError, match="k_pos shape"):
+        mod(torch.randn(2, 1, 3, 4), torch.zeros(2, 3, 2), torch.zeros(1, 5, 2))
+
+
+def test_cvpe_ndim_rejects_mismatched_coordinate_width() -> None:
+    mod = CVPEContextBias(head_dim=4, spatial_dims=2)
+    with pytest.raises(ValueError, match="dims"):
+        mod(torch.randn(1, 1, 3, 4), torch.zeros(1, 3, 2), torch.zeros(1, 5, 3))
+
+
+# --- positioning.py constructor guards ---------------------------------------
+def test_positioning_constructor_guards() -> None:
+    with pytest.raises(ValueError, match="spatial_dims"):
+        CVPEContextBias(head_dim=4, spatial_dims=0)
+    with pytest.raises(ValueError, match="axis_max"):
+        CVPEContextBias(head_dim=4, spatial_dims=2, axis_max=(10,))
+    with pytest.raises(ValueError, match="spatial_dims"):
+        FRVMSpatialOV(spatial_dims=0, head_dim=4)
+    with pytest.raises(ValueError, match="num_heads"):
+        FRVMValueGate(head_dim=4, num_heads=0)

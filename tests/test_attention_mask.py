@@ -13,6 +13,27 @@ def plain_cfg():
     return dataclasses.replace(tiny_cfg(), cvpe_enabled=False, frvm_enabled=False)
 
 
+def test_attend_rejects_the_causal_bidirectional_combo() -> None:
+    m = GroupedQueryAttention(plain_cfg()).eval()
+    q = torch.randn(1, m.num_heads, 3, m.head_dim)
+    kv = torch.randn(1, m.num_key_value_heads, 5, m.head_dim)
+    vq = torch.randn(1, m.num_key_value_heads, 3, m.head_dim)
+    q_pos, k_pos = torch.arange(3).unsqueeze(0), torch.arange(5).unsqueeze(0)
+    with pytest.raises(ValueError, match="bidirectional"):
+        m.attend(q, kv, kv, vq, q_pos, k_pos, is_causal=True, bidirectional=True)
+
+
+def test_attend_rejects_an_additive_mask_together_with_unwindowed_causal() -> None:
+    m = GroupedQueryAttention(plain_cfg()).eval()
+    q = torch.randn(1, m.num_heads, 3, m.head_dim)
+    kv = torch.randn(1, m.num_key_value_heads, 5, m.head_dim)
+    vq = torch.randn(1, m.num_key_value_heads, 3, m.head_dim)
+    q_pos, k_pos = torch.arange(3).unsqueeze(0), torch.arange(5).unsqueeze(0)
+    pad = torch.zeros(1, 1, 5, dtype=torch.bool)
+    with pytest.raises(ValueError, match="attn_mask=None"):
+        m.attend(q, kv, kv, vq, q_pos, k_pos, attention_mask=pad, windowed=False, is_causal=True)
+
+
 def test_gqa_is_causal_matches_explicit_tril():
     torch.manual_seed(0)
     m = GroupedQueryAttention(plain_cfg()).eval()
