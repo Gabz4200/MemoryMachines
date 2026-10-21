@@ -8,7 +8,7 @@ projection) and exposes the backbone embedding so HF resizing/tying works.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -42,13 +42,19 @@ class CustomModelForCausalLM(PreTrainedModel):
         self.vocab_size = config.typed_vocab_size
         self.post_init()
 
-    @property
-    def lm_head(self) -> nn.Linear:
-        return self.backbone.head
+    def __getattr__(self, name: str) -> Any:
+        if name == "lm_head":
+            return self.backbone.head
+        return super().__getattr__(name)
 
-    @lm_head.setter
-    def lm_head(self, value: nn.Linear) -> None:
-        self.backbone.head = value
+    def __setattr__(self, name: str, value: Any) -> None:
+        # nn.Module.__setattr__ registers Module values as submodules, so the
+        # alias must be routed explicitly to keep one registered head tensor.
+        modules = self.__dict__.get("_modules")
+        if name == "lm_head" and modules is not None and "backbone" in modules:
+            self.backbone.head = cast(nn.Linear, value)
+            return
+        super().__setattr__(name, value)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.backbone.get_input_embeddings()
@@ -57,10 +63,10 @@ class CustomModelForCausalLM(PreTrainedModel):
         self.backbone.set_input_embeddings(value)
 
     def get_output_embeddings(self) -> nn.Linear:
-        return self.lm_head
+        return cast(nn.Linear, self.lm_head)
 
     def set_output_embeddings(self, new_embeddings: nn.Module):
-        self.lm_head = cast(nn.Linear, new_embeddings)
+        self.backbone.head = cast(nn.Linear, new_embeddings)
 
     def forward(
         self,
