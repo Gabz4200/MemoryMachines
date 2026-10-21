@@ -115,7 +115,7 @@ def test_looped_decoder_shares_one_layer_projection_ffn_and_gate():
     assert isinstance(dec.layers[0], CompressedSparseAttention2)
     assert isinstance(dec.ffns[0], DenseFFN)
     assert isinstance(dec.gate, AdaptiveExitGate)
-    assert dec.loop_steps == 4
+    assert dec.loop_steps == 16
 
 
 def test_looping_off_keeps_one_layer_per_configured_depth():
@@ -173,10 +173,89 @@ def test_trm_looped_decoder_uses_three_stream_input():
 
 
 def test_looped_decoder_reindexes_on_the_configured_cycle():
-    dec = CausalDecoder(_loop_cfg(ced_decoder_loop_steps=5, ced_decoder_loop_exit_threshold=1.0)).eval()
+    dec = CausalDecoder(_loop_cfg(ced_decoder_loop_steps=9, ced_decoder_loop_exit_threshold=1.0)).eval()
     with _record_loop_modes(dec) as modes:
         dec.decode_full_context(torch.randn(1, 5, H), torch.randn(1, 6, H))
-    assert modes == ["full", "reindex", "reuse", "reuse", "reuse"]
+    # Grouped layout: full first, then groups of 3 reuse opened by a reindex.
+    assert modes == ["full", "reuse", "reuse", "reuse", "reindex", "reuse", "reuse", "reuse", "reindex"]
+
+
+def test_looped_decoder_uses_full_kv_for_masked_queries():
+    torch.manual_seed(0)
+    dec = CausalDecoder(_loop_cfg(ced_decoder_loop_steps=6, ced_decoder_loop_exit_threshold=1.0)).eval()
+    _amp_signal(dec)
+    N, L = 6, 2
+    enc = torch.randn(1, N, H)
+    queries = torch.randn(1, L, H)
+    kv_a = torch.randn(1, N, H)
+    kv_b = kv_a.clone()
+    kv_b[0, 0] += 1e3  # an earlier KV token the masked queries can see
+    q_pos = torch.arange(N - L, N).unsqueeze(0)
+    kv_pos = torch.arange(N).unsqueeze(0)
+    out_a = dec.decode_full_context(queries, enc, q_pos, start_pos=N - L, exit_threshold=1.0, kv_states=kv_a, kv_position_ids=kv_pos)
+    out_b = dec.decode_full_context(queries, enc, q_pos, start_pos=N - L, exit_threshold=1.0, kv_states=kv_b, kv_position_ids=kv_pos)
+    assert (out_a - out_b).abs().max().item() > 1e-4
+
+
+def test_looped_decoder_kv_stream_stays_causal():
+    torch.manual_seed(0)
+    dec = CausalDecoder(_loop_cfg(ced_decoder_loop_steps=5, ced_decoder_loop_exit_threshold=1.0)).eval()
+    _amp_signal(dec)
+    N = 6
+    enc = torch.randn(1, N, H)
+    query = torch.randn(1, 1, H)
+    kv_a = torch.randn(1, N, H)
+    kv_b = kv_a.clone()
+    kv_b[0, 4] += 10.0  # future relative to the query at position 2
+    q_pos = torch.tensor([[2]])
+    kv_pos = torch.arange(N).unsqueeze(0)
+    out_a = dec.decode_full_context(query, enc, q_pos, start_pos=2, exit_threshold=1.0, kv_states=kv_a, kv_position_ids=kv_pos)
+    out_b = dec.decode_full_context(query, enc, q_pos, start_pos=2, exit_threshold=1.0, kv_states=kv_b, kv_position_ids=kv_pos)
+    torch.testing.assert_close(out_a, out_b, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", [(6,), (2, 6, H), (1, 6, H + 1)], ids=["rank2", "batch", "width"])
+def test_decoder_rejects_a_malformed_kv_stream(shape: tuple[int, ...]) -> None:
+    dec = CausalDecoder(_loop_cfg()).eval()
+    with pytest.raises(ValueError, match="kv_states must be"):
+        dec.decode_full_context(torch.randn(1, 2, H), torch.randn(1, 6, H), torch.arange(2).unsqueeze(0), kv_states=torch.randn(*shape))
+
+
+def test_stack_forwards_the_kv_stream_to_the_decoder() -> None:
+    torch.manual_seed(0)
+    stack = CausalEncoderDecoderStack(_loop_cfg(ced_decoder_loop_steps=5, ced_decoder_loop_exit_threshold=1.0)).eval()
+    h, enc = torch.randn(1, 2, H), torch.randn(1, 6, H)
+    kv = torch.randn(1, 6, H)
+    kv_pos = torch.arange(6).unsqueeze(0)
+    via_stack = stack.decode_full_context(h, enc, exit_threshold=1.0, kv_states=kv, kv_position_ids=kv_pos)
+    via_decoder = stack.decoder.decode_full_context(h, enc, exit_threshold=1.0, kv_states=kv, kv_position_ids=kv_pos)
+    torch.testing.assert_close(via_stack, via_decoder)
+
+
+def test_looped_decoder_passes_the_kv_stream_to_every_iteration():
+    dec = CausalDecoder(_loop_cfg(ced_decoder_loop_steps=5, ced_decoder_loop_exit_threshold=1.0)).eval()
+    layer = dec.layers[0]
+    orig = cast("Callable[..., tuple[torch.Tensor, CSA2SharedState]]", layer.forward_shared)
+    seen: list[tuple[int, int]] = []
+
+    def spy(*args, **kwargs):
+        seen.append((args[0].shape[1], kwargs["kv_states"].shape[1]))
+        return orig(*args, **kwargs)
+
+    object.__setattr__(layer, "forward_shared", spy)
+    try:
+        dec.decode_full_context(
+            torch.randn(1, 2, H),
+            torch.randn(1, 6, H),
+            torch.arange(4, 6).unsqueeze(0),
+            start_pos=4,
+            exit_threshold=1.0,
+            kv_states=torch.randn(1, 6, H),
+            kv_position_ids=torch.arange(6).unsqueeze(0),
+        )
+    finally:
+        object.__delattr__(layer, "forward_shared")
+    assert seen == [(2, 6)] * 5
 
 
 def test_looped_decoder_output_changes_with_loop_depth():
@@ -220,7 +299,7 @@ def test_looped_decoder_runs_every_step_when_the_gate_never_exits():
         torch.nn.init.constant_(gate.proj.bias, -20.0)  # lambda -> 0
     with _record_loop_modes(dec) as modes:
         dec.decode_full_context(torch.randn(1, 5, H), torch.randn(1, 6, H))
-    assert modes == ["full", "reindex", "reuse"]
+    assert modes == ["full", "reuse", "reuse"]
 
 
 # 5. stack wiring, encoder conditioning, causality, config validation ----------

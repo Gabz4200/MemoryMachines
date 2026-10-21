@@ -711,7 +711,9 @@ class CompressedSparseAttention2(CompressedSparseAttention):
                 decoder, whose global KV is projected from the
                 encoder-final states rather than derived from decoder
                 hidden states (CSA2, Eq. 1). Default: ``False``.
-            kv_states (Tensor, optional): full KV stream for masked-query mode; queries stay in hidden_states. Default: None.
+            kv_states (Tensor, optional): encoder-final latent stream used as
+                keys/values in masked-query mode; queries stay in
+                ``hidden_states``. Default: ``None``.
             kv_position_ids (Tensor, optional): positions for kv_states, (B, Lk). Default: None.
             mode (str, optional): per-call override of the layer's
                 ``full``/``reindex``/``reuse`` mode, used by the looped
@@ -756,7 +758,9 @@ class CompressedSparseAttention2(CompressedSparseAttention):
             else:
                 kv_src = kv_states if kv_states is not None else hidden_states
                 src = compress_from if compress_from is not None else kv_src
-                start = compress_start_pos if compress_from is not None else past_len_raw
+                # An alternate or masked-query source is an absolute stream
+                # starting at position 0; only self-compression continues past.
+                start = compress_start_pos if (compress_from is not None or kv_states is not None) else past_len_raw
                 new_comp, new_ends = self.compressor(src, start_pos=start)
                 if compress_from is not None:
                     full_comp, full_ends = new_comp, new_ends

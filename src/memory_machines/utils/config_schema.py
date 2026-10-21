@@ -178,12 +178,20 @@ class MemoryMachineConfig:
             parameter-shared layer plus one shared encoder-KV projection,
             applied ``ced_decoder_loop_steps`` times. Default: ``False``.
         ced_decoder_loop_steps: Recurrent depth ``T_max`` of the looped
-            decoder (number of times the shared layer is applied). Default:
-            ``4``.
+            decoder (number of times the shared layer is applied). The
+            grouped layout needs a multiple of four to reach every
+            ``reindex`` stage: ``16`` gives one ``full`` plus three groups of
+            ``reindex`` + 3x ``reuse``. Default: ``16``.
         ced_decoder_loop_exit_threshold: Q-exit threshold ``q`` for the
             decoder's exit gate: the loop stops at the first step whose
             cumulative exit probability reaches ``q``. ``0.0`` exits
             immediately, ``1.0`` forces a full loop. Default: ``0.5``.
+        ced_masked_query: Enable Perceiver-AR masked generation (mask
+            embeddings appended to the sequence; only their latents query the
+            decoder). Default: ``False``.
+        ced_masked_token_count: Size of the learned mask-embedding table.
+            Masked indices wrap cyclically, so the masked count is free per
+            forward pass and larger than this table. Default: ``1``.
         ced_decoder_hidden_size: Asymmetric decoder width. ``0`` (default)
             keeps the decoder at ``hidden_size`` (symmetric encoder/decoder).
             When set, the encoder stays at ``hidden_size`` (wide prefill) and
@@ -373,7 +381,7 @@ class MemoryMachineConfig:
     ced_encoder_ffn_update_intervals: tuple[int, ...] = ()
     ced_decoder_ffn_update_intervals: tuple[int, ...] = ()
     ced_decoder_looping: bool = False
-    ced_decoder_loop_steps: int = 4
+    ced_decoder_loop_steps: int = 16
     ced_decoder_loop_exit_threshold: float = 0.5
     ced_decoder_trm: bool = True
     ced_decoder_hidden_size: int = 0

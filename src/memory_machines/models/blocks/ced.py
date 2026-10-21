@@ -43,7 +43,18 @@ collapses into one parameter-shared layer (plus one shared encoder-KV
 projection), applied ``ced_decoder_loop_steps`` times, and an
 :class:`AdaptiveExitGate` stops the loop early per position once its
 cumulative exit probability crosses
-``ced_decoder_loop_exit_threshold``.
+``ced_decoder_loop_exit_threshold``. The shared layer's CSA2 stage follows
+the grouped decoder layout: ``full`` on the first application, then groups
+of three ``reuse`` applications opened by a ``reindex`` (``reindex`` at
+steps 4, 8, 12, ...), so the loop reproduces the block pattern of the
+reference decoder while keeping one set of weights.
+
+Perceiver-AR generation reuses the same path: the encoder first contextualizes
+the appended masked latents; the decoder then receives those masked latents as
+``hidden_states`` (the only queries) and the encoder-final latent sequence as
+``kv_states`` (keys/values), so every position contributes K/V while the masked
+tail queries. The compressed store stays the encoder-projected global KV of
+Eq. 1.
 """
 
 from dataclasses import replace
@@ -519,8 +530,10 @@ class CausalEncoderDecoderStack(nn.Module):
         seeded_store: bool = True,
         exit_threshold: float | None = None,
         num_masked_tokens: int | None = None,
+        kv_states: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None, num_masked_tokens=None) -> Tensor
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None, num_masked_tokens=None, kv_states=None, kv_position_ids=None) -> Tensor
 
         Decode with every decoder layer seeded from the encoder-final states.
 
@@ -564,6 +577,11 @@ class CausalEncoderDecoderStack(nn.Module):
                 count; when set, the masked query slice is anchored at
                 positions ``[N-L, N)`` instead of ``[enc_len, enc_len+L)``.
                 Default: ``None`` (no masked-token mode).
+            kv_states (Tensor, optional): encoder-final latent stream used as
+                Perceiver-AR keys/values (queries come from ``hidden_states``).
+                Default: ``None``.
+            kv_position_ids (Tensor, optional): positions of ``kv_states``.
+                Default: ``None``.
 
         Returns:
             Tensor: decoder outputs of shape ``(B, Ld, D)``.
@@ -586,6 +604,8 @@ class CausalEncoderDecoderStack(nn.Module):
             seeded_store=seeded_store,
             exit_threshold=exit_threshold,
             num_masked_tokens=num_masked_tokens,
+            kv_states=kv_states,
+            kv_position_ids=kv_position_ids,
         )
 
     def prefill(
@@ -860,9 +880,17 @@ class CausalDecoder(nn.Module):
     ``CSA2 -> DenseFFN`` layer (and one shared
     :class:`CEDGlobalKVProjection`) is applied ``ced_decoder_loop_steps``
     times. The layer's ``full`` / ``reindex`` / ``reuse`` stage cycles per
-    iteration (:meth:`_loop_mode`), so reindexing still happens inside the
-    loop, and :attr:`gate` reads the hidden state after each iteration to
+    iteration (:meth:`_loop_mode`) in the grouped layout of the reference
+    decoder: ``full`` first, then ``reuse`` blocks of three opened by a
+    ``reindex``. :attr:`gate` reads the hidden state after each iteration to
     exit positions early (Q-exit).
+
+    Perceiver-AR decoding passes the encoder-final latent sequence as
+    ``kv_states`` while ``hidden_states`` holds the encoder's masked latents.
+    The masked positions are the only queries; every position contributes
+    keys/values to the SWA branch, and the compressed store remains the
+    encoder's global KV (Eq. 1). The same contract holds for both the plain
+    LoopLM and TRM paths.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
@@ -1026,8 +1054,10 @@ class CausalDecoder(nn.Module):
         seeded_store: bool = True,
         exit_threshold: float | None = None,
         num_masked_tokens: int | None = None,
+        kv_states: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None) -> Tensor
+        r"""decode_full_context(hidden_states, encoder_final, position_ids=None, start_pos=None, seeded_store=True, exit_threshold=None, num_masked_tokens=None, kv_states=None, kv_position_ids=None) -> Tensor
 
         Decode with every decoder layer seeded from the encoder-final states.
 
@@ -1061,6 +1091,17 @@ class CausalDecoder(nn.Module):
                 overriding ``config.ced_decoder_loop_exit_threshold`` for this
                 call (looped decoder only). ``1.0`` forces every loop step.
                 Default: ``None`` (use the config value).
+            num_masked_tokens (int, optional): Perceiver-AR masked-token count;
+                when set, the masked query slice is anchored at positions
+                ``[N-L, N)``. Default: ``None`` (no masked-token mode).
+            kv_states (Tensor, optional): encoder-final latent stream
+                ``(B, Lk, D)`` for Perceiver-AR decoding: queries stay in
+                ``hidden_states`` (the encoder's masked latents) while
+                keys/values come from this stream. The compressed store is
+                still the encoder projection. Default: ``None`` (keys/values
+                come from ``hidden_states``).
+            kv_position_ids (Tensor, optional): positions of ``kv_states``
+                ``(B, Lk)``. Default: ``None`` (implicit counting).
 
         Returns:
             Tensor: decoder outputs of shape ``(B, Ld, D)``.
@@ -1087,6 +1128,8 @@ class CausalDecoder(nn.Module):
             # If the decoder input is just the masked slice, adjust start_pos.
             if hidden_states.shape[1] == L and start_pos == N:
                 start_pos = max(0, N - L)
+        if kv_states is not None and (kv_states.dim() != 3 or kv_states.shape[0] != hidden_states.shape[0] or kv_states.shape[-1] != hidden_states.shape[-1]):
+            raise ValueError(f"kv_states must be (B, Lk, D) matching hidden_states batch/width, got {tuple(kv_states.shape)} vs {tuple(hidden_states.shape)}")
         if self.config.ced_decoder_looping:
             return self._decode_looped(
                 hidden_states,
@@ -1096,6 +1139,8 @@ class CausalDecoder(nn.Module):
                 num_masked_tokens=num_masked_tokens,
                 seeded_store=seeded_store,
                 exit_threshold=exit_threshold,
+                kv_states=kv_states,
+                kv_position_ids=kv_position_ids,
             )
         layers = cast("list[CompressedSparseAttention2]", list(self.layers))
         if not layers:
@@ -1118,6 +1163,8 @@ class CausalDecoder(nn.Module):
                 shared,
                 position_ids=position_ids,
                 seeded_store=seeded_store,
+                kv_states=kv_states,
+                kv_position_ids=kv_position_ids,
             )
             # The layer index is the per-forward step counter shared by every
             # decoder FFN; each block's own update_interval decides on which
@@ -1131,18 +1178,25 @@ class CausalDecoder(nn.Module):
 
         CSA2 stage for loop iteration ``step`` (0-based).
 
-        Keeps the paper's ``full`` / ``reindex`` / ``reuse`` cycle (a
-        ``reindex`` every fourth iteration) while sharing one layer's weights
-        across all iterations, so reindexing still happens inside the loop.
+        Follows the grouped decoder layout: the first application builds the
+        store (``full``), then each group of four applications is three
+        ``reuse`` stages opened by a ``reindex`` (steps 4, 8, 12, ...).
+        Sharing one layer's weights keeps the pattern while removing one
+        parameter set per stage.
 
         Args:
             step (int): zero-based loop iteration.
 
         Returns:
-            str: ``"full"`` at step 0, ``"reindex"`` when ``step % 4 == 1``,
+            str: ``"full"`` at step 0, ``"reindex"`` when ``step % 4 == 0``,
             else ``"reuse"``.
+
+        Examples::
+
+            >>> [CausalDecoder._loop_mode(s) for s in range(9)]
+            ['full', 'reuse', 'reuse', 'reuse', 'reindex', 'reuse', 'reuse', 'reuse', 'reindex']
         """
-        return "full" if step == 0 else ("reindex" if step % 4 == 1 else "reuse")
+        return "full" if step == 0 else ("reindex" if step % 4 == 0 else "reuse")
 
     @staticmethod
     def _exit_loop(
@@ -1204,8 +1258,10 @@ class CausalDecoder(nn.Module):
         seeded_store: bool,
         exit_threshold: float | None,
         num_masked_tokens: int | None = None,
+        kv_states: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r"""_decode_looped(hidden_states, encoder_final, position_ids=None, *, start_pos, seeded_store, exit_threshold) -> Tensor
+        r"""_decode_looped(hidden_states, encoder_final, position_ids=None, *, start_pos, seeded_store, exit_threshold, num_masked_tokens=None, kv_states=None, kv_position_ids=None) -> Tensor
 
         Run the parameter-shared decoder layer for up to ``loop_steps``
         iterations with per-position early exit.
@@ -1215,7 +1271,10 @@ class CausalDecoder(nn.Module):
         from :meth:`_loop_mode`) followed by the same dense FFN, then reads
         the exit gate. A position stops updating at the first iteration whose
         cumulative exit probability reaches ``exit_threshold``; the loop
-        stops early once every position has exited.
+        stops early once every position has exited. ``kv_states`` (the
+        encoder-final latent sequence) turns every iteration into a
+        Perceiver-AR cross-attend: ``hidden_states`` supplies the masked
+        queries, ``kv_states`` supplies keys/values.
 
         Returns:
             Tensor: decoder outputs ``(B, Ld, D)``, each position taken from
@@ -1259,6 +1318,8 @@ class CausalDecoder(nn.Module):
                     position_ids=position_ids,
                     seeded_store=seeded_store,
                     mode=self._loop_mode(step),
+                    kv_states=kv_states,
+                    kv_position_ids=kv_position_ids,
                 )
                 layer_in = self.ffns[0](layer_in, step=0)
                 # Y takes the refined layer output (the answer / layer output).
@@ -1298,6 +1359,8 @@ class CausalDecoder(nn.Module):
                 position_ids=position_ids,
                 seeded_store=seeded_store,
                 mode=self._loop_mode(step),
+                kv_states=kv_states,
+                kv_position_ids=kv_position_ids,
             )
             # The loop is a black box for the update schedule: the repeated
             # CSA2 -> DenseFFN pattern counts as a single forward-call step,
@@ -1457,10 +1520,9 @@ class CausalDecoder(nn.Module):
 class MaskedTokenEmbedding(nn.Module):
     """Learnable masked-token embedding table for Perceiver-AR generation.
 
-    Each masked position receives a learnable vector. The caller is expected
-    to keep the masked-token count within the table size so every position
-    gets a distinct embedding; an out-of-range index raises rather than
-    silently aliasing two positions via cyclic modulo.
+    The masked-patch count is free per forward pass; indices above the table
+    size wrap cyclically, so a table of one (the default) gives every mask the
+    same learned vector while larger tables distinguish the first positions.
 
     Args:
         num_tokens (int): size of the embedding table (>= 1).
@@ -1475,10 +1537,4 @@ class MaskedTokenEmbedding(nn.Module):
         self.embed = nn.Embedding(num_tokens, hidden_size)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        # The cyclic lookup is a safety net: callers should keep the masked
-        # count within the table size so every position gets a distinct
-        # embedding. Fail loudly when that contract is violated instead of
-        # silently aliasing two positions.
-        if indices.max().item() >= self.num_tokens:
-            raise ValueError(f"masked-token index {indices.max().item()} exceeds the table size ({self.num_tokens}); cyclic modulo would alias positions")
-        return self.embed(indices)
+        return self.embed(indices % self.num_tokens)
