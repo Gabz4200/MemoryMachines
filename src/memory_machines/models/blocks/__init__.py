@@ -28,6 +28,7 @@ from .fast_weights import (
 )
 from .ffn import DenseFFN, SwiGLU, build_ffn
 from .gdn2 import GatedDeltaNet2, GatedDeltaNet2Mixer, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
+from .latent_sampling import GaussianLatentSampler, LatentSample
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC, from_streams, to_streams
@@ -75,6 +76,7 @@ __all__ = [
     "FactoredLinear",
     "GatedDeltaNet2",
     "GatedDeltaNet2Mixer",
+    "GaussianLatentSampler",
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HeadRMSNorm",
@@ -82,6 +84,7 @@ __all__ = [
     "HopeAttentionBlock",
     "HopeBlock",
     "JacobiRKAN",
+    "LatentSample",
     "LivConvBlock",
     "LivDoubleGatedBase",
     "LivPerceiver",

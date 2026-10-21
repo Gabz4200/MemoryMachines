@@ -306,6 +306,18 @@ class MemoryMachineConfig:
         blt_tie_word_embeddings: Tie the byte embedding table and the local
             decoder output projection. Default: ``False`` (paper does not tie
             local encoder/decoder logits).
+        blt_latent_sampling: Sample a reparameterized Gaussian latent per
+            patch between the BLT causal decoder and vocabulary decoder.
+            Default: ``False``.
+        blt_latent_target_std: Standard deviation the sampler starts at and
+            its variance regularizer anchors to. Default: ``0.1``.
+        blt_latent_temperature: Scale factor on the standard-normal latent
+            draw before it multiplies the predicted standard deviation; ``0``
+            uses the predicted mean only. Default: ``1.0``.
+        blt_latent_min_std: Numerical floor on the predicted standard
+            deviation. Default: ``1e-4``.
+        blt_latent_std_reg_weight: Weight of the variance-only KL regularizer
+            that prevents std collapse. Default: ``0.01``.
     """
 
     vocab_size: int = 32768
@@ -440,6 +452,11 @@ class MemoryMachineConfig:
     blt_max_patch_bytes: int = 8
     blt_local_max_position_embeddings: int = 0
     blt_tie_word_embeddings: bool = False
+    blt_latent_sampling: bool = False
+    blt_latent_target_std: float = 0.1
+    blt_latent_temperature: float = 1.0
+    blt_latent_min_std: float = 1e-4
+    blt_latent_std_reg_weight: float = 0.01
 
     def __post_init__(self):
         """Validate invariant bounds across configuration fields."""
@@ -657,6 +674,16 @@ class MemoryMachineConfig:
             raise ValueError(f"blt_max_patch_bytes ({self.blt_max_patch_bytes}) must be >= 1")
         if self.blt_local_max_position_embeddings < 0:
             raise ValueError(f"blt_local_max_position_embeddings ({self.blt_local_max_position_embeddings}) must be non-negative (0 = max_position_embeddings * blt_patch_size)")
+        if self.blt_latent_target_std <= 0:
+            raise ValueError(f"blt_latent_target_std ({self.blt_latent_target_std}) must be positive")
+        if self.blt_latent_temperature < 0:
+            raise ValueError(f"blt_latent_temperature ({self.blt_latent_temperature}) must be non-negative")
+        if self.blt_latent_min_std <= 0:
+            raise ValueError(f"blt_latent_min_std ({self.blt_latent_min_std}) must be positive")
+        if self.blt_latent_min_std > self.blt_latent_target_std:
+            raise ValueError(f"blt_latent_min_std ({self.blt_latent_min_std}) must not exceed blt_latent_target_std ({self.blt_latent_target_std})")
+        if self.blt_latent_std_reg_weight < 0:
+            raise ValueError(f"blt_latent_std_reg_weight ({self.blt_latent_std_reg_weight}) must be non-negative")
 
     @classmethod
     def from_pretrained_size(cls, size: str) -> "MemoryMachineConfig":

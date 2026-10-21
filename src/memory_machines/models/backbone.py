@@ -32,6 +32,7 @@ from memory_machines.models.blocks.ced import (
     _validate_encoder_layers,
     decoder_width,
 )
+from memory_machines.models.blocks.latent_sampling import GaussianLatentSampler
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
 from memory_machines.models.registry import register_model
@@ -484,6 +485,7 @@ class BLTBackbone(nn.Module):
             config.hidden_size,
         )
         self.up = VocabularyUpProjection(config)
+        self.latent_sampler = GaussianLatentSampler(config) if config.blt_latent_sampling else None
         self.decoder_in_proj = nn.Identity() if decoder_width(config) == config.hidden_size else nn.Linear(config.hidden_size, decoder_width(config), bias=False)
         self.reset_parameters()
 
@@ -500,6 +502,8 @@ class BLTBackbone(nn.Module):
         if isinstance(self.decoder_in_proj, nn.Linear):
             std = self.config.initializer_range
             nn.init.trunc_normal_(self.decoder_in_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        if self.latent_sampler is not None:
+            self.latent_sampler.reset_parameters()
         if self.config.blt_tie_word_embeddings:
             # reset_parameters re-initialized both tensors; keep them tied.
             self.vocab_decoder.output.weight = self.vocab_encoder.byte_embeddings.weight
@@ -595,6 +599,8 @@ class BLTBackbone(nn.Module):
         if L is not None and L < 0:
             raise ValueError(f"num_masked_tokens ({L}) must be non-negative")
         masked = L is not None and L > 0
+        temperature = inputs.temperature if inputs.temperature is not None else self.config.blt_latent_temperature
+        aux_loss = None
         if masked:
             assert L is not None
             mask_indices = torch.arange(L, device=x.device)
@@ -619,6 +625,10 @@ class BLTBackbone(nn.Module):
             )
             dec_out = dec_out[:, -L:, :]
             masked_reps = self.up(dec_out)
+            if self.latent_sampler is not None:
+                sample = self.latent_sampler(masked_reps, temperature=temperature)
+                masked_reps = sample.latent
+                aux_loss = self.config.blt_latent_std_reg_weight * sample.regularization
             # Masked slots condition on their own patch's latent decoder output
             # (the prefix is never attended).
             patch_reps = torch.cat([encoder_final[:, :num_patches], masked_reps], dim=1)
@@ -628,5 +638,10 @@ class BLTBackbone(nn.Module):
             # Patch p of byte i holds bytes up to i, so query i reads latent p - 1
             # (the begin patch for p == 0). Even then logits[i] predicts byte i + 1
             # only after that byte's own patch; see VocabularyDecoder.forward.
-            logits = self.vocab_decoder(byte_hidden, self.up(dec_out), patch_ids)
-        return ModelOutput(logits=logits, new_state=None)
+            latents = self.up(dec_out)
+            if self.latent_sampler is not None:
+                sample = self.latent_sampler(latents, temperature=temperature)
+                latents = sample.latent
+                aux_loss = self.config.blt_latent_std_reg_weight * sample.regularization
+            logits = self.vocab_decoder(byte_hidden, latents, patch_ids)
+        return ModelOutput(logits=logits, new_state=None, aux_loss=aux_loss)

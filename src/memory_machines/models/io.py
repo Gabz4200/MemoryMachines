@@ -29,6 +29,9 @@ class ModelInput:
     inputs_embeds: torch.Tensor | None = None
     pixel_values: torch.Tensor | None = None
     num_masked_tokens: int | None = None
+    # BLT: per-call inference temperature for latent sampling; None uses the
+    # configured ``blt_latent_temperature``.
+    temperature: float | None = None
 
 
 @dataclass
