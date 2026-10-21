@@ -190,8 +190,10 @@ class MemoryMachineConfig:
             embeddings appended to the sequence; only their latents query the
             decoder). Default: ``False``.
         ced_masked_token_count: Size of the learned mask-embedding table.
-            Masked indices wrap cyclically, so the masked count is free per
-            forward pass and larger than this table. Default: ``1``.
+            ``1`` shares one embedding across every mask; a shorter masked
+            count takes the table's highest-index entries in order, and a
+            longer count interpolates between neighbouring entries. Default:
+            ``1``.
         ced_decoder_hidden_size: Asymmetric decoder width. ``0`` (default)
             keeps the decoder at ``hidden_size`` (symmetric encoder/decoder).
             When set, the encoder stays at ``hidden_size`` (wide prefill) and

@@ -1518,15 +1518,34 @@ class CausalDecoder(nn.Module):
 
 
 class MaskedTokenEmbedding(nn.Module):
-    """Learnable masked-token embedding table for Perceiver-AR generation.
+    r"""Learnable masked-token embedding table for Perceiver-AR generation.
 
-    The masked-patch count is free per forward pass; indices above the table
-    size wrap cyclically, so a table of one (the default) gives every mask the
-    same learned vector while larger tables distinguish the first positions.
+    The masked-patch count is free per forward pass and the table is laid out
+    over the requested slots as follows, with ``C`` table entries and ``L``
+    requested slots:
+
+    - ``C == 1``: every slot shares the single learned vector.
+    - ``L <= C``: the last ``L`` entries are used in order, so a shorter
+      request prioritizes the higher-index codebooks (``L == C`` yields the
+      whole table in order; ``L == 1`` yields the final entry).
+    - ``L > C``: entry ``j`` anchors at slot ``j * (L - 1) / (C - 1)`` (first
+      entry at slot 0, last entry at slot ``L - 1``), and every other slot is
+      the linear interpolation of its two neighbouring entries.
 
     Args:
         num_tokens (int): size of the embedding table (>= 1).
         hidden_size (int): embedding dimension.
+
+    Examples::
+
+        >>> import torch
+        >>> emb = MaskedTokenEmbedding(4, 3)
+        >>> with torch.no_grad():
+        ...     _ = emb.embed.weight.copy_(torch.arange(12, dtype=torch.float32).view(4, 3))
+        >>> emb(torch.arange(2)).tolist()
+        [[6.0, 7.0, 8.0], [9.0, 10.0, 11.0]]
+        >>> emb(torch.arange(5)).shape
+        torch.Size([5, 3])
     """
 
     def __init__(self, num_tokens: int, hidden_size: int):
@@ -1537,4 +1556,42 @@ class MaskedTokenEmbedding(nn.Module):
         self.embed = nn.Embedding(num_tokens, hidden_size)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        return self.embed(indices % self.num_tokens)
+        r"""forward(indices) -> Tensor
+
+        Map requested mask slots to codebook embeddings.
+
+        ``indices`` supplies the slot layout through its trailing length; its
+        values are not read (callers pass ``arange(L)``). Leading dimensions
+        are broadcast, so a ``(B, L)`` input yields ``(B, L, hidden_size)``.
+
+        Args:
+            indices (Tensor): mask-slot indices of shape ``(..., L)``.
+
+        Returns:
+            Tensor: embeddings of shape ``(..., L, hidden_size)``.
+
+        Raises:
+            ValueError: if ``indices`` has no trailing slot dimension.
+
+        Examples::
+
+            >>> import torch
+            >>> MaskedTokenEmbedding(1, 4)(torch.arange(6)).shape
+            torch.Size([6, 4])
+        """
+        if indices.dim() == 0:
+            raise ValueError("indices must have at least one dimension (the trailing axis holds the mask slots)")
+        length = indices.shape[-1]
+        if length == 0:
+            return self.embed(indices)
+        width = self.num_tokens
+        if length <= width:
+            # Shorter requests take the tail of the table, in order.
+            slots = torch.arange(width - length, width, device=indices.device)
+            return self.embed(slots).expand(*indices.shape, -1)
+        positions = torch.linspace(0.0, float(width - 1), length, device=indices.device, dtype=torch.float32)
+        lower = positions.floor().long()
+        upper = (lower + 1).clamp(max=width - 1)
+        frac = (positions - lower.to(torch.float32)).to(self.embed.weight.dtype)
+        mixed = self.embed(lower).lerp(self.embed(upper), frac.unsqueeze(-1))
+        return mixed.expand(*indices.shape, -1)

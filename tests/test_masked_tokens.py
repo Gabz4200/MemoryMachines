@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from memory_machines.models.backbone import CheapLLM
-from memory_machines.models.blocks.ced import CausalDecoder
+from memory_machines.models.blocks.ced import CausalDecoder, MaskedTokenEmbedding
 from memory_machines.models.blocks.positioning import CVPEContextBias
 from memory_machines.models.io import ModelInput
 from memory_machines.utils.config_schema import MemoryMachineConfig
@@ -40,6 +40,64 @@ def test_masked_token_embedding_exists():
     cfg = _cfg(ced_masked_token_count=3)
     model = CheapLLM(cfg)
     assert hasattr(model, "masked_token_embed")
+
+
+def _filled_masked_embedding(num_tokens: int, hidden_size: int = 3) -> MaskedTokenEmbedding:
+    emb = MaskedTokenEmbedding(num_tokens, hidden_size)
+    with torch.no_grad():
+        emb.embed.weight.copy_(torch.arange(num_tokens * hidden_size, dtype=torch.float32).view(num_tokens, hidden_size))
+    return emb
+
+
+def test_masked_token_embedding_single_codebook_is_shared():
+    emb = _filled_masked_embedding(1)
+    out = emb(torch.arange(7))
+    assert out.shape == (7, 3)
+    torch.testing.assert_close(out, emb.embed.weight[0].expand(7, -1))
+
+
+def test_masked_token_embedding_exact_count_uses_table_in_order():
+    emb = _filled_masked_embedding(4)
+    out = emb(torch.arange(4))
+    torch.testing.assert_close(out, emb.embed.weight)
+
+
+@pytest.mark.parametrize("length", [1, 2, 3], ids=["one", "two", "three"])
+def test_masked_token_embedding_short_count_uses_high_index_tail(length: int) -> None:
+    emb = _filled_masked_embedding(4)
+    out = emb(torch.arange(length))
+    torch.testing.assert_close(out, emb.embed.weight[-length:])
+
+
+def test_masked_token_embedding_long_count_interpolates_evenly():
+    emb = _filled_masked_embedding(2)
+    out = emb(torch.arange(5))
+    expected = torch.stack([emb.embed.weight[0].lerp(emb.embed.weight[1], t) for t in (0.0, 0.25, 0.5, 0.75, 1.0)])
+    torch.testing.assert_close(out, expected)
+
+
+def test_masked_token_embedding_long_count_anchors_first_and_last_entries():
+    emb = _filled_masked_embedding(4)
+    out = emb(torch.arange(16))
+    anchors = (0, 5, 10, 15)
+    for entry, slot in enumerate(anchors):
+        torch.testing.assert_close(out[slot], emb.embed.weight[entry])
+    # Slots between anchors mix exactly the two neighbouring entries.
+    torch.testing.assert_close(out[1], emb.embed.weight[0].lerp(emb.embed.weight[1], 0.2))
+    torch.testing.assert_close(out[7], emb.embed.weight[1].lerp(emb.embed.weight[2], 0.4))
+
+
+def test_masked_token_embedding_broadcasts_leading_axes():
+    emb = _filled_masked_embedding(4)
+    out = emb(torch.arange(16).expand(2, -1))
+    assert out.shape == (2, 16, 3)
+    torch.testing.assert_close(out[0], out[1])
+
+
+def test_masked_token_embedding_empty_slots():
+    emb = _filled_masked_embedding(4)
+    out = emb(torch.empty(0, dtype=torch.long))
+    assert out.shape == (0, 3)
 
 
 def test_masked_generation_shape():
