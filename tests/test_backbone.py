@@ -223,12 +223,13 @@ def test_cheapllm_hybrid_encoder_starts_with_plain_swa_then_seeds_the_store() ->
     assert len(model.encoder_ffns) == 3
 
 
-def test_cheapllm_rejects_a_masked_count_above_the_embedding_table() -> None:
+@pytest.mark.parametrize("masked", [1, 2, 3, 5], ids=["one", "table", "above-table", "well-above-table"])
+def test_cheapllm_accepts_any_masked_count(masked: int) -> None:
     cfg = _ced_cfg(ced_masked_query=True, ced_masked_token_count=2)
     model = CheapLLM(cfg).eval()
     ids = torch.randint(0, cfg.vocab_size, (1, 4))
-    with pytest.raises(ValueError, match="exceeds the table size"):
-        model(ModelInput(input_ids=ids, num_masked_tokens=3))
+    out = model(ModelInput(input_ids=ids, num_masked_tokens=masked))
+    assert tuple(out.logits.shape) == (1, masked, cfg.vocab_size)
 
 
 def test_num_masked_tokens_is_ignored_when_masked_query_is_disabled() -> None:

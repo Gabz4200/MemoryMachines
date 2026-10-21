@@ -30,6 +30,7 @@ from memory_machines.models.blocks.ced import (
     _build_encoder,
     _run_encoder_layers,
     _validate_encoder_layers,
+    decoder_width,
 )
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
@@ -144,6 +145,14 @@ class CheapLLM(nn.Module):
     :class:`~memory_machines.models.blocks.ced.VocabularyUpProjection` and
     fed to an LM head to produce logits.
 
+    Perceiver-AR generation flow: embed the input, append ``L`` learnable mask
+    embeddings, run the causal encoder over the whole sequence, then decode
+    with the encoder's masked latents as queries and its full latent sequence
+    as keys/values. The LM head reads only the ``L`` masked outputs. When
+    ``ced_decoder_hidden_size`` is set, :attr:`decoder_in_proj` downsamples
+    the encoder-width states (and the decoder's K/V stream) into the narrow
+    decoder.
+
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
             drives every sub-module (encoder, decoder, up-projection, head).
@@ -206,6 +215,9 @@ class CheapLLM(nn.Module):
         )
         # Widen (possibly narrow) decoder states back to hidden_size for the head.
         self.up = VocabularyUpProjection(config)
+        # Mirror of ``up``: the decoder runs at ``ced_decoder_hidden_size`` when
+        # asymmetric, so encoder-width states must be downsampled first.
+        self.decoder_in_proj = nn.Identity() if decoder_width(config) == config.hidden_size else nn.Linear(config.hidden_size, decoder_width(config), bias=False)
         self.embed = nn.Embedding(self.vocab_size, config.hidden_size)
         self.head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
         if config.tie_word_embeddings:
@@ -230,6 +242,9 @@ class CheapLLM(nn.Module):
                 reset()
         self.decoder.reset_parameters()
         self.up.reset_parameters()
+        if isinstance(self.decoder_in_proj, nn.Linear):
+            std = self.config.initializer_range
+            nn.init.trunc_normal_(self.decoder_in_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         if not self.config.tie_word_embeddings:
             std = self.config.initializer_range
             nn.init.trunc_normal_(self.head.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
@@ -285,6 +300,8 @@ class CheapLLM(nn.Module):
         start_pos: int | None = None,
         seeded_store: bool = True,
         exit_threshold: float | None = None,
+        kv_states: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode with every decoder layer seeded from the encoder-final states.
 
@@ -292,7 +309,16 @@ class CheapLLM(nn.Module):
         global KV is projected from the encoder-final hidden states with each
         layer's own weights (:class:`CEDGlobalKVProjection`, Eq. 1).
         """
-        return self.decoder.decode_full_context(hidden_states, encoder_final, position_ids, start_pos=start_pos, seeded_store=seeded_store, exit_threshold=exit_threshold)
+        return self.decoder.decode_full_context(
+            hidden_states,
+            encoder_final,
+            position_ids,
+            start_pos=start_pos,
+            seeded_store=seeded_store,
+            exit_threshold=exit_threshold,
+            kv_states=kv_states,
+            kv_position_ids=kv_position_ids,
+        )
 
     def prefill(self, hidden_states: torch.Tensor, encoder_final: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Prefill decode via bounded replay (last window).
@@ -325,8 +351,9 @@ class CheapLLM(nn.Module):
             x = self.embed(inputs.input_ids)
         # Perceiver-AR masked-token generation: append learnable masked embeddings.
         L = inputs.num_masked_tokens
+        if L is not None and L < 0:
+            raise ValueError(f"num_masked_tokens ({L}) must be non-negative")
         if L is not None and L > 0 and self.config.ced_masked_query:
-            # Append masked-token embeddings at the end.
             mask_indices = torch.arange(L, device=x.device)
             masked_embeds = self.masked_token_embed(mask_indices)  # (L, D)
             masked_embeds = masked_embeds.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, L, D)
@@ -341,16 +368,21 @@ class CheapLLM(nn.Module):
             # inside CausalDecoder.decode_full_context (which derives positions
             # from start_pos when position_ids is None).
             dec_pos = torch.arange(N - L, N, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+            kv_in = self.decoder_in_proj(encoder_final)
             dec_out = self.decoder.decode_full_context(
-                x[:, N - L :, :],
+                kv_in[:, N - L :, :],
                 encoder_final,
                 position_ids=dec_pos,
                 num_masked_tokens=L,
                 start_pos=N - L,
+                # Perceiver-AR: the encoder's masked latents query its full
+                # latent sequence (masked + unmasked), never raw embeddings.
+                kv_states=kv_in,
+                kv_position_ids=torch.arange(N, device=x.device).unsqueeze(0).expand(x.shape[0], -1),
             )
             dec_out = dec_out[:, -L:, :]
         else:
-            dec_out = self.decoder.decode_full_context(x, encoder_final)
+            dec_out = self.decoder.decode_full_context(self.decoder_in_proj(x), encoder_final)
         out = self.up(dec_out)
         logits = self.head(out)
         return ModelOutput(logits=logits, new_state=None)
@@ -386,7 +418,9 @@ class BLTBackbone(nn.Module):
 
     ``ModelInput.attention_mask`` is accepted for API parity but not consumed
     (the byte transformer is causal and has no padding mask), so batches must
-    contain packed byte sequences.
+    contain packed byte sequences. When ``ced_decoder_hidden_size`` is set,
+    :attr:`decoder_in_proj` downsamples patch states (and the decoder's K/V
+    stream) into the narrow latent decoder.
 
     Args:
         config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
@@ -450,6 +484,7 @@ class BLTBackbone(nn.Module):
             config.hidden_size,
         )
         self.up = VocabularyUpProjection(config)
+        self.decoder_in_proj = nn.Identity() if decoder_width(config) == config.hidden_size else nn.Linear(config.hidden_size, decoder_width(config), bias=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -462,6 +497,9 @@ class BLTBackbone(nn.Module):
                 reset()
         self.decoder.reset_parameters()
         self.up.reset_parameters()
+        if isinstance(self.decoder_in_proj, nn.Linear):
+            std = self.config.initializer_range
+            nn.init.trunc_normal_(self.decoder_in_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         if self.config.blt_tie_word_embeddings:
             # reset_parameters re-initialized both tensors; keep them tied.
             self.vocab_decoder.output.weight = self.vocab_encoder.byte_embeddings.weight
@@ -508,6 +546,8 @@ class BLTBackbone(nn.Module):
         start_pos: int | None = None,
         seeded_store: bool = True,
         exit_threshold: float | None = None,
+        kv_states: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode latent patch states seeded by the encoder-final states."""
         return self.decoder.decode_full_context(
@@ -517,6 +557,8 @@ class BLTBackbone(nn.Module):
             start_pos=start_pos,
             seeded_store=seeded_store,
             exit_threshold=exit_threshold,
+            kv_states=kv_states,
+            kv_position_ids=kv_position_ids,
         )
 
     def prefill(self, hidden_states: torch.Tensor, encoder_final: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
@@ -552,8 +594,6 @@ class BLTBackbone(nn.Module):
             raise ValueError("num_masked_tokens requires ced_masked_query=True")
         if L is not None and L < 0:
             raise ValueError(f"num_masked_tokens ({L}) must be non-negative")
-        if L is not None and L > self.config.ced_masked_token_count:
-            raise ValueError(f"num_masked_tokens ({L}) exceeds ced_masked_token_count ({self.config.ced_masked_token_count})")
         masked = L is not None and L > 0
         if masked:
             assert L is not None
@@ -565,12 +605,17 @@ class BLTBackbone(nn.Module):
             assert L is not None
             total = x.shape[1]
             dec_pos = torch.arange(total - L, total, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+            kv_in = self.decoder_in_proj(encoder_final)
             dec_out = self.decoder.decode_full_context(
-                x[:, total - L :, :],
+                kv_in[:, total - L :, :],
                 encoder_final,
                 position_ids=dec_pos,
                 num_masked_tokens=L,
                 start_pos=total - L,
+                # Perceiver-AR over patches: the encoder's masked latents
+                # query its full latent sequence, not the raw patch reps.
+                kv_states=kv_in,
+                kv_position_ids=torch.arange(total, device=x.device).unsqueeze(0).expand(x.shape[0], -1),
             )
             dec_out = dec_out[:, -L:, :]
             masked_reps = self.up(dec_out)
@@ -579,7 +624,7 @@ class BLTBackbone(nn.Module):
             patch_reps = torch.cat([encoder_final[:, :num_patches], masked_reps], dim=1)
             logits = self.vocab_decoder.decode_masked_patches(masked_reps, patch_reps, first_patch_index=num_patches)
         else:
-            dec_out = self.decoder.decode_full_context(x, encoder_final)
+            dec_out = self.decoder.decode_full_context(self.decoder_in_proj(x), encoder_final)
             # Patch p of byte i holds bytes up to i, so query i reads latent p - 1
             # (the begin patch for p == 0). Even then logits[i] predicts byte i + 1
             # only after that byte's own patch; see VocabularyDecoder.forward.

@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 import torch
 
+from memory_machines.models.backbone import BLTBackbone, CheapLLM
 from memory_machines.models.blocks import (
     CausalDecoder,
     CausalEncoderDecoderStack,
@@ -21,6 +22,7 @@ from memory_machines.models.blocks import (
     DenseFFN,
     VocabularyUpProjection,
 )
+from memory_machines.models.io import ModelInput
 from memory_machines.utils.config_schema import MemoryMachineConfig
 from tests.test_blocks_shapes import tiny_cfg
 
@@ -123,3 +125,30 @@ def test_asymmetric_looped_decoder_runs_end_to_end():
     out = stack.decode_full_context(torch.randn(1, 5, DEC), torch.randn(1, 6, ENC), exit_threshold=1.0)
     assert tuple(out.shape) == (1, 5, DEC)
     assert tuple(VocabularyUpProjection(_asym_cfg())(out).shape) == (1, 5, ENC)
+
+
+# 5. backbones downsample into the narrow decoder -------------------------------
+def test_cheapllm_runs_with_a_narrow_decoder():
+    model = CheapLLM(_asym_cfg(vocab_size=32)).eval()
+    out = model(ModelInput(input_ids=torch.randint(0, 32, (1, 5))))
+    assert tuple(out.logits.shape) == (1, 5, 32)
+
+
+def test_cheapllm_masked_generation_runs_with_a_narrow_decoder():
+    model = CheapLLM(_asym_cfg(vocab_size=32, ced_masked_query=True, ced_masked_token_count=4)).eval()
+    out = model(ModelInput(input_ids=torch.randint(0, 32, (1, 5)), num_masked_tokens=2))
+    assert tuple(out.logits.shape) == (1, 2, 32)
+
+
+def test_blt_backbone_runs_with_a_narrow_decoder():
+    cfg = _asym_cfg(vocab_size=32, blt_local_layers=1, blt_local_hidden_size=16, blt_local_window_size=8, blt_max_patch_bytes=2)
+    model = BLTBackbone(cfg).eval()
+    out = model(ModelInput(input_ids=torch.randint(0, 32, (1, 6))))
+    assert tuple(out.logits.shape) == (1, 6, 32)
+
+
+def test_blt_masked_generation_runs_with_a_narrow_decoder():
+    cfg = _asym_cfg(vocab_size=32, blt_local_layers=1, blt_local_hidden_size=16, blt_local_window_size=8, blt_max_patch_bytes=2, ced_masked_query=True, ced_masked_token_count=4)
+    model = BLTBackbone(cfg).eval()
+    out = model(ModelInput(input_ids=torch.randint(0, 32, (1, 6)), num_masked_tokens=1))
+    assert tuple(out.logits.shape) == (1, 2, 32)

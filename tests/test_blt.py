@@ -173,6 +173,40 @@ def test_blt_backbone_masked_patch_mode_shapes() -> None:
     assert tuple(out.logits.shape) == (1, 2 * 3, VOCAB)
 
 
+def test_blt_masked_decoder_queries_and_kv_are_encoder_states() -> None:
+    """Masked patch queries/KV come from the latent encoder, not raw patch reps."""
+    cfg = _cfg(ced_masked_query=True, ced_masked_token_count=4, blt_max_patch_bytes=3)
+    torch.manual_seed(0)
+    model = BLTBackbone(cfg).eval()
+    L = 2
+    captured: dict[str, torch.Tensor] = {}
+    real = model.decoder.decode_full_context
+
+    def spy(hidden_states, encoder_final, position_ids=None, **kw):
+        captured["queries"] = hidden_states.detach().clone()
+        captured["kv"] = kw["kv_states"].detach().clone()
+        captured["encoder"] = encoder_final.detach().clone()
+        return real(hidden_states, encoder_final, position_ids, **kw)
+
+    model.decoder.decode_full_context = spy
+    try:
+        with torch.no_grad():
+            model(ModelInput(input_ids=torch.randint(0, VOCAB, (1, 8)), num_masked_tokens=L))
+    finally:
+        del model.decoder.decode_full_context
+    assert torch.equal(captured["queries"], captured["encoder"][:, -L:, :])
+    assert torch.equal(captured["kv"], captured["encoder"])
+
+
+def test_blt_forwards_the_kv_stream_to_the_decoder() -> None:
+    model = BLTBackbone(_cfg()).eval()
+    h, enc, kv = torch.randn(1, 2, 16), torch.randn(1, 6, 16), torch.randn(1, 6, 16)
+    kv_pos = torch.arange(6).unsqueeze(0)
+    via_model = model.decode_full_context(h, enc, kv_states=kv, kv_position_ids=kv_pos)
+    via_decoder = model.decoder.decode_full_context(h, enc, kv_states=kv, kv_position_ids=kv_pos)
+    torch.testing.assert_close(via_model, via_decoder)
+
+
 def test_blt_backbone_is_causal() -> None:
     cfg = _cfg()
     model = BLTBackbone(cfg).eval()

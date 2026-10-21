@@ -229,11 +229,12 @@ def test_masked_tokens_without_masked_query_raises() -> None:
         model(ModelInput(input_ids=_ids(), num_masked_tokens=2))
 
 
-def test_masked_tokens_above_available_count_raises() -> None:
-    cfg = _cfg(ced_masked_query=True, ced_masked_token_count=2)
+@pytest.mark.parametrize("masked", [1, 2, 3, 5], ids=["one", "table", "above-table", "well-above-table"])
+def test_masked_patch_count_is_free_per_forward(masked: int) -> None:
+    cfg = _cfg(ced_masked_query=True, ced_masked_token_count=2, blt_max_patch_bytes=3)
     model = BLTBackbone(cfg).eval()
-    with pytest.raises(ValueError, match="ced_masked_token_count"):
-        model(ModelInput(input_ids=_ids(), num_masked_tokens=3))
+    out = model(ModelInput(input_ids=_ids(), num_masked_tokens=masked))
+    assert tuple(out.logits.shape) == (1, masked * 3, VOCAB)
 
 
 def test_negative_masked_tokens_raises() -> None:
