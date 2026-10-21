@@ -13,7 +13,11 @@ import torch
 import torch.nn.functional as F
 
 from memory_machines.models.blocks.causal_conv1d import ShortConvolution
-from memory_machines.ops.causal_conv1d import causal_conv1d_naive, causal_conv1d_op
+from memory_machines.ops.causal_conv1d import (
+    _causal_conv1d_fake,
+    causal_conv1d_naive,
+    causal_conv1d_op,
+)
 from memory_machines.ops.dispatch import (
     dispatch_causal_conv1d,
     dispatch_causal_conv1d_update,
@@ -735,3 +739,49 @@ def test_dispatch_backend_normalization_is_case_insensitive_and_tolerant():
     # An explicit compiled backend still raises (no silent downgrade).
     with pytest.raises(NotImplementedError):
         dispatch_causal_conv1d(x, w, backend="GPU")
+
+
+def test_causal_conv1d_fake_valid_shapes_return_x_shape() -> None:
+    torch.manual_seed(70)
+    x = torch.randn(2, 5, 4)
+    weight = torch.randn(4, 3)
+    out = _causal_conv1d_fake(x, weight)
+    assert tuple(out.shape) == tuple(x.shape)
+    assert out.dtype == x.dtype
+    # Optional args that are shape-correct must be accepted.
+    out2 = _causal_conv1d_fake(x, weight, bias=torch.randn(4), residual=torch.randn(2, 5, 4))
+    assert tuple(out2.shape) == tuple(x.shape)
+
+
+@pytest.mark.parametrize(
+    "x,weight,bias,residual,message",
+    [
+        (torch.randn(1, 4, 2), torch.randn(2, 1, 3), None, None, "weight must be"),
+        (torch.randn(1, 4, 3), torch.randn(2, 3), None, None, "must match weight dim 0"),
+        (torch.randn(1, 4, 2), torch.randn(2, 3), torch.randn(3), None, "bias must be"),
+        (torch.randn(1, 4, 2), torch.randn(2, 3), None, torch.randn(1, 3, 2), "residual shape"),
+    ],
+    ids=["weight-not-2d", "x-channel-mismatch", "bias-not-d", "residual-mismatch"],
+)
+def test_causal_conv1d_fake_rejects_bad_shapes(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _causal_conv1d_fake(x, weight, bias=bias, residual=residual)
+
+
+def test_causal_conv1d_custom_op_dispatches_to_registered_fake() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    torch.manual_seed(71)
+    with FakeTensorMode():
+        x = torch.randn(1, 4, 2)
+        weight = torch.randn(2, 3)
+        out = causal_conv1d_op(x, weight)
+        assert tuple(out.shape) == (1, 4, 2)
+        with pytest.raises(ValueError, match="x last dim"):
+            causal_conv1d_op(torch.randn(1, 4, 5), weight)
