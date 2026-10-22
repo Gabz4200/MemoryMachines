@@ -248,7 +248,7 @@ class CheapLLM(nn.Module):
         if config.tie_word_embeddings:
             self.head.weight = self.embed.weight
         self.reset_parameters()
-        _apply_rank_budget(self, self.config)
+        apply_low_rank(self, RankPolicy.from_config(self.config))
 
     def reset_parameters(self) -> None:
         """reset_parameters() -> None
@@ -257,15 +257,8 @@ class CheapLLM(nn.Module):
         up-projection init. The embedding uses PyTorch's default init; the
         head is re-initialized only when it is not weight-tied to the embedding.
         """
-        # Every registered component here (CSA2/parallel-hybrid, DenseFFN, CEDGlobalKVProjection,
-        # CausalDecoder, VocabularyUpProjection) defines ``reset_parameters``;
-        # the ``getattr`` guard is defensive only and should never skip a
-        # module in practice. A missing ``reset_parameters`` is a contract
-        # violation, not a reason to stay silent.
         for layer in (*self.encoder_layers, *self.encoder_ffns):
-            reset = getattr(layer, "reset_parameters", None)
-            if callable(reset):
-                reset()
+            layer.reset_parameters()
         self.decoder.reset_parameters()
         self.up.reset_parameters()
         if isinstance(self.decoder_in_proj, nn.Linear):
@@ -512,16 +505,14 @@ class BLTBackbone(nn.Module):
         self.latent_sampler = GaussianLatentSampler(config) if config.blt_latent_sampling else None
         self.decoder_in_proj = nn.Identity() if decoder_width(config) == config.hidden_size else nn.Linear(config.hidden_size, decoder_width(config), bias=False)
         self.reset_parameters()
-        _apply_rank_budget(self, self.config)
+        apply_low_rank(self, RankPolicy.from_config(self.config))
 
     def reset_parameters(self) -> None:
         """Re-apply byte-model, latent-stack, and vocabulary-head initialization."""
         self.vocab_encoder.reset_parameters()
         self.vocab_decoder.reset_parameters()
         for layer in (*self.encoder_layers, *self.encoder_ffns):
-            reset = getattr(layer, "reset_parameters", None)
-            if callable(reset):
-                reset()
+            layer.reset_parameters()
         self.decoder.reset_parameters()
         self.up.reset_parameters()
         if isinstance(self.decoder_in_proj, nn.Linear):
