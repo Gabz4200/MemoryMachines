@@ -18,8 +18,9 @@ deliberate initialisation, and loud guards where the algebra is fragile. The bot
 not finished: the ops layer is architecturally orphaned (nothing on the model path
 calls it, and it would silently downgrade if it did), attention still materialises
 `O(L²)` scores and expands KV by `H/Hkv`, the recurrent memory branch has no decode
-state, and 2,607 lines of mechanisms are unreachable from any model while their config
-knobs remain live. The config seam — 137 flat fields read directly by blocks — is what
+state, and roughly 2.4k lines of mechanisms (`liv`, `memory`, `rkan`,
+`ChunkedBottleneckLinear`) are unreachable from any model while their config knobs
+remain live. The config seam — 139 flat fields read directly by blocks — is what
 makes all of that possible. None of it is hard to fix; the ordering matters more than
 the effort.
 
@@ -29,10 +30,10 @@ the effort.
 | --- | --- |
 | `01-contracts-and-layering.md` | `ModelInput`/`ModelOutput`, `protocols.py`, registry, composition roots, extension seams |
 | `02-strengths.md` | What is genuinely good, ranked, with the reason it matters and what to protect |
-| `03-defects.md` | Ranked code defects S1–S4, each with evidence, consequence, minimal fix |
+| `03-defects.md` | Ranked code defects S1–S4, each with evidence, consequence, minimal fix (S2-13: the rank budget is declared per module path) |
 | `04-ops-and-kernels.md` | Dispatch semantics, reference duplication, mask polarity, custom-op contract, autograd |
 | `05-state-numerics-and-precision.md` | Cache/state semantics, chunk-vs-recurrent parity, dtype policy, sync points |
-| `06-dead-code-config-and-cost.md` | Unreachable modules, the 137-field config, per-call allocations, import cost |
+| `06-dead-code-config-and-cost.md` | Unreachable modules, the 139-field config, per-call allocations, import cost |
 | `07-remediation-plan.md` | Ordered phases with acceptance checks |
 
 ## Severity ladder
@@ -53,7 +54,7 @@ the effort.
    window as an additive bias; drop `repeat_interleave`. Until then the 32k design
    point in the config is aspirational.
 2. **Make the config honest**: wire or delete `engram_*`, `mhc_*`, `dspark_*`,
-   `liv`/`rkan`/`linears`, then split the 137 fields per subsystem.
+   `liv`/`rkan`/`ChunkedBottleneckLinear`, then split the 139 fields per subsystem.
 3. **Wire or delete `ops/`**; stop catching exceptions around the kernel *call*.
 4. **One** `global_proj`, **one** masked-decode helper, **one** `forward_shared`
    signature.
@@ -77,7 +78,7 @@ Executed for this review:
 
 | Probe | Command | Result |
 | --- | --- | --- |
-| Test count | `uv run --no-sync pytest --collect-only -q` | 1547 collected |
+| Test count | `uv run --no-sync pytest --collect-only -q` | 1555 collected |
 | Import cost | `python -X importtime -c "import memory_machines.models.blocks.attention"` | 1313 modules, 3.22 s |
 | GDN-2 chunk vs recurrent, strong decay | see `05` §2 | chunk NaN at `T=C=64, g=-8` (fp32); recurrent finite |
 | `AttentionSink` overflow | read `compression.py:551-555` | no max-subtraction; fp32 `exp` overflows at logit > 88 |

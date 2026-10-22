@@ -63,7 +63,7 @@ or the curve will measure the wrong thing.
 
 Cut: `EngramMemory`, `LivConvBlock`, `LivPerceiver`, `HopeBlock`, `HopeAttentionBlock`,
 `ContinuumMemorySystem`, `TitansFastWeightsMemory` (the duplicate standalone),
-`NativeSparseAttention`, `DSparkDrafter`, `JacobiRKAN`/`PadeRKAN`, `FactoredLinear`.
+`NativeSparseAttention`, `DSparkDrafter`, `JacobiRKAN`/`PadeRKAN`.
 
 Park with a one-line note: `SinglePassMHC` (only the shared-`B` two-branch variant is novel
 enough to test), `ChunkedBottleneckLinear` (interesting bottleneck, no test).

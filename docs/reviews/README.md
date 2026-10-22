@@ -33,7 +33,9 @@ underexplored one**, **one interesting but currently unjustified one**, and roug
 hybrid — exact local attention ∥ approximate global memory, superposed additively on the
 same normalized input. The unjustified idea is the CED encoder→decoder handoff through a
 single shared compressed store (Eq. 1). The surplus is mHC, Engram, LIV, rKAN, DPA, NSA,
-`linears`, `TitansFastWeightsMemory`, HopeBlock/CMS.
+`ChunkedBottleneckLinear`, `TitansFastWeightsMemory`, HopeBlock/CMS. (`FactoredLinear`
+is wired since the rank budget landed: every backbone builds its projections through it
+with per-role ratios; see `code/06` §2b.)
 
 The engineering is far ahead of the science. There is no ablation harness, no baseline
 comparison, and several mechanisms that are on by default with no measurement of whether

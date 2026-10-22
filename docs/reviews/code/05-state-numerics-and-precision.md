@@ -169,3 +169,19 @@ run is profiled.
 - `DenseFFN.reset_parameters` and three BLT sites resolve the method with `getattr` and
   skip silently (`ffn.py:324-332`, `blt.py:181-186, 364-369, 443-445`). The comment calls
   it a contract violation; the code does not.
+- **Factored projections change the RNG stream.** `factorize_linear`
+  (`linear_init.py`) draws fresh factors, so the same seed no longer reproduces the same
+  tensors as a pre-budget commit. Scope: init only; nothing depends on checkpoint bytes.
+- **A factored pair must be initialised as a pair.** `init_linear` matches variance by
+  splitting the target between the factors (`Var(A)=1/in`, `Var(B)=std²·in/rank`) and
+  clips only the input factor, because clipping both compounds the two truncation
+  shrinkages and lands the product 12% below the dense draw it replaces (measured
+  `0.007746` vs `0.008781`; after the fix `0.008843`). Any `module.apply(...)` initialiser
+  must skip a `FactoredLinear`'s own factors or it will re-init them individually and
+  destroy the match — `gdn2._initialize_weights` (`gdn2.py:846`) is the one such site and
+  now marks both factors done in the same visit.
+- **Per-column scales belong in the input factor.** For a projection initialised with
+  different scales per input block (`ParallelAttentionGDN2.out_proj`, `1e-3` on the memory
+  half), `init_linear_columns` puts the whole column scale on `A`, so `Var(W[:,j]) = s_j²`
+  exactly; the SVD-truncation alternative lost the split's tail (measured memory half
+  `6.3e-4` against a `1e-3` target).

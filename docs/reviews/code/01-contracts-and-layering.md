@@ -71,12 +71,25 @@ raises, `get_model` lists what exists. Two notes:
   by design, but it means the available model set depends on import order and on whether
   `memory_machines.models` was imported at all. An explicit `register_all()` would make
   the registry deterministic and testable.
-- `blocks/__init__.py` eagerly re-exports 45 symbols, including privates
+- `blocks/__init__.py` eagerly re-exports 77 symbols, including privates
   (`_sinkhorn`, `_window_mask`, `_causal_comp_mask`, `_past_total_len`,
   `_resolve_positions`, `_check_position_bounds`, `_update_swa_pos`). Importing one leaf
   module (`blocks.attention`) loads 1,313 modules and pulls `fast_weights` and `ops`
   (measured, `README.md` ledger). That is the cost of the convenience barrel; split
   public exports from internal ones, or make `blocks/__init__.py` lazy.
+
+## The rank budget is a second pass over the tree
+
+`_apply_rank_budget` (`backbone.py:43`) runs once at the end of each backbone
+`__init__`, after `reset_parameters`, and replaces every projection whose role has a
+profitable ratio with a `FactoredLinear` (`blocks/low_rank.py:284`). The backbone is
+therefore not only a composition root but a rewriter of its own children, which is the
+smallest change that covers ~60 construction sites without threading a policy through
+every block constructor. The cost: a block built directly (as every block-level test
+does) is dense, so block tests and model tests exercise different layer classes; the
+guard test (`tests/test_low_rank.py`) is what keeps the two consistent.
+The pass is idempotent and never runs from `reset_parameters`, so a reset on an
+already-factored model keeps the budget.
 
 ## Composition roots: duplicated, not shared
 

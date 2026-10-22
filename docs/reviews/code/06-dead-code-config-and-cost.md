@@ -10,14 +10,14 @@ field selects them.
 | `liv.py` | 889 | `LivDoubleGatedBase`, `LivConvBlock`, `LivPerceiver` (two-pass compressed cross-attention) | correct only in non-sparse mode; sparse mode double-projects (`05` §5.4) |
 | `memory.py` | 999 | Engram (hashed n-grams, SSD offload), `SinglePassMHC`, `DSparkDrafter`, `to_streams` | 4 verified defects (`05` §5.1-3, 6) |
 | `rkan.py` | 473 | rational-KAN FFN variant | unused, unvalidated at config level |
-| `linears.py` | 246 | `FactoredLinear`, `ChunkedBottleneckLinear` | unused; `isinstance(nn.Linear)` branching (`208`) |
+| `linears.py` | 258 | `FactoredLinear`, `ChunkedBottleneckLinear`; `linear_init.py` (322) and `low_rank.py` (363) hold the init helpers and the rank policy | **wired**: every backbone builds through `FactoredLinear` (§2b); `ChunkedBottleneckLinear` still has no consumer |
 | `fast_weights.py` | 1480 | Titans, SRT, CMS, HopeBlock, `HopeAttentionBlock` | partly reachable (`SelfReferentialTitanMixer` via the hybrid branch); the Blocks are not |
 
 Cost is not the line count; it is:
 
 1. **Schema surface.** `engram_*` (16 fields), `mhc_*` (5), `dspark_*` (4), `cms_*` (3),
    `rkan_*` are validated at boot. A user who sets them gets no effect and no warning.
-2. **Maintenance.** `blocks/__init__.py` re-exports 45 symbols including these, so every
+2. **Maintenance.** `blocks/__init__.py` re-exports 77 symbols including these, so every
    rename is a public-API change and every import pays the compile/import cost.
 3. **False coverage.** Tests exercise the modules directly, so line coverage looks high
    while no model path is proven. The defects in `05` §5 are exactly the ones a
@@ -34,8 +34,8 @@ Cost is not the line count; it is:
 - **(b) Isolate them.** Move to `src/memory_machines/experimental/`, delete the config
   fields, stop exporting from `blocks/__init__.py`, keep the tests as unit tests of the
   experimental package.
-- **(c) Delete.** `rkan` and `linears` have no consumer and no published claim; they are
-  the two I would delete outright.
+- **(c) Delete.** `rkan` and `ChunkedBottleneckLinear` have no consumer and no published
+  claim; they are the two I would delete outright (`FactoredLinear` is now on every path).
 
 Do not leave the current state: a knob that does nothing is a claim that the feature
 works.
@@ -60,11 +60,25 @@ config is real. The fix is not to delete the fields but to make the model *rejec
 non-default value it cannot honour — a `__post_init__` rule per subsystem ("`engram_*`
 requires `model.name='blt'` and `blt_use_engram=True`") is enough.
 
+## 2b. Rank budget
+
+`apply_low_rank` runs once per backbone (`backbone.py`) and replaces every projection
+whose role budget is both requested and strictly cheaper to factor
+(`low_rank.py:284-363`). At the default 32-wide test config that is −19% parameters for
+`CheapLLM` (`tests/test_low_rank.py`). The saving is bounded by the
+parameter algebra: factoring an `in x out` projection costs `rank * (in + out)` against
+`in * out`, so a square projection only gets cheaper below 50% rank. That is why the
+Value/Output/FFN-Up/Down entries (0.75) do *not* fire on square or expanding matrices:
+0.75 of `d` costs 1.5x dense. Cutting those honestly means cutting them below 0.5, which
+the spectral evidence says is the information bottleneck, so the budget is refused and
+the projection stays dense.
+
 ## 3. Config structure
 
-`MemoryMachineConfig` is 137 fields in one dataclass (`config_schema.py`, 740 lines).
+`MemoryMachineConfig` is 139 fields in one dataclass (`config_schema.py`, 804 lines).
 Distribution: attention/CSA ~35, CED ~30, BLT ~25, GDN-2 ~14, Titans ~10, Engram ~16,
-CMS ~3, mHC ~5, DSpark ~4, training/model ~10.
+CMS ~3, mHC ~5, DSpark ~4, training/model ~10 (the last now includes `low_rank_mode`
+plus `rank_ratios`, which is one field carrying 31 per-role ratios).
 
 Three concrete costs:
 
@@ -148,7 +162,7 @@ is structural, not effort:
 - No test constructs a model with `engram_*`/`liv`/`rkan` selected, because no model can.
 - No test asserts a cache round-trip, because no backbone returns one.
 - No test asserts mask semantics across the reference boundary, because nothing calls it.
-- No test asserts that every config field is read (`137` fields, `grep` audit absent).
+- No test asserts that every config field is read (`139` fields, `grep` audit absent).
 
 Three cheap meta-tests would close most of the gap:
 

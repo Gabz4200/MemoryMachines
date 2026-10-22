@@ -57,8 +57,10 @@ the same mask, or must be rejected behind a capability check.
 Truncated-normal at `initializer_range`; residual output projections zeroed or
 depth-scaled at `std / sqrt(2N)` (`shared.py:20-55`); the fused parallel block keeps the
 memory half of its `2d -> d` projection at `1e-3` so the block *starts* as attention and
-grows the memory branch (`parallel_hybrid.py:241-245`); `init_residual_linears` is shared
-by attention, FFN, and BLT local layers.
+grows the memory branch (`parallel_hybrid.py:242-261`, via `init_linear_columns` so the
+split survives factoring); `init_residual_linears` is shared by attention, FFN, and BLT
+local layers and accepts dense or factored projections (`blocks/linear_init.py`), so one
+init policy covers both layer classes.
 
 **Why it matters.** Init is the difference between a 40-layer stack that trains and one
 that does not, and the memory-branch schedule is a real architectural decision encoded

@@ -296,7 +296,8 @@ downstream reads.
 Not wired into any registered backbone: `SinglePassMHC`, `EngramMemory`, `DSparkDrafter`,
 `LivConvBlock`, `LivPerceiver`, `HopeBlock`, `HopeAttentionBlock`, `ContinuumMemorySystem`,
 `TitansFastWeightsMemory`, `NativeSparseAttention`, `JacobiRKAN`/`PadeRKAN`,
-`FactoredLinear`/`ChunkedBottleneckLinear`.
+`ChunkedBottleneckLinear`. (`FactoredLinear` left this list: every registered backbone now
+builds its projections through it, see `code/03` S2-13.)
 
 Science-level assessment of each:
 
@@ -318,7 +319,8 @@ Science-level assessment of each:
 - **linears** — `ChunkedBottleneckLinear` (scalar pool per chunk → `G×G` bottleneck →
   broadcast, `O(D_in + D_out + R²)`) is the one genuinely interesting item: cross-chunk
   interaction only through a low-rank bottleneck is a real efficiency/expressivity
-  trade-off, and it has no test.
+  trade-off, and it has no test. `FactoredLinear` is now wired (per-role rank budget), so
+  the plain rank constraint is no longer surplus.
 
 Surplus code is not neutral: it dilutes the thesis, and a reviewer reads it as "the author
 has not decided what the contribution is."

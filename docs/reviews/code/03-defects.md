@@ -7,8 +7,8 @@
 | S1-3 | 19 of 20 decoder global-KV projections are dead parameters | S1 | `ced.py:975-977` |
 | S1-4 | No KV cache, but an API that returns and forwards one | S1 | `backbone.py`, HF adapter |
 | S1-5 | `O(L²)` score materialisation and KV expansion | S1 | `attention.py:377-381, 771-777` |
-| S2-1 | 2,607 lines unreachable from any model, knobs still live | S2 | `06` §1 |
-| S2-2 | 137-field config read directly by blocks | S2 | `config_schema.py` |
+| S2-1 | ~2.5k lines unreachable from any model, knobs still live | S2 | `06` §1 |
+| S2-2 | 139-field config read directly by blocks | S2 | `config_schema.py` |
 | S2-3 | `attention_mask` accepted and dropped at the top level | S2 | `backbone.py:131, 389, 647` |
 | S2-4 | Two opposite bool-mask conventions | S2 | `attention.py:111` vs `attention_reference.py:44` |
 | S2-5 | Inheritance + `delattr`/`Identity` + `strict=False` migration | S2 | `sparse.py:96-99, 135-136` |
@@ -19,6 +19,7 @@
 | S2-10 | `AttentionSink` exponentiates without subtracting a row max | S2 | `compression.py:551-555` |
 | S2-11 | `FRVMSpatialOV` bias ships in checkpoints and is never used | S2 | `positioning.py:249-261`, `attention.py:452` |
 | S2-12 | `ced_attention_variant` is not validated at boot | S2 | `config_schema.py:386` |
+| S2-13 | A projection's rank budget is decided by its module path | S2 | `low_rank.py:131-185` |
 | S3-1 | Duplicated masked-decode path across backbones | S3 | `backbone.py:284-307, 566-600` |
 | S3-2 | `CausalDecoder.forward` silently truncates its output | S3 | `ced.py:1435-1479` |
 | S3-3 | Window units are ambiguous, one window is scaled twice | S3 | `sparse.py:167-196` |
@@ -140,7 +141,7 @@ SWA-replay tests must pass unchanged; add a peak-memory probe at `L=4096`.
 
 ### S2-1 Unreachable mechanisms with live config knobs
 
-`liv.py` (889), `memory.py` (999: Engram, mHC, DSpark), `rkan.py` (473), `linears.py`
+`liv.py` (889), `memory.py` (999: Engram, mHC, DSpark), `rkan.py` (473), `low_rank.py` (363), `linear_init.py` (322), `linears.py` (258)
 (246) are imported only by `blocks/__init__.py` and tests. No backbone constructs them;
 no config switch selects them. Yet `config_schema.py` advertises `engram_*`, `mhc_*`,
 `dspark_*` (16 + 5 + 4 fields) and validates them — setting them changes nothing and
@@ -154,10 +155,10 @@ is CPU-only, LIV double-projects in sparse mode. Anyone who wires a knob inherit
 test per path, or move the modules to `experimental/`, delete the knobs, and stop
 re-exporting them. See `06` §1-2.
 
-### S2-2 The config is a 137-field god-object
+### S2-2 The config is a 139-field god-object
 
 One flat dataclass, namespaced only by prefix, serving three model families and five
-memory mechanisms (`config_schema.py`, 740 lines, 137 fields). `GroupedQueryAttention`
+memory mechanisms (`config_schema.py`, 804 lines, 139 fields). `GroupedQueryAttention`
 alone reads 15 (`attention.py:230-293`); `EngramMemory` reads 16 (`memory.py:690-704`).
 Cross-field invariants are enforced in the schema *and* re-checked (or not) in blocks:
 `hidden % mhc_num_streams` exists only in `EngramMemory` (`memory.py:707`), so
@@ -306,6 +307,29 @@ survives config validation and fails later with `AttributeError` from `getattr` 
 
 ---
 
+### S2-13 A projection's rank budget is decided by its module path
+
+`linear_role` (`low_rank.py:131-185`) maps a `named_modules()` path to a role, so renaming
+an attribute changes its budget: `self.k_proj` → `self.key_proj` no longer matches a leaf,
+and `apply_low_rank` now **raises** `ValueError("no rank role for projection ...")` rather
+than leaving it dense. The role table is therefore the one declaration site for a projection;
+a new block must add its leaf (`None` for a dense invariant) or its path fragment.
+
+**Mitigation today.** The raise makes a rename loud at build time, and
+`apply_low_rank` (`low_rank.py:284-363`) warns once per process per role when a ratio in
+`(0, 1)` is rejected by the cost guard, so a budget that quietly does nothing is reported
+instead of inferred. `tests/test_low_rank.py` additionally asserts that no
+reachable `nn.Linear` in `CheapLLM` or `BLTBackbone` still has a role the policy would
+factor. A block not built by either backbone (mHC, Engram, LIV perceiver, D-Spark, HOPE,
+rKAN) gets no such guard, but its projections must still be declared before they can be
+budgeted.
+
+**Fix if the roles keep growing.** Classify from the owning module type instead of the
+path string; the table form (`_LEAF_ROLES`, `_PATH_ROLES`) is already a data structure, so
+this is a table swap, not a rewrite.
+
+---
+
 ## S3 — named future cost
 
 **S3-1 Duplicated masked-decode path.** `CheapLLM.forward` and `BLTBackbone.forward`
@@ -370,7 +394,7 @@ violation, then the code stays silent. Raise instead.
   Vanishes under `python -O`. Use `raise`.
 - `blocks/__init__.py`: exports privates (`_sinkhorn`, `_window_mask`,
   `_causal_comp_mask`, `_past_total_len`, `_resolve_positions`, `_check_position_bounds`,
-  `_update_swa_pos`) and eagerly imports all 45 symbols (1,313 modules / 3.22 s).
+  `_update_swa_pos`) and eagerly imports all 77 symbols (1,313 modules / 3.22 s before the low-rank split).
 - `ffn.py:52-53`: `SwiGLU` rejects odd `intermediate_size`, but the schema only requires
   positive (`config_schema.py:325`), so the failure lands at model construction. Validate
   where the value is defined, or drop the constraint (`ClassicMLP` does not have it).

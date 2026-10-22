@@ -355,7 +355,10 @@ logits and would drive `σ → 0`; the anchor prevents collapse.
   approximation-theory claim (rational > polynomial per parameter) is plausible; it is
   orthogonal to the architecture's thesis and should be a separate paper or nothing.
 - **linears**: `FactoredLinear` is a rank constraint `W = W_out W_in` (no expressivity gain
-  past `min(d_in,d_out)`, correctly warned). `ChunkedBottleneckLinear` computes `O(D_in +
+  past `min(d_in,d_out)`, correctly warned). It is no longer a wiring candidate: every
+  registered backbone replaces its rank-deficient projections with it at the composition
+  root, with the rank per role set by `config.rank_ratios` (`code/03` S2-13).
+  `ChunkedBottleneckLinear` computes `O(D_in +
   D_out + R²)` with cross-chunk interaction only through a `G×G` (or `G→R→G`) bottleneck
   applied to *scalar* chunk pools — the information bottleneck is one scalar per chunk, which
   is a very strong constraint and the interesting thing about it.

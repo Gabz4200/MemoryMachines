@@ -19,8 +19,8 @@ with the intended message.
 
 ## Phase 1 — Make the config honest (1–2 days)
 
-1. Decide §1 of `06` (wire / isolate / delete) for `liv`, `memory`, `rkan`, `linears`,
-   and for the Titans Blocks.
+1. Decide §1 of `06` (wire / isolate / delete) for `liv`, `memory`, `rkan`,
+   `ChunkedBottleneckLinear`, and for the Titans Blocks.
 2. Delete the config fields of anything isolated or deleted; add a `__post_init__` rule
    for anything kept but conditional.
 3. Remove `blocks/__init__.py`'s private exports; make the barrel lazy.

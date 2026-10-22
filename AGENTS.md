@@ -46,6 +46,11 @@ This file is operational memory, maintained by the agent at the same end-of-sess
 - Bool masks are inverted: `models/blocks/attention.py` treats `True` as *blocked*; `ops/references/*` treats it as *participate* (`code/03` S2-4).
 - GDN-2 `naive` (the default) runs recurrent and ignores `ced_gdn2_chunk_size`; `chunk` NaNs when a chunk's cumulative decay underflows (`code/05`).
 - The `ops/` dispatcher is orphaned and `kernels/` is empty — read `code/04` before touching either.
+- Every backbone factorizes projections at build time (`apply_low_rank` + `config.rank_ratios`, `blocks/low_rank.py`; layers in `blocks/linears.py`, init helpers in `blocks/linear_init.py`). A role only fires when `rank*(in+out) < in*out`, so Value/Output/FFN-Up/Down stay dense by arithmetic — a square matrix must drop below 50% rank to save anything, so raising those ratios above 0.5 is a silent no-op, not a bigger budget.
+- Factored projections have no `.weight` and no `.in_features`: use `effective_weight` / `copy_linear_weight_` / `init_linear` / `zero_linear` / `linear_dtype` / `linear_in_features`. A stale `.weight` read is an `AttributeError`, a stale `.weight` write on a dense layer is silent.
+- `linear_role` classifies by module **path**, and `apply_low_rank` raises on a path with no declared role, so adding a projection means adding its leaf to `_LEAF_ROLES` (`None` = dense invariant) or its fragment to `_PATH_ROLES`. A ratio in `(0, 1)` that the cost guard rejects warns once per process instead of silently doing nothing. `tests/test_low_rank.py` guards the two built backbones only (`code/03` S2-13).
+- The budget is applied at the **end of each backbone `__init__`**, so a block built directly in a test is dense. Block-level tests therefore measure `nn.Linear`; use `effective_weight` when a test must read a projection either way.
+- `init_linear` splits a factored layer's variance between its factors and clips only the input one. Any `module.apply(...)` initialiser must mark `FactoredLinear.in_linear`/`out_linear` done in the same visit or it re-inits them individually and breaks the match (`gdn2._initialize_weights` is the pattern).
 
 ## Conventions tooling does not enforce
 
