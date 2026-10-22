@@ -33,10 +33,32 @@ from memory_machines.models.blocks.ced import (
     decoder_width,
 )
 from memory_machines.models.blocks.latent_sampling import GaussianLatentSampler
+from memory_machines.models.blocks.linear_init import init_linear
+from memory_machines.models.blocks.low_rank import RankPolicy, apply_low_rank
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.models.io import ModelInput, ModelOutput
 from memory_machines.models.registry import register_model
 from memory_machines.utils.config_schema import MemoryMachineConfig
+
+
+def _apply_rank_budget(module: nn.Module, config: MemoryMachineConfig) -> int:
+    r"""_apply_rank_budget(module, config) -> int
+
+    Replace every eligible dense projection under ``module`` with a
+    rank-budgeted :class:`~memory_machines.models.blocks.FactoredLinear` given
+    by ``config``. Called once per backbone, after its layers are built and
+    initialized, so every nested block is covered by one pass at the
+    composition root.
+
+    Args:
+        module (nn.Module): the assembled backbone.
+        config (:class:`~memory_machines.utils.config_schema.MemoryMachineConfig`):
+            supplies ``low_rank_mode`` and ``rank_ratios``.
+
+    Returns:
+        int: number of projections replaced.
+    """
+    return apply_low_rank(module, RankPolicy.from_config(config))
 
 
 class _GQAWrapper(nn.Module):
@@ -111,6 +133,8 @@ class ExampleBackbone(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.head = nn.Linear(embed_dim, vocab_size, bias=False)
+        # Smoke-test backbone has no config object; apply the default budget.
+        apply_low_rank(self, RankPolicy.from_config(cfg))
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed
@@ -224,6 +248,7 @@ class CheapLLM(nn.Module):
         if config.tie_word_embeddings:
             self.head.weight = self.embed.weight
         self.reset_parameters()
+        _apply_rank_budget(self, self.config)
 
     def reset_parameters(self) -> None:
         """reset_parameters() -> None
@@ -244,11 +269,10 @@ class CheapLLM(nn.Module):
         self.decoder.reset_parameters()
         self.up.reset_parameters()
         if isinstance(self.decoder_in_proj, nn.Linear):
-            std = self.config.initializer_range
-            nn.init.trunc_normal_(self.decoder_in_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            # Identity when the decoder keeps the encoder width.
+            init_linear(self.decoder_in_proj, self.config.initializer_range)
         if not self.config.tie_word_embeddings:
-            std = self.config.initializer_range
-            nn.init.trunc_normal_(self.head.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            init_linear(self.head, self.config.initializer_range)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed
@@ -488,6 +512,7 @@ class BLTBackbone(nn.Module):
         self.latent_sampler = GaussianLatentSampler(config) if config.blt_latent_sampling else None
         self.decoder_in_proj = nn.Identity() if decoder_width(config) == config.hidden_size else nn.Linear(config.hidden_size, decoder_width(config), bias=False)
         self.reset_parameters()
+        _apply_rank_budget(self, self.config)
 
     def reset_parameters(self) -> None:
         """Re-apply byte-model, latent-stack, and vocabulary-head initialization."""
@@ -500,8 +525,8 @@ class BLTBackbone(nn.Module):
         self.decoder.reset_parameters()
         self.up.reset_parameters()
         if isinstance(self.decoder_in_proj, nn.Linear):
-            std = self.config.initializer_range
-            nn.init.trunc_normal_(self.decoder_in_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            # Identity when the decoder keeps the encoder width.
+            init_linear(self.decoder_in_proj, self.config.initializer_range)
         if self.latent_sampler is not None:
             self.latent_sampler.reset_parameters()
         if self.config.blt_tie_word_embeddings:

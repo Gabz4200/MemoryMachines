@@ -60,6 +60,25 @@ class MemoryMachineConfig:
             grouped output) by ``initializer_range / sqrt(2N)``
             (Megatron-LM/Qwen depth scaling). When False, residual
             outputs are zero-initialized (identity residual start).
+        low_rank_mode: Rank budget for the projections of an assembled
+            model: ``"factored"`` replaces rank-deficient projections with
+            :class:`~memory_machines.models.blocks.FactoredLinear` at the
+            composition root, ``"dense"`` keeps every projection dense.
+            Default: ``"factored"``.
+        rank_ratios: Per-role rank budget, as ``(role, ratio)`` pairs.
+            A role with ratio ``r`` gets ``int(min(in, out) * r)`` bottleneck
+            width; ``1.0`` keeps that role dense. A budget is only applied
+            where it strictly saves parameters (``rank * (in + out) < in *
+            out``), so the entry expresses intent and the builder keeps
+            whatever is cheaper. Role names are defined by ``linear_role`` in
+            ``models/blocks/low_rank.py``. Defaults target *training* ranks
+            rather than post-hoc compression: Key ~8% of the hidden width,
+            Query ~25%, FFN gate ~12%, GDN-2 write/erase gates and decay ~25%
+            and ~6%, indexer selectors ~12%. Value, Output, and FFN Up/Down
+            are isotropic (they need 70-90% of their width), and a factored
+            square matrix above 50% costs *more* parameters than the dense
+            one, so those stay dense — that entry is the rank-efficient
+            choice, not a missing budget.
         use_cache: Whether to use key-value caching
         pad_token_id: Padding token ID
         bos_token_id: Beginning of sequence token ID
@@ -345,6 +364,40 @@ class MemoryMachineConfig:
     hidden_dropout: float = 0.0
     initializer_range: float = 0.006
     residual_init_scale: bool = True
+    low_rank_mode: str = "factored"
+    rank_ratios: tuple[tuple[str, float], ...] = (
+        ("attn_q", 0.25),
+        ("attn_k", 0.25),
+        ("attn_v", 0.75),
+        ("attn_o", 0.75),
+        ("ffn_gate", 0.15),
+        ("ffn_up", 0.75),
+        ("ffn_down", 0.75),
+        ("csa_kv", 0.75),
+        ("csa_q", 0.25),
+        ("csa_v", 0.75),
+        ("csa_q_latent", 1.0),
+        ("csa_index_q", 0.15),
+        ("csa_index_k", 0.15),
+        ("csa_group", 0.5),
+        ("csa_out", 0.75),
+        ("gdn2_q", 0.25),
+        ("gdn2_k", 0.25),
+        ("gdn2_v", 1.0),
+        ("gdn2_o", 0.75),
+        ("gdn2_gate", 0.45),
+        ("gdn2_decay", 0.1),
+        ("titan_q", 0.25),
+        ("titan_k", 0.25),
+        ("titan_v", 1.0),
+        ("titan_o", 0.75),
+        ("titan_gate", 0.5),
+        ("engram", 0.5),
+        ("blt_patch", 0.5),
+        ("blt_latent", 0.5),
+        ("ced_mix", 0.5),
+        ("dspark", 0.15),
+    )
     use_cache: bool = True
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -482,6 +535,17 @@ class MemoryMachineConfig:
             raise ValueError(f"hidden_dropout ({self.hidden_dropout}) must be in [0, 1]")
         if self.initializer_range <= 0:
             raise ValueError(f"initializer_range ({self.initializer_range}) must be positive")
+        if self.low_rank_mode not in ("dense", "factored"):
+            raise ValueError(f"low_rank_mode ({self.low_rank_mode!r}) must be 'dense' or 'factored'")
+        seen_roles: set[str] = set()
+        for role, ratio in self.rank_ratios:
+            if not isinstance(role, str) or not role:
+                raise ValueError(f"rank_ratios entries need a non-empty role, got {role!r}")
+            if role in seen_roles:
+                raise ValueError(f"rank_ratios lists role {role!r} twice")
+            seen_roles.add(role)
+            if not isinstance(ratio, int | float) or not 0.0 < ratio <= 1.0:
+                raise ValueError(f"rank_ratios[{role!r}] must be in (0, 1], got {ratio!r}")
         if self.cvpe_max_dims <= 0:
             raise ValueError(f"cvpe_max_dims ({self.cvpe_max_dims}) must be positive")
         if self.cvpe_mlp_hidden <= 0:

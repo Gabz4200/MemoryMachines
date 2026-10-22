@@ -13,6 +13,7 @@ import torch
 
 from memory_machines.models.backbone import BLTBackbone
 from memory_machines.models.blocks.latent_sampling import GaussianLatentSampler
+from memory_machines.models.blocks.linears import FactoredLinear
 from memory_machines.models.io import ModelInput
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
@@ -311,7 +312,8 @@ def test_backbone_training_backpropagates_into_both_sampling_heads() -> None:
     assert out.aux_loss is not None
     loss = out.logits.square().mean() + out.aux_loss
     loss.backward()
-    grad = model.latent_sampler.stats_proj.weight.grad
+    stats_proj = model.latent_sampler.stats_proj
+    grad = (stats_proj.out_linear.weight if isinstance(stats_proj, FactoredLinear) else stats_proj.weight).grad
     assert grad is not None
     assert torch.isfinite(grad).all()
     assert grad[: cfg.hidden_size].abs().sum().item() > 0

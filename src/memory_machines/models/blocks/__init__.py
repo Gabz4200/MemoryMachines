@@ -29,8 +29,21 @@ from .fast_weights import (
 from .ffn import DenseFFN, SwiGLU, build_ffn
 from .gdn2 import GatedDeltaNet2, GatedDeltaNet2Mixer, add_resting_projection, apply_beta_guard, gated_delta_rule_2, resting_corrected_write
 from .latent_sampling import GaussianLatentSampler, LatentSample
+from .linear_init import (
+    copy_linear_weight_,
+    effective_weight,
+    factorize_linear,
+    init_linear,
+    init_linear_columns,
+    init_linear_xavier,
+    linear_dtype,
+    linear_in_features,
+    linear_out_features,
+    zero_linear,
+)
 from .linears import ChunkedBottleneckLinear, FactoredLinear
 from .liv import LivConvBlock, LivDoubleGatedBase, LivPerceiver
+from .low_rank import RANK_ROLES, RankConfig, RankPolicy, apply_low_rank, linear_role
 from .memory import DSparkDrafter, EngramMemory, SinglePassMHC, from_streams, to_streams
 from .parallel_hybrid import ParallelAttentionGDN2, ParallelAttentionTitan
 from .positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
@@ -54,6 +67,7 @@ from .sparse import (
 )
 
 __all__ = [
+    "RANK_ROLES",
     "AdaptiveExitGate",
     "AttentionSink",
     "BlockCompressor",
@@ -92,6 +106,8 @@ __all__ = [
     "PadeRKAN",
     "ParallelAttentionGDN2",
     "ParallelAttentionTitan",
+    "RankConfig",
+    "RankPolicy",
     "SelfReferentialTitanMemory",
     "SelfReferentialTitanMixer",
     "ShortConvolution",
@@ -112,10 +128,22 @@ __all__ = [
     "_window_mask",
     "add_resting_projection",
     "apply_beta_guard",
+    "apply_low_rank",
     "build_ffn",
     "compute_patch_ids",
+    "copy_linear_weight_",
+    "effective_weight",
+    "factorize_linear",
     "from_streams",
     "gated_delta_rule_2",
+    "init_linear",
+    "init_linear_columns",
+    "init_linear_xavier",
+    "linear_dtype",
+    "linear_in_features",
+    "linear_out_features",
+    "linear_role",
     "resting_corrected_write",
     "to_streams",
+    "zero_linear",
 ]

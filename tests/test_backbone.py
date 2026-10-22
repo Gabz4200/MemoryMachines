@@ -15,6 +15,8 @@ from memory_machines.models.blocks import (
     CausalEncoderDecoderStack,
     GroupedQueryAttention,
     ParallelAttentionGDN2,
+    RankPolicy,
+    apply_low_rank,
 )
 from memory_machines.models.io import ModelInput
 from memory_machines.utils.config_schema import MemoryMachineConfig
@@ -202,6 +204,9 @@ def test_cheapllm_encode_matches_the_stack_encoder_with_shared_layers(explicit_p
     torch.manual_seed(0)
     model = CheapLLM(cfg).eval()
     stack = CausalEncoderDecoderStack(cfg, encoder_layers=list(model.encoder_layers)).eval()
+    # The stack builds its own FFNs, so give them the same rank budget as the
+    # model's before copying: a dense FFN cannot hold a factored state dict.
+    apply_low_rank(stack, RankPolicy.from_config(cfg))
     stack.encoder_ffns.load_state_dict(model.encoder_ffns.state_dict())
     x = torch.randn(1, 7, cfg.hidden_size)
     pos = torch.arange(7).unsqueeze(0) if explicit_positions else None
