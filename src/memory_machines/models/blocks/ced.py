@@ -243,11 +243,9 @@ def _run_encoder_layers(
     _validate_encoder_layers(layers)
     if not layers:
         raise ValueError("encode produced no shared state (encoder_layers is empty)")
-    shared: CSA2SharedState | None = None
+    shared = CSA2SharedState(total_len=0)
     x = hidden_states
     for i, layer in enumerate(cast("list[CompressedSparseAttention2 | ParallelAttentionGDN2]", layers)):
-        if shared is None:
-            shared = CSA2SharedState(total_len=0)
         # SWA KV is layer-local and never persisted onto the cross-layer
         # shared state, so ``use_cache`` is a no-op here (API parity only).
         x, shared = layer.forward_shared(x, shared, position_ids=position_ids)
@@ -255,8 +253,6 @@ def _run_encoder_layers(
         # encoder FFN; each block's own update_interval decides on which
         # steps it actually applies its FFN (HOPE time-cycle).
         x = ffns[i](x, step=i)
-    if shared is None:
-        raise ValueError("encode produced no shared state (encoder_layers is empty)")
     return x, shared
 
 
@@ -482,9 +478,7 @@ class CausalEncoderDecoderStack(nn.Module):
         (or depth-scaled) residual outputs.
         """
         for layer in (*self.encoder_layers, *self.encoder_ffns):
-            reset = getattr(layer, "reset_parameters", None)
-            if callable(reset):
-                reset()
+            layer.reset_parameters()
         self.decoder.reset_parameters()
 
     def encode(self, hidden_states: torch.Tensor, position_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, CSA2SharedState]:
@@ -514,12 +508,9 @@ class CausalEncoderDecoderStack(nn.Module):
             >>> stack.encode(torch.randn(1, 6, 16))[0].shape
             torch.Size([1, 6, 16])
         """
-        shared: CSA2SharedState | None = None
-        x = hidden_states
         layers = list(self.encoder_layers)
         ffns = list(self.encoder_ffns)
-        x, shared = _run_encoder_layers(layers, ffns, hidden_states, position_ids)
-        return x, shared
+        return _run_encoder_layers(layers, ffns, hidden_states, position_ids)
 
     def decode_full_context(
         self,
@@ -778,14 +769,8 @@ class AdaptiveExitGate(nn.Module):
             Tensor: 1-based exit step per position, shape ``(B, L)``.
         """
         cdf = AdaptiveExitGate.cdf(lambdas)
-        # ``exit_distribution`` assigns the survival mass to the final step, so
-        # ``cdf[:, -1] == 1`` exactly and the final row is never below any
-        # threshold in [0, 1]. The clamp is therefore a safety net against
-        # numerical drift in the cumprod/cumsum chain: if a position's final
-        # CDF ever drifted below ``threshold`` (it shouldn't), the count would
-        # reach ``T`` and the clamp pins it to ``T - 1`` so the ``+1`` below
-        # still lands on the final step ``T`` rather than ``T + 1``. The
-        # invariant this relies on is: the last step always exits.
+        # exit_distribution puts the survival mass on the final step, so
+        # cdf[:, -1] == 1 and the clamp is a guard against cumprod drift only.
         steps = (cdf < threshold).sum(dim=1).clamp(max=cdf.shape[1] - 1)
         return steps + 1
 
@@ -1002,13 +987,9 @@ class CausalDecoder(nn.Module):
         self.exit_threshold = config.ced_decoder_loop_exit_threshold
         if config.ced_decoder_looping:
             self.gate = AdaptiveExitGate(dec_cfg)
-            # TRM mechanism (arXiv:2510.04871): the looped decoder takes
-            # [X, Y, Z] as input at each step — X is the fixed previous-layer
-            # output (decoder input / question), Y is the running answer
-            # (layer output), and Z is the loop-local latent that feeds back
-            # into the loop but never exits to the next layer. Only built when
-            # ced_decoder_trm is enabled; otherwise the plain LoopLM
-            # single-stream path runs.
+            # TRM (arXiv:2510.04871): each loop step consumes [X, Y, Z] — the
+            # fixed layer input, the running answer, and a loop-local latent
+            # that feeds back but never exits.
             if config.ced_decoder_trm:
                 hidden = self.decoder_hidden_size or dec_cfg.hidden_size
                 self.trm_mix = nn.Linear(hidden * 3, hidden)
@@ -1026,12 +1007,10 @@ class CausalDecoder(nn.Module):
         (or depth-scaled) residual outputs.
         """
         for module in (*self.layers, *self.global_projs, *self.ffns):
-            reset = getattr(module, "reset_parameters", None)
-            if callable(reset):
-                reset()
-        gate = getattr(self, "gate", None)
-        if gate is not None:
-            gate.reset_parameters()
+            module.reset_parameters()
+        if self.gate is not None:
+            self.gate.reset_parameters()
+        # trm_mix / z_proj are absent (not None) unless TRM is enabled.
         mix = getattr(self, "trm_mix", None)
         if mix is not None:
             init_linear(mix, self.config.initializer_range)
@@ -1280,11 +1259,7 @@ class CausalDecoder(nn.Module):
         # Initialize shared store (Eq. 1 encoder projection) before both paths.
         comp, ends = self.global_projs[0](encoder_final)
         shared0: CSA2SharedState | None = CSA2SharedState(compressed_kv=comp, comp_end_pos=ends, total_len=start_pos)
-        # TRM mechanism (arXiv:2510.04871) when ced_decoder_trm is enabled:
-        # each loop step takes [X, Y, Z] where X is the fixed previous-layer
-        # output (decoder input / question), Y is the running answer
-        # (layer output), and Z is the loop-local latent that feeds back
-        # into the loop but never exits to the next layer.
+        # TRM (arXiv:2510.04871) when ced_decoder_trm is enabled.
         if getattr(self, "trm_mix", None) is not None:
             # X = fixed previous-layer output (decoder input hidden_states)
             # Y = running answer, initialized to decoder input
@@ -1296,20 +1271,14 @@ class CausalDecoder(nn.Module):
             done_trm = torch.zeros(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
             survival_trm = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
             cdf_trm = torch.zeros_like(survival_trm)
-            shared_trm = shared0
+            gate = cast(AdaptiveExitGate, self.gate)
             for step in range(self.loop_steps):
-                if self.gate is None:
-                    raise RuntimeError("ced_decoder_trm requires looping (gate) to be enabled")
-                # Combine [X, Y, Z] into the shared CSA2 layer input.
-                # The mix projects concatenated features (B, L, 3*D) -> (B, L, D).
-                # This keeps the attention's global KV cache (Eq. 1, encoder
-                # seed) intact while giving the loop full access to all
-                # three streams at each step.
+                # Mix concatenated features (B, L, 3*D) -> (B, L, D).
                 combined = torch.cat([x_fixed, y_state, z_state], dim=-1)
                 layer_in = self.trm_mix(combined)
-                layer_in, shared_trm = layer.forward_shared(
+                layer_in, shared0 = layer.forward_shared(
                     layer_in,
-                    shared0 if step == 0 else shared_trm,
+                    shared0,
                     position_ids=position_ids,
                     seeded_store=seeded_store,
                     mode=self._loop_mode(step),
@@ -1317,13 +1286,9 @@ class CausalDecoder(nn.Module):
                     kv_position_ids=kv_position_ids,
                 )
                 layer_in = self.ffns[0](layer_in, step=0)
-                # Y takes the refined layer output (the answer / layer output).
-                # Z takes a projection of the same output (the loop-internal
-                # latent — it feeds back only inside this layer's loop).
                 y_state = layer_in
                 z_state = self.z_proj(layer_in)
-                assert self.gate is not None  # ced_decoder_looping is True here
-                lam = self.gate(y_state)
+                lam = gate(y_state)
                 out_trm, done_trm, survival_trm, cdf_trm = self._exit_loop(
                     y_state,
                     out_trm,
