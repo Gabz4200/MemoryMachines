@@ -96,9 +96,7 @@ class _SharedStateAdapter(nn.Module):
         return getattr(self.inner, "mode", None)
 
     def reset_parameters(self) -> None:
-        reset = getattr(self.inner, "reset_parameters", None)
-        if callable(reset):
-            reset()
+        self.inner.reset_parameters()
 
     def forward_shared(
         self,
@@ -236,10 +234,9 @@ class ParallelAttentionGDN2(nn.Module):
         the attention half and near-zero for the memory half, so the block
         starts as a standard attention block.
         """
-        for module in (self.norm, self.attention, self.gdn2):
-            reset = getattr(module, "reset_parameters", None)
-            if callable(reset):
-                reset()
+        self.norm.reset_parameters()
+        self.attention.reset_parameters()
+        self.gdn2.reset_parameters()
         std = self.initializer_range
         out_proj = self.out_proj
         if isinstance(out_proj, FactoredLinear):
