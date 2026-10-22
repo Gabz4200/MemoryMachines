@@ -884,12 +884,8 @@ class EngramMemory(nn.Module):
         """
         if self.engram_layer_positions and layer_id not in self.engram_layer_positions:
             return hidden_states
-        if input_ids.dim() != 2:
-            raise ValueError(f"input_ids must be [B, Lq], got {tuple(input_ids.shape)}")
         if hidden_states.shape[:2] != input_ids.shape:
             raise ValueError(f"hidden_states batch/seq {tuple(hidden_states.shape[:2])} does not match input_ids {tuple(input_ids.shape)}")
-        if bool((input_ids < 0).any()):
-            raise ValueError("input_ids must be non-negative token ids")
         hashes = self._ngram_hashes(input_ids, layer_id)
         embeddings = self.multi_head_embedding(hashes).flatten(start_dim=-2)
         # SSD storage is float32; cast rows to the compute dtype (.to() on the

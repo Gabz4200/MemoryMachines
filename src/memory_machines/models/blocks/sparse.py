@@ -94,10 +94,8 @@ class CompressedSparseAttention(GroupedQueryAttention):
         # checkpoints/optimizers do not carry dead params. NOTE: checkpoints
         # saved before this change contain q_proj/k_proj/o_proj weights —
         # load them with strict=False.
-        for _dead in ("q_proj", "k_proj", "o_proj"):
-            if hasattr(self, _dead):
-                delattr(self, _dead)
-            setattr(self, _dead, nn.Identity())
+        for dead in ("q_proj", "k_proj", "o_proj"):
+            setattr(self, dead, nn.Identity())
         self.compression_ratio = compression_ratio if compression_ratio is not None else config.csa_compression_ratio
         self.use_indexer = use_indexer
         self.use_dense_branch = use_dense_branch

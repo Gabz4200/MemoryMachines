@@ -322,15 +322,8 @@ class DenseFFN(nn.Module):
         wrapped FFN init, so a freshly built FFN starts as an identity residual
         branch (zero-start or depth-scaled output projection).
         """
-        # Registry kinds define reset_parameters, but ``nn.Module`` does not
-        # declare it, so resolve dynamically instead of asserting on the type.
-        # If a registered kind omits reset_parameters, its weights are silently
-        # left at their factory defaults - callers must ensure every registered
-        # FFN implements reset_parameters (see ``_FFN_REGISTRY``).
-        for sublayer in (self.norm, self.ffn):
-            reset = getattr(sublayer, "reset_parameters", None)
-            if callable(reset):
-                reset()
+        self.norm.reset_parameters()
+        self.ffn.reset_parameters()
 
     def forward(self, x: torch.Tensor, step: int | None = None) -> torch.Tensor:
         r"""forward(x, step=None) -> Tensor

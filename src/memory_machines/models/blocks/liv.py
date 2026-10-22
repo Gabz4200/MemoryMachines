@@ -652,7 +652,7 @@ class LivPerceiver(LivDoubleGatedBase):
             # and only the masked tokens get their representation updated —
             # they attend to the full causal past, including other masked
             # tokens. Positional encoding is the standard CVPE QK bias.
-            return self._masked_mix(x_gated, x_merged, x_query, query_mask, k_pos, anchors, device)
+            return self._masked_mix(x_gated, x_merged, query_mask, k_pos, anchors, device)
         if self.query_mode == "learned":
             latents = self.latent_queries.unsqueeze(0).expand(bsz, -1, -1, -1)
             v_ref = self.latent_values.unsqueeze(0).expand(bsz, -1, -1, -1)
@@ -777,13 +777,12 @@ class LivPerceiver(LivDoubleGatedBase):
         self,
         x_gated: torch.Tensor,
         x_merged: torch.Tensor,
-        _x_query: torch.Tensor | None,
         query_mask: torch.Tensor | None,
         k_pos: torch.Tensor,
         _anchors: torch.Tensor,
         _device: torch.device,
     ) -> torch.Tensor:
-        r"""_masked_mix(x_gated, x_merged, _x_query, query_mask, k_pos, _anchors, _device) -> Tensor
+        r"""_masked_mix(x_gated, x_merged, query_mask, k_pos, _anchors, _device) -> Tensor
 
         Masked Perceiver cross-attend: a ``(B, L)`` boolean mask selects which
         tokens produce queries; every token produces keys and values.
@@ -797,11 +796,6 @@ class LivPerceiver(LivDoubleGatedBase):
             x_gated (Tensor): gated inputs of shape ``(B, L, H, Dh)``; the
                 KV stream and the baseline for non-masked tokens.
             x_merged (Tensor): merged input of shape ``(B, L, hidden)``.
-            _x_query (Tensor, optional): ungated projected inputs of shape
-                ``(B, L, H, Dh)``; accepted for API parity with the other
-                Perceiver helpers and intentionally ignored — in masked mode
-                the query stream is derived from ``x_merged`` (every token
-                produces a query), not from the ungated projection.
             query_mask (Tensor, optional): ``(B, L)`` bool query-selector mask.
             k_pos (Tensor): key positions of shape ``(B, L)``.
             _anchors (Tensor): latent anchor positions of shape ``(B, N)``;
