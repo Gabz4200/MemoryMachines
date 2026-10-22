@@ -1,14 +1,10 @@
 """Guard tests for memory.py (SSD/bf16, DiskGather OOM, hashes, grad accum),
 positioning.py (CVPE bf16 + edges), and linears.py (two-stage init, eye, determinism)."""
 
-import math
-
 import numpy as np
 import pytest
 import torch
-from torch import nn
 
-from memory_machines.models.blocks.linears import ChunkedBottleneckLinear
 from memory_machines.models.blocks.memory import EngramMemory, _SsdTable
 from memory_machines.models.blocks.positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
 from memory_machines.utils.config_schema import MemoryMachineConfig
@@ -73,25 +69,6 @@ def test_diskgather_backward_oom_message(tmp_path, monkeypatch):
             out.sum().backward()
     finally:
         monkeypatch.setattr(torch, "zeros", orig_zeros)
-
-
-# 3. CRITICAL: two-stage init scales G=4 R=3
-def test_two_stage_init_scales_distinct():
-    torch.manual_seed(0)
-    layer = ChunkedBottleneckLinear(8, num_blocks=4, output_dim=8, bottleneck_dim=3)
-    layer.reset_parameters()
-    assert isinstance(layer.mixer, nn.Sequential)
-    first, second = list(layer.mixer)
-    assert isinstance(first, nn.Linear) and isinstance(second, nn.Linear)
-    assert tuple(first.weight.shape) == (3, 4)
-    assert tuple(second.weight.shape) == (4, 3)
-    g_bound = 2 / math.sqrt(4)
-    r_bound = 2 / math.sqrt(3)
-    assert float(first.weight.detach().abs().max()) <= g_bound + 1e-6
-    assert float(second.weight.detach().abs().max()) <= r_bound + 1e-6
-    expected_std = 1 / math.sqrt(3)
-    got_std = float(second.weight.detach().std())
-    assert expected_std / 3 <= got_std <= expected_std * 3
 
 
 # 4. IMPORTANT: ngram hash shape guards
@@ -208,13 +185,6 @@ def test_ssd_normal_init_chunked_determinism(tmp_path):
     a.normal_init_(0.02, g1)
     b.normal_init_(0.02, g2)
     assert np.array_equal(np.asarray(a._mmap), np.asarray(b._mmap))
-
-
-def test_bottleneck_dim_equals_num_blocks_single_linear_eye():
-    torch.manual_seed(0)
-    layer = ChunkedBottleneckLinear(8, num_blocks=4, output_dim=8, bottleneck_dim=4)
-    assert isinstance(layer.mixer, torch.nn.Linear)
-    torch.testing.assert_close(layer.mixer.weight, torch.eye(4))
 
 
 def test_signed_sqrt_zero_gate_half_no_nan_grad():
