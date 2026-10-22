@@ -18,6 +18,7 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .dyt import DyT
+from .linear_init import init_linear, zero_linear
 from .shared import init_residual_linears
 
 
@@ -80,9 +81,9 @@ class SwiGLU(nn.Module):
         std = self.initializer_range
         scale = init_residual_linears(std, self.num_layers, self.residual_init_scale, self.gate_proj, self.up_proj)
         if scale is None:
-            nn.init.zeros_(self.down_proj.weight)
+            zero_linear(self.down_proj)
         else:
-            nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
+            init_linear(self.down_proj, scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""forward(x) -> Tensor
@@ -154,9 +155,9 @@ class ClassicMLP(nn.Module):
         std = self.initializer_range
         scale = init_residual_linears(std, self.num_layers, self.residual_init_scale, self.up_proj)
         if scale is None:
-            nn.init.zeros_(self.down_proj.weight)
+            zero_linear(self.down_proj)
         else:
-            nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
+            init_linear(self.down_proj, scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""forward(x) -> Tensor — apply the SiLU feed-forward transformation.

@@ -27,6 +27,7 @@ from .compression import (
     HeadRMSNorm,
     SparseIndexer,
 )
+from .linear_init import init_linear
 from .shared import CompressedCache, CSA2SharedState, _past_total_len, _resolve_positions, _update_swa_pos
 
 
@@ -148,9 +149,9 @@ class CompressedSparseAttention(GroupedQueryAttention):
         (or depth-scaled) residual output.
         """
         std = self.init_std
-        nn.init.trunc_normal_(self.q_down.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.q_up_main.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.v_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(self.q_down, std)
+        init_linear(self.q_up_main, std)
+        init_linear(self.v_proj, std)
         self.compressor.reset_parameters()
         if self.indexer is not None:
             self.indexer.reset_parameters()

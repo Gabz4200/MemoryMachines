@@ -25,6 +25,13 @@ from memory_machines.models.blocks import (
 )
 from memory_machines.models.blocks.attention import GroupedQueryAttention
 from memory_machines.models.blocks.dyt import DyT
+from memory_machines.models.blocks.linear_init import (
+    copy_linear_weight_,
+    effective_weight,
+    linear_in_features,
+    linear_out_features,
+    zero_linear,
+)
 from memory_machines.models.blocks.shared import CSA2SharedState
 from memory_machines.utils.config_schema import MemoryMachineConfig
 from tests.test_blocks_shapes import tiny_cfg
@@ -81,8 +88,8 @@ def test_block_wires_norm_attention_memory_and_fusion() -> None:
     assert isinstance(block.norm, DyT)
     assert isinstance(block.attention, CompressedSparseAttention2)
     assert isinstance(block.gdn2, GatedDeltaNet2Mixer)
-    assert block.out_proj.in_features == 2 * H
-    assert block.out_proj.out_features == H
+    assert linear_in_features(block.out_proj) == 2 * H
+    assert linear_out_features(block.out_proj) == H
     assert block.out_proj.bias is None
     assert block.mode == "full"
 
@@ -157,7 +164,7 @@ def test_both_branches_read_the_same_pre_normed_input() -> None:
 def test_zero_fusion_projection_is_exact_residual() -> None:
     block = ParallelAttentionGDN2(_cfg()).eval()
     with torch.no_grad():
-        block.out_proj.weight.zero_()
+        zero_linear(block.out_proj)
     x = torch.randn(1, 4, H)
     with torch.no_grad():
         out, _ = block.forward_shared(x)
@@ -167,7 +174,7 @@ def test_zero_fusion_projection_is_exact_residual() -> None:
 def test_fusion_init_starts_attention_only() -> None:
     torch.manual_seed(0)
     block = ParallelAttentionGDN2(_cfg())
-    weight = block.out_proj.weight
+    weight = effective_weight(block.out_proj)
     attention_half = weight[:, :H]
     memory_half = weight[:, H:]
     assert attention_half.abs().max().item() > 1e-3
@@ -179,9 +186,9 @@ def test_reset_parameters_reapplies_the_split_init() -> None:
     torch.manual_seed(0)
     block = ParallelAttentionGDN2(_cfg())
     with torch.no_grad():
-        block.out_proj.weight.fill_(1.0)
+        copy_linear_weight_(block.out_proj, torch.ones_like(effective_weight(block.out_proj)))
     block.reset_parameters()
-    assert block.out_proj.weight[:, H:].abs().max().item() < 5e-3
+    assert effective_weight(block.out_proj)[:, H:].abs().max().item() < 5e-3
 
 
 # 4. pre-norm configuration ----------------------------------------------------
@@ -337,8 +344,11 @@ def test_ced_first_layer_global_reach_comes_from_the_memory_branch() -> None:
     stack = CausalEncoderDecoderStack(_ced_cfg(ced_encoder_first_window_size=2)).eval()
     layer = cast("ParallelAttentionGDN2", stack.encoder_layers[0])
     with torch.no_grad():
-        layer.out_proj.weight[:, :H].zero_()  # keep the memory half only
-        layer.out_proj.weight[:, H:].normal_(std=0.1)
+        # Keep the memory half only, so any long reach must come from the mixer.
+        weight = effective_weight(layer.out_proj).clone()
+        weight[:, :H] = 0.0
+        weight[:, H:] = torch.randn_like(weight[:, H:]) * 0.1
+        copy_linear_weight_(layer.out_proj, weight)
     enc = torch.randn(1, 8, H)
     with torch.no_grad():
         base = layer(enc)
@@ -367,7 +377,9 @@ def test_windowed_attention_alone_cannot_see_the_first_token() -> None:
     torch.manual_seed(0)
     block = ParallelAttentionGDN2(replace(_cfg(), ced_attention_variant="dense"), window_size=2).eval()
     with torch.no_grad():
-        block.out_proj.weight[:, H:].zero_()  # attention half only
+        weight = effective_weight(block.out_proj).clone()
+        weight[:, H:] = 0.0  # attention half only
+        copy_linear_weight_(block.out_proj, weight)
     x = torch.randn(1, 8, H)
     with torch.no_grad():
         base, _ = block.forward_shared(x)
@@ -512,6 +524,7 @@ def test_backward_reaches_both_branches_and_both_fusion_halves() -> None:
     memory_grads = [p.grad for p in block.gdn2.parameters() if p.grad is not None]
     assert attention_grads and any(g.abs().sum().item() > 0 for g in attention_grads)
     assert memory_grads and any(g.abs().sum().item() > 0 for g in memory_grads)
+    assert isinstance(block.out_proj, nn.Linear), "a directly built block is not rank-budgeted"
     weight_grad = block.out_proj.weight.grad
     assert weight_grad is not None
     assert weight_grad[:, :H].abs().max().item() > 0
@@ -522,16 +535,17 @@ def test_backward_reaches_both_branches_and_both_fusion_halves() -> None:
 def test_memory_init_scale_controls_the_memory_half() -> None:
     cfg = _cfg()
     block = ParallelAttentionGDN2(cfg, memory_init_scale=0.05)
-    assert 0.03 < block.out_proj.weight[:, H:].std().item() < 0.08
-    assert 0.003 < block.out_proj.weight[:, :H].std().item() < 0.009
+    weight = effective_weight(block.out_proj)
+    assert 0.03 < weight[:, H:].std().item() < 0.08
+    assert 0.003 < weight[:, :H].std().item() < 0.009
 
 
 def test_reset_parameters_restores_the_attention_half_to_standard_scale() -> None:
     block = ParallelAttentionGDN2(_cfg())
     with torch.no_grad():
-        block.out_proj.weight.fill_(1.0)
+        copy_linear_weight_(block.out_proj, torch.ones_like(effective_weight(block.out_proj)))
     block.reset_parameters()
-    attention_half = block.out_proj.weight[:, :H]
+    attention_half = effective_weight(block.out_proj)[:, :H]
     assert attention_half.abs().max().item() <= 2 * block.initializer_range + 1e-6
     assert 0.003 < attention_half.std().item() < 0.009
 
@@ -549,10 +563,11 @@ def test_titan_reset_parameters_restores_the_split_init() -> None:
     torch.manual_seed(0)
     block = ParallelAttentionTitan(_cfg())
     with torch.no_grad():
-        block.out_proj.weight.fill_(1.0)
+        copy_linear_weight_(block.out_proj, torch.ones_like(effective_weight(block.out_proj)))
     block.reset_parameters()
-    memory_std = block.out_proj.weight[:, H:].std().item()
-    assert block.out_proj.weight[:, :H].abs().max().item() <= 2 * block.initializer_range + 1e-6
+    weight = effective_weight(block.out_proj)
+    memory_std = weight[:, H:].std().item()
+    assert weight[:, :H].abs().max().item() <= 2 * block.initializer_range + 1e-6
     assert 0.5e-3 < memory_std < 2e-3
 
 

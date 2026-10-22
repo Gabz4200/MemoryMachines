@@ -40,6 +40,7 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .attention import GroupedQueryAttention
 from .ffn import DenseFFN, build_norm
+from .linear_init import init_linear
 
 _HASH_PRIME = 1_000_000_007
 
@@ -256,7 +257,7 @@ class VocabularyEncoder(nn.Module):
         for layer in cast("list[_LocalEncoderLayer]", list(self.layers)):
             layer.reset_parameters()
         for projection in (self.patch_init_proj, self.patch_out_proj):
-            nn.init.trunc_normal_(projection.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            init_linear(projection, std)
 
     def _embeddings(self, byte_ids: torch.Tensor | None, byte_embeds: torch.Tensor | None) -> torch.Tensor:
         if byte_embeds is not None:
@@ -435,7 +436,7 @@ class VocabularyDecoder(nn.Module):
     def reset_parameters(self) -> None:
         r"""Re-apply projection, begin-patch, slot, and local-layer initialization."""
         std = self.config.initializer_range
-        nn.init.trunc_normal_(self.patch_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(self.patch_proj, std)
         nn.init.trunc_normal_(self.begin_patch, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.trunc_normal_(self.byte_slot_embed.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
         for layer in cast("list[_LocalDecoderLayer]", list(self.layers)):

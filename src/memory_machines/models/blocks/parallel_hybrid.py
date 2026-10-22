@@ -40,6 +40,8 @@ from .attention import GroupedQueryAttention
 from .fast_weights import SelfReferentialTitanMixer
 from .ffn import build_norm
 from .gdn2 import GatedDeltaNet2Mixer
+from .linear_init import init_linear_columns
+from .linears import FactoredLinear
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention, CompressedSparseAttention2, HeavilyCompressedAttention
 
@@ -192,7 +194,7 @@ class ParallelAttentionGDN2(nn.Module):
         self.attention = _build_attention(self.attention_variant, config, compression_ratio, mode, top_k, resolved_window)
         self.gdn2: GatedDeltaNet2Mixer | SelfReferentialTitanMixer = self._build_branch(config)
         self.memory_init_scale = memory_init_scale
-        self.out_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.out_proj: nn.Linear | FactoredLinear = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.reset_parameters()
 
     def _build_branch(self, config: MemoryMachineConfig) -> GatedDeltaNet2Mixer | SelfReferentialTitanMixer:
@@ -239,8 +241,23 @@ class ParallelAttentionGDN2(nn.Module):
             if callable(reset):
                 reset()
         std = self.initializer_range
-        attention_half = self.out_proj.weight[:, : self.hidden_size]
-        memory_half = self.out_proj.weight[:, self.hidden_size :]
+        out_proj = self.out_proj
+        if isinstance(out_proj, FactoredLinear):
+            # The memory half starts at ~1e-3 of the attention half, so a single
+            # global std would erase the split. Per-column stds keep both halves
+            # at their own scale with no truncation loss.
+            column_stds = torch.full(
+                (out_proj.input_dim,),
+                std,
+                dtype=out_proj.in_linear.weight.dtype,
+                device=out_proj.in_linear.weight.device,
+            )
+            column_stds[self.hidden_size :] = self.memory_init_scale
+            init_linear_columns(out_proj, column_stds)
+            return
+        weight = out_proj.weight
+        attention_half = weight[:, : self.hidden_size]
+        memory_half = weight[:, self.hidden_size :]
         nn.init.trunc_normal_(attention_half, mean=0.0, std=std, a=-2 * std, b=2 * std)
         nn.init.normal_(memory_half, mean=0.0, std=self.memory_init_scale)
 

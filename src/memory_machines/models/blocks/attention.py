@@ -17,6 +17,7 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
+from .linear_init import init_linear, zero_linear
 from .positioning import CVPEContextBias, FRVMSpatialOV, FRVMValueGate
 from .shared import (
     _check_position_bounds,
@@ -310,13 +311,13 @@ class GroupedQueryAttention(nn.Module):
         """
         std = self.initializer_range
         scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
-        nn.init.trunc_normal_(self.q_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.k_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.v_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(self.q_proj, std)
+        init_linear(self.k_proj, std)
+        init_linear(self.v_proj, std)
         if scale is None:
-            nn.init.zeros_(self.o_proj.weight)
+            zero_linear(self.o_proj)
         else:
-            nn.init.trunc_normal_(self.o_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
+            init_linear(self.o_proj, scale)
 
     def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""_project_qkv(hidden_states) -> (Tensor, Tensor, Tensor)

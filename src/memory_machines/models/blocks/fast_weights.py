@@ -56,6 +56,7 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .causal_conv1d import ShortConvolution
 from .ffn import DenseFFN
+from .linear_init import init_linear_xavier, zero_linear
 from .shared import _l2norm
 
 __all__ = [
@@ -209,13 +210,13 @@ class TitansFastWeightsMemory(nn.Module):
         for w in self.fast_init:
             nn.init.normal_(w, std=self.init_std)
         for proj in (self.q_proj, self.k_proj, self.v_proj, self.gate_proj):
-            nn.init.xavier_uniform_(proj.weight, gain=2**-2.5)
+            init_linear_xavier(proj, gain=2**-2.5)
         for proj in (self.eta_proj, self.theta_proj, self.alpha_proj):
             nn.init.normal_(proj.weight, std=self.init_std)
             nn.init.zeros_(proj.bias)
         if self.persistent is not None:
             nn.init.normal_(self.persistent, std=self.init_std)
-        nn.init.xavier_uniform_(self.o_proj.weight, gain=2**-2.5)
+        init_linear_xavier(self.o_proj, gain=2**-2.5)
 
     def project_qkv(
         self,
@@ -504,9 +505,8 @@ class TitansMAGBlock(nn.Module):
 
     def reset_parameters(self) -> None:
         r"""reset_parameters() -> None — zero-start fusion, Xavier output."""
-        nn.init.zeros_(self.fuse.weight)
-        nn.init.zeros_(self.fuse.bias)
-        nn.init.xavier_uniform_(self.o_proj.weight, gain=2**-2.5)
+        zero_linear(self.fuse)
+        init_linear_xavier(self.o_proj, gain=2**-2.5)
 
     def forward(self, x: torch.Tensor, short_term: torch.Tensor | None = None) -> torch.Tensor:
         r"""forward(x, short_term=None) -> Tensor — gated short/long fusion.
@@ -932,10 +932,9 @@ class SelfReferentialTitanMemory(nn.Module):
         for box in HOPE_BOXES:
             for w in self._box_weights(box):
                 nn.init.normal_(w, std=self.init_std)
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=2**-2.5)
-        nn.init.xavier_uniform_(self.gate_proj.weight, gain=2**-2.5)
-        nn.init.zeros_(self.gate_proj.bias)
-        nn.init.xavier_uniform_(self.o_proj.weight, gain=2**-2.5)
+        init_linear_xavier(self.q_proj, gain=2**-2.5)
+        init_linear_xavier(self.gate_proj, gain=2**-2.5)
+        init_linear_xavier(self.o_proj, gain=2**-2.5)
 
     def _heads(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape

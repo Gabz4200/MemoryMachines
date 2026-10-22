@@ -63,6 +63,8 @@ from torch import nn
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .causal_conv1d import ShortConvolution
+from .linear_init import init_linear_xavier
+from .linears import FactoredLinear
 from .shared import _l2norm
 
 __all__ = [
@@ -845,10 +847,15 @@ class GatedDeltaNet2(nn.Module):
     def _initialize_weights(self, module: nn.Module) -> None:
         if getattr(module, "_is_hf_initialized", False):
             return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=2**-2.5)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+        if isinstance(module, FactoredLinear):
+            # Init the factors as a pair, then mark them done: ``apply`` would
+            # otherwise re-init each factor separately and destroy the
+            # variance matching (the product would get the wrong scale).
+            init_linear_xavier(module, gain=2**-2.5)
+            module.in_linear._is_hf_initialized = True  # type: ignore[assignment]
+            module.out_linear._is_hf_initialized = True  # type: ignore[assignment]
+        elif isinstance(module, nn.Linear):
+            init_linear_xavier(module, gain=2**-2.5)
         module._is_hf_initialized = True  # type: ignore[assignment]
 
     def forward(

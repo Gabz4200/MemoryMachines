@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from .linear_init import init_linear
+
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     r"""_l2norm(x, eps=1e-6) -> Tensor
@@ -41,17 +43,19 @@ def init_residual_linears(
     std: float,
     num_layers: int,
     enabled: bool,
-    *linears: nn.Linear,
+    *linears: nn.Module,
 ) -> float | None:
     r"""init_residual_linears(std, num_layers, enabled, *linears) -> scale | None
 
-    Truncated-normal init ``N(0, std^2)`` for every ``linears`` weight and
-    return the depth-scaled residual scale (or ``None``) for the downstream
-    output projection. Shared by every block that initializes a bounded
-    residual path (SwiGLU, ClassicMLP, LIV double-gated base).
+    Truncated-normal init ``N(0, std^2)`` for every ``linears`` effective
+    weight and return the depth-scaled residual scale (or ``None``) for the
+    downstream output projection. Accepts dense and factored projections alike,
+    so a resident block keeps a single init path. Shared by every block that
+    initializes a bounded residual path (SwiGLU, ClassicMLP, LIV double-gated
+    base).
     """
     for lin in linears:
-        nn.init.trunc_normal_(lin.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(lin, std)
     return residual_init_scale(std, num_layers, enabled)
 
 

@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .linear_init import init_linear, zero_linear
+from .linears import FactoredLinear
 from .shared import _causal_comp_mask, residual_init_scale
 
 
@@ -84,7 +86,7 @@ class BlockCompressor(nn.Module):
         at step 0.
         """
         std = self.init_std
-        nn.init.trunc_normal_(self.kv_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(self.kv_proj, std)
         nn.init.zeros_(self.score_proj.weight)
         nn.init.zeros_(self.block_bias)
 
@@ -196,8 +198,8 @@ class SparseIndexer(nn.Module):
         geometry is learned.
         """
         std = self.init_std
-        nn.init.trunc_normal_(self.q_up_index.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.k_index_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(self.q_up_index, std)
+        init_linear(self.k_index_proj, std)
         nn.init.zeros_(self.weight_proj.weight)
 
     def _index_heads(self, query_latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -616,13 +618,13 @@ class GroupedOutputProjection(nn.Module):
         std = self.init_std
         scale = residual_init_scale(std, self.num_layers, self.residual_init_scale)
         for proj in self.group_projs:
-            if not isinstance(proj, nn.Linear):
-                raise TypeError(f"group_projs must hold nn.Linear instances, got {type(proj).__name__}")
-            nn.init.trunc_normal_(proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+            if not isinstance(proj, (nn.Linear, FactoredLinear)):
+                raise TypeError(f"group_projs must hold nn.Linear or FactoredLinear instances, got {type(proj).__name__}")
+            init_linear(proj, std)
         if scale is None:
-            nn.init.zeros_(self.out_proj.weight)
+            zero_linear(self.out_proj)
         else:
-            nn.init.trunc_normal_(self.out_proj.weight, mean=0.0, std=scale, a=-2 * scale, b=2 * scale)
+            init_linear(self.out_proj, scale)
 
     def forward(self, heads: torch.Tensor) -> torch.Tensor:
         r"""forward(heads) -> Tensor

@@ -67,6 +67,7 @@ from memory_machines.utils.config_schema import MemoryMachineConfig
 
 from .compression import BlockCompressor
 from .ffn import DenseFFN
+from .linear_init import init_linear
 from .parallel_hybrid import ParallelAttentionGDN2, ParallelAttentionTitan
 from .shared import CSA2SharedState
 from .sparse import CompressedSparseAttention2
@@ -1033,16 +1034,10 @@ class CausalDecoder(nn.Module):
             gate.reset_parameters()
         mix = getattr(self, "trm_mix", None)
         if mix is not None:
-            std = self.config.initializer_range
-            nn.init.trunc_normal_(mix.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-            if mix.bias is not None:
-                nn.init.zeros_(mix.bias)
+            init_linear(mix, self.config.initializer_range)
         z_proj = getattr(self, "z_proj", None)
         if z_proj is not None:
-            std = self.config.initializer_range
-            nn.init.trunc_normal_(z_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-            if z_proj.bias is not None:
-                nn.init.zeros_(z_proj.bias)
+            init_linear(z_proj, self.config.initializer_range)
 
     def decode_full_context(
         self,

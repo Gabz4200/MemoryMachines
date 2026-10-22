@@ -15,6 +15,8 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
+from .linear_init import init_linear, zero_linear
+
 
 @dataclass
 class LatentSample:
@@ -94,10 +96,8 @@ class GaussianLatentSampler(nn.Module):
     def reset_parameters(self) -> None:
         """Restore the identity-mean and target-std initialization."""
         std = self.initializer_range
-        nn.init.trunc_normal_(self.hidden_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
-        nn.init.zeros_(self.hidden_proj.bias)
-        nn.init.zeros_(self.stats_proj.weight)
-        nn.init.zeros_(self.stats_proj.bias)
+        init_linear(self.hidden_proj, std)
+        zero_linear(self.stats_proj)
 
     def forward(self, hidden_states: torch.Tensor, *, temperature: float | None = None, noise: torch.Tensor | None = None) -> LatentSample:
         r"""Draw one Gaussian latent per patch.

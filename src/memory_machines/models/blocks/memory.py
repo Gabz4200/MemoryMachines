@@ -13,6 +13,7 @@ from torch import nn
 
 from memory_machines.utils.config_schema import MemoryMachineConfig
 
+from .linear_init import init_linear, linear_dtype, zero_linear
 from .shared import _sinkhorn
 
 
@@ -786,10 +787,9 @@ class EngramMemory(nn.Module):
             self.multi_head_embedding.normal_init_(self.init_std, gen)
         else:
             nn.init.normal_(self.multi_head_embedding.weight, std=self.init_std)
-        nn.init.zeros_(self.value_proj.weight)
+        zero_linear(self.value_proj)
         for proj in self.key_projs:
-            assert isinstance(proj, nn.Linear)
-            nn.init.zeros_(proj.weight)
+            zero_linear(proj)
         if self.conv is not None:
             nn.init.zeros_(self.conv.conv.weight)
 
@@ -894,7 +894,7 @@ class EngramMemory(nn.Module):
         embeddings = self.multi_head_embedding(hashes).flatten(start_dim=-2)
         # SSD storage is float32; cast rows to the compute dtype (.to() on the
         # parent breaks mmap sharing, so re-mmap after .to()).
-        target_dtype = self.value_proj.weight.dtype
+        target_dtype = linear_dtype(self.value_proj)
         if embeddings.dtype != target_dtype:
             embeddings = embeddings.to(target_dtype)
         gates: list[torch.Tensor] = []
@@ -966,7 +966,7 @@ class DSparkDrafter(nn.Module):
         earns confidence through training.
         """
         std = self.init_std
-        nn.init.trunc_normal_(self.draft_proj.weight, mean=0.0, std=std, a=-2 * std, b=2 * std)
+        init_linear(self.draft_proj, std)
         nn.init.zeros_(self.markov_head.weight)
         nn.init.zeros_(self.confidence_head.weight)
         nn.init.zeros_(self.confidence_head.bias)
