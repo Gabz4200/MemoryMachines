@@ -89,6 +89,18 @@ class FactoredLinear(nn.Module):
         if self.out_linear.bias is not None:
             nn.init.zeros_(self.out_linear.bias)
 
+    @property
+    def bias(self) -> torch.Tensor | None:
+        r"""bias -> Tensor | None
+
+        The output bias vector, aliased to ``out_linear.bias``. The alias is
+        read-write: it is the parameter the forward pass adds, not a copy.
+        There is deliberately no ``weight`` alias -- a summed product is not a
+        parameter, and an attribute that silently swallowed writes would hide
+        initialization bugs.
+        """
+        return self.out_linear.bias
+
     def extra_repr(self) -> str:
         return f"input_dim={self.input_dim}, rank={self.rank}, output_dim={self.output_dim}, bias={self.out_linear.bias is not None}"
 
